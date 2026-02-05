@@ -1,0 +1,13 @@
+{
+  "_comment": "IMPORTANT: Replace {PROJECT_ROOT} with the actual absolute path to your scrcpy-py-ddlx directory",
+  "mcpServers": {
+    "scrcpy-local": {
+      "command": "python",
+      "args": [
+        "-c",
+        "from scrcpy_py_ddlx.mcp_server import create_mcp_server; server = create_mcp_server(log_file='logs/claude_mcp.log'); server.connect(); import sys; print('MCP Server ready', file=sys.stderr)"
+      ],
+      "cwd": "{PROJECT_ROOT}"
+    }
+  }
+}

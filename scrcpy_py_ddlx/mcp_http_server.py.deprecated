@@ -1,0 +1,499 @@
+"""
+============================================================
+DEPRECATED - This file is outdated. DO NOT USE.
+============================================================
+
+Use the new location: scrcpy_py_ddlx/mcp/http_server.py
+
+This file (490 lines) is the old version with limited features.
+The new version (1091 lines) in scrcpy_py_ddlx/mcp/ is more complete.
+
+MCP HTTP Server for scrcpy-py-ddlx (DEPRECATED)
+
+A standalone HTTP server that provides REST API access to Android device control.
+This allows AI Agents to interact with the device without managing connections.
+
+Features:
+- Single connection, multiple requests
+- Auto-reconnect on connection loss
+- Health check endpoint
+- All 41 tools available via REST API
+"""
+
+import logging
+import json
+import threading
+import time
+from typing import Any, Dict, Optional, List
+from pathlib import Path
+from datetime import datetime
+
+try:
+    from flask import Flask, request, jsonify
+    from flask_cors import CORS
+
+    FLASK_AVAILABLE = True
+except ImportError:
+    FLASK_AVAILABLE = False
+
+from . import ScrcpyClient, ClientConfig, create_mcp_server as create_mcp_server_base
+
+logger = logging.getLogger(__name__)
+
+
+class ScrcpyHTTPServer:
+    """
+    HTTP Server for scrcpy device control.
+
+    Runs as a standalone process with a persistent device connection.
+    AI Agents can call REST API endpoints to control the device.
+    """
+
+    def __init__(
+        self,
+        host: str = "127.0.0.1",
+        port: int = 8080,
+        log_file: Optional[str] = "logs/mcp_http.log",
+        auto_reconnect: bool = True,
+        default_config: Optional[ClientConfig] = None,
+    ):
+        """Initialize the HTTP server
+
+        Args:
+            host: Server host (default: 127.0.0.1)
+            port: Server port (default: 8080)
+            log_file: Path to log file
+            auto_reconnect: Automatically reconnect on connection loss
+            default_config: Default configuration for connections
+        """
+        if not FLASK_AVAILABLE:
+            raise ImportError(
+                "Flask is required for HTTP server. "
+                "Install with: pip install flask flask-cors"
+            )
+
+        self.host = host
+        self.port = port
+        self.auto_reconnect = auto_reconnect
+        self._default_config = default_config or ClientConfig(
+            show_window=False,
+            control=True,
+            audio=False,
+        )
+
+        # Internal MCP server (reuse existing logic)
+        self._mcp_server = create_mcp_server_base(
+            default_config=self._default_config,
+            log_file=log_file,
+        )
+
+        # Connection state
+        self._client: Optional[ScrcpyClient] = None
+        self._lock = threading.Lock()
+        self._reconnect_thread: Optional[threading.Thread] = None
+        self._running = False
+
+        # Flask app
+        self.app = Flask(__name__)
+        CORS(self.app)  # Enable CORS for AI Agents
+
+        # Setup routes
+        self._setup_routes()
+
+        # Setup logging
+        self._setup_logging(log_file)
+
+    def _setup_logging(self, log_file: Optional[str]):
+        """Setup logging configuration"""
+        self._logger = logging.getLogger(f"{__name__}.ScrcpyHTTPServer")
+        self._logger.setLevel(logging.INFO)
+
+        formatter = logging.Formatter(
+            "%(asctime)s - %(levelname)s - %(name)s - %(message)s", datefmt="%Y-%m-%d %H:%M:%S"
+        )
+
+        # File handler - capture ALL logs including client internals
+        if log_file:
+            Path(log_file).parent.mkdir(parents=True, exist_ok=True)
+            file_handler = logging.FileHandler(log_file, encoding="utf-8")
+            file_handler.setLevel(logging.INFO)
+            file_handler.setFormatter(formatter)
+
+            # Capture all logs from scrcpy_py_ddlx and its submodules
+            root_logger = logging.getLogger("scrcpy_py_ddlx")
+            root_logger.addHandler(file_handler)
+            root_logger.setLevel(logging.INFO)
+
+        # Console handler
+        console_handler = logging.StreamHandler()
+        console_handler.setLevel(logging.INFO)
+        console_handler.setFormatter(formatter)
+        self._logger.addHandler(console_handler)
+
+    def _setup_routes(self):
+        """Setup Flask routes"""
+
+        @self.app.route("/", methods=["GET"])
+        def index():
+            """Server info"""
+            return jsonify(
+                {
+                    "name": "scrcpy-py-ddlx MCP HTTP Server",
+                    "version": "0.1.0",
+                    "status": "running" if self._client else "disconnected",
+                    "connected": self._client is not None
+                    and self._client.state.connected
+                    if self._client
+                    else False,
+                    "device": self._get_device_info(),
+                    "endpoints": self._get_endpoints(),
+                }
+            )
+
+        @self.app.route("/health", methods=["GET"])
+        def health():
+            """Health check endpoint"""
+            connected = (
+                self._client is not None and self._client.state.connected
+                if self._client
+                else False
+            )
+            return jsonify(
+                {
+                    "status": "healthy",
+                    "connected": connected,
+                    "device": self._get_device_info() if connected else None,
+                }
+            )
+
+        @self.app.route("/tools", methods=["GET"])
+        def list_tools():
+            """List all available tools"""
+            schema = self._mcp_server.get_tools_schema()
+            return jsonify(schema)
+
+        # ========== Runtime Video Control ==========
+        @self.app.route("/video/enable", methods=["POST"])
+        def enable_video():
+            """Enable video decoding"""
+            if self._client:
+                self._client.enable_video()
+            return jsonify({"success": True, "video_enabled": True})
+            return jsonify({"success": False, "error": "No client connected"})
+
+        @self.app.route("/video/disable", methods=["POST"])
+        def disable_video():
+            """Disable video decoding"""
+            if self._client:
+                self._client.disable_video()
+                return jsonify({"success": True, "video_enabled": False})
+            return jsonify({"success": False, "error": "No client connected"})
+
+        # ========== Runtime Audio Control ==========
+        @self.app.route("/audio/enable", methods=["POST"])
+        def enable_audio():
+            """Enable audio decoding and playback"""
+            if self._client:
+                self._client.enable_audio()
+                return jsonify({"success": True, "audio_enabled": True})
+            return jsonify({"success": False, "error": "No client connected"})
+
+        @self.app.route("/audio/disable", methods=["POST"])
+        def disable_audio():
+            """Disable audio decoding and playback"""
+            if self._client:
+                self._client.disable_audio()
+                return jsonify({"success": True, "audio_enabled": False})
+            return jsonify({"success": False, "error": "0: No client connected"})
+
+        @self.app.route("/tools/<tool_name>", methods=["POST"])
+        def call_tool(tool_name: str):
+            """Call a specific tool"""
+            try:
+                arguments = request.get_json() or {}
+                result = self._mcp_server.handle_tool_call(tool_name, arguments)
+
+                # Add device info to response
+                if result.get("success") and self._client:
+                    result["device"] = self._get_device_info()
+
+                return jsonify(result)
+            except Exception as e:
+                self._logger.error(f"Tool call error ({tool_name}): {e}")
+                return jsonify(
+                    {
+                        "success": False,
+                        "error": str(e),
+                        "tool": tool_name,
+                    }
+                ), 500
+
+        @self.app.route("/connect", methods=["POST"])
+        def connect():
+            """Connect to device"""
+            try:
+                data = request.get_json() or {}
+                audio = data.get("audio", False)
+                tcpip = data.get("tcpip", False)
+                stay_awake = data.get("stay_awake", True)
+
+                result = self._mcp_server.connect(
+                    audio=audio,
+                    tcpip=tcpip,
+                    stay_awake=stay_awake,
+                )
+
+                if result.get("success"):
+                    self._client = self._mcp_server._client
+
+                return jsonify(result)
+            except Exception as e:
+                self._logger.error(f"Connect error: {e}")
+                return jsonify(
+                    {
+                        "success": False,
+                        "error": str(e),
+                    }
+                ), 500
+
+        @self.app.route("/disconnect", methods=["POST"])
+        def disconnect():
+            """Disconnect from device"""
+            try:
+                result = self._mcp_server.disconnect()
+                self._client = None
+                return jsonify(result)
+            except Exception as e:
+                self._logger.error(f"Disconnect error: {e}")
+                return jsonify(
+                    {
+                        "success": False,
+                        "error": str(e),
+                    }
+                ), 500
+
+        @self.app.route("/state", methods=["GET"])
+        def get_state():
+            """Get current device state"""
+            if self._client is None or not self._client.state.connected:
+                return jsonify(
+                    {
+                        "connected": False,
+                        "device": None,
+                    }
+                )
+
+            return jsonify(
+                {
+                    "connected": True,
+                    "device": self._get_device_info(),
+                }
+            )
+
+    def _get_device_info(self) -> Optional[Dict[str, Any]]:
+        """Get device information"""
+        if self._client is None or not self._client.state.connected:
+            return None
+
+        return {
+            "name": self._client.state.device_name,
+            "size": list(self._client.state.device_size),
+            "codec": hex(self._client.state.codec_id),
+            "tcpip_connected": self._client.state.tcpip_connected,
+            "tcpip_address": (
+                f"{self._client.state.tcpip_ip}:{self._client.state.tcpip_port}"
+                if self._client.state.tcpip_connected
+                else None
+            ),
+        }
+
+    def _get_endpoints(self) -> Dict[str, str]:
+        """Get available endpoints"""
+        return {
+            "GET /": "Server info",
+            "GET /health": "Health check",
+            "GET /tools": "List all tools",
+            "POST /tools/<tool_name>": "Call a tool",
+            "POST /connect": "Connect to device",
+            "POST /disconnect": "Disconnect from device",
+            "GET /state": "Get device state",
+        }
+
+    def start(self, auto_connect: bool = True):
+        """Start the HTTP server
+
+        Args:
+            auto_connect: Automatically connect to device on start
+        """
+        self._running = True
+
+        # Auto connect on start
+        if auto_connect:
+            self._logger.info("Auto-connecting to device...")
+            result = self._mcp_server.connect()
+            if result.get("success"):
+                self._client = self._mcp_server._client
+                self._logger.info(f"Connected to {result.get('device_name')}")
+            else:
+                self._logger.warning(f"Auto-connect failed: {result.get('error')}")
+
+        # Start reconnect thread if enabled
+        if self.auto_reconnect and self._client:
+            self._start_reconnect_thread()
+
+        # Start Flask server
+        self._logger.info(f"Starting HTTP server on {self.host}:{self.port}")
+        self.app.run(
+            host=self.host,
+            port=self.port,
+            debug=False,
+            use_reloader=False,
+            threaded=True,
+        )
+
+    def stop(self):
+        """Stop the HTTP server"""
+        self._running = False
+
+        if self._client:
+            try:
+                self._mcp_server.disconnect()
+            except:
+                pass
+            self._client = None
+
+    def _start_reconnect_thread(self):
+        """Start background thread to monitor and reconnect"""
+
+        def reconnect_loop():
+            while self._running:
+                time.sleep(5)  # Check every 5 seconds
+                if self._client and not self._client.state.connected:
+                    self._logger.warning("Connection lost, attempting to reconnect...")
+                    try:
+                        result = self._mcp_server.connect()
+                        if result.get("success"):
+                            self._client = self._mcp_server._client
+                            self._logger.info(
+                                f"Reconnected to {result.get('device_name')}"
+                            )
+                        else:
+                            self._logger.error(
+                                f"Reconnect failed: {result.get('error')}"
+                            )
+                    except Exception as e:
+                        self._logger.error(f"Reconnect error: {e}")
+
+        self._reconnect_thread = threading.Thread(target=reconnect_loop, daemon=True)
+        self._reconnect_thread.start()
+
+
+def create_http_server(
+    host: str = "127.0.0.1",
+    port: int = 8080,
+    log_file: Optional[str] = "logs/mcp_http.log",
+    auto_reconnect: bool = True,
+    default_config: Optional[ClientConfig] = None,
+) -> ScrcpyHTTPServer:
+    """Create an HTTP server instance
+
+    Args:
+        host: Server host (default: 127.0.0.1)
+        port: Server port (default: 8080)
+        log_file: Path to log file
+        auto_reconnect: Automatically reconnect on connection loss
+        default_config: Default configuration for connections
+
+    Returns:
+        ScrcpyHTTPServer instance
+
+    Example:
+        >>> server = create_http_server(port=8080)
+        >>> server.start(auto_connect=True)  # Blocks, runs forever
+    """
+    return ScrcpyHTTPServer(
+        host=host,
+        port=port,
+        log_file=log_file,
+        auto_reconnect=auto_reconnect,
+        default_config=default_config,
+    )
+
+
+def main():
+    """CLI entry point"""
+    import argparse
+
+    parser = argparse.ArgumentParser(description="scrcpy-py-ddlx MCP HTTP Server")
+    parser.add_argument(
+        "--host",
+        type=str,
+        default="127.0.0.1",
+        help="Server host (default: 127.0.0.1)",
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=8080,
+        help="Server port (default: 8080)",
+    )
+    parser.add_argument(
+        "--log-file",
+        type=str,
+        default="logs/mcp_http.log",
+        help="Path to log file",
+    )
+    parser.add_argument(
+        "--no-auto-reconnect",
+        action="store_true",
+        help="Disable auto-reconnect on connection loss",
+    )
+    parser.add_argument(
+        "--no-auto-connect",
+        action="store_true",
+        help="Don't auto-connect on startup",
+    )
+    parser.add_argument(
+        "--audio",
+        action="store_true",
+        help="Enable audio streaming",
+    )
+
+    args = parser.parse_args()
+
+    # Create and start server
+    server = create_http_server(
+        host=args.host,
+        port=args.port,
+        log_file=args.log_file,
+        auto_reconnect=not args.no_auto_reconnect,
+    )
+
+    print()
+    print("=" * 60)
+    print(" scrcpy-py-ddlx MCP HTTP Server")
+    print("=" * 60)
+    print()
+    print(f"Server: http://{args.host}:{args.port}")
+    print(f"Log file: {args.log_file}")
+    print(f"Auto-reconnect: {not args.no_auto_reconnect}")
+    print(f"Auto-connect on startup: {not args.no_auto_connect}")
+    print(f"Audio enabled: {args.audio}")
+    print()
+    print("API Endpoints:")
+    print(f"  GET  http://{args.host}:{args.port}/")
+    print(f"  GET  http://{args.host}:{args.port}/health")
+    print(f"  GET  http://{args.host}:{args.port}/tools")
+    print(f"  POST http://{args.host}:{args.port}/tools/<tool_name>")
+    print(f"  POST http://{args.host}:{args.port}/connect")
+    print(f"  POST http://{args.host}:{args.port}/disconnect")
+    print(f"  GET  http://{args.host}:{args.port}/state")
+    print()
+    print("Starting server...")
+    print()
+
+    server.start(auto_connect=not args.no_auto_connect)
+
+
+if __name__ == "__main__":
+    main()

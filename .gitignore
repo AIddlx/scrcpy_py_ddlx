@@ -1,0 +1,105 @@
+# scrcpy/ 目录（保留源码，忽略本地配置）
+scrcpy/.claude/
+scrcpy/.github/
+scrcpy/.gradle/
+scrcpy/build/
+scrcpy/.externalNativeBuild/
+scrcpy/local.properties
+
+# 编译产物（保留 scrcpy-server 和 yadb 给用户使用）
+scrcpy-server.*
+# yadb - 保留
+*.jar
+# 其他 APK 忽略
+*.apk
+!yadb
+!scrcpy-server
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# 虚拟环境
+venv/
+ENV/
+env/
+.venv
+
+# PyCharm
+.idea/
+*.iml
+*.iws
+*.ipr
+
+# VS Code
+.vscode/
+*.code-workspace
+
+# Jupyter Notebook
+.ipynb_checkpoints
+*.ipynb
+
+# 日志
+*.log
+logs/
+
+# 测试
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.hypothesis/
+
+# Ruff (Python linter)
+.ruff_cache/
+.ruff_cache/*/
+
+# 临时文件
+*.tmp
+*.temp
+*.bak
+*.swp
+*~
+
+# 系统文件
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# 录音文件
+recording_*
+*.opus
+*.mp3
+*.wav
+*.ogg
+
+# 截图
+screenshot*.png
+screenshot*.jpg
+
+# 其他
+*.pid
+*.lock
+
+# 文档（仅保留 user/ 和 api/，忽略内部文档）
+docs/archive/
+docs/development/

@@ -1,0 +1,20 @@
+# scrcpy-py-ddlx - Python scrcpy 客户端依赖
+# ===============================================
+
+# 核心依赖
+av>=13.0.0                    # PyAV - 视频/音频编解码
+numpy>=1.24.0,<2.0.0        # NumPy - 数组操作
+
+# 可选依赖（按需安装）
+PySide6>=6.6.0                # Qt6 - 视频窗口（需要 GUI 功能时安装）
+sounddevice>=0.4.6            # 音频播放（需要音频功能时安装）
+starlette>=0.27.0             # HTTP MCP 服务器（需要 HTTP MCP 时安装）
+uvicorn[standard]>=0.23.0     # HTTP MCP 服务器（需要 HTTP MCP 时安装）
+
+# MCP 服务器（可选）
+mcp>=0.9.0                    # Claude MCP SDK（需要 MCP 功能时安装）
+
+# 开发依赖（可选）
+# pytest>=8.0.0                # 测试框架
+# black>=24.0.0                # 代码格式化
+# mypy>=1.8.0                  # 类型检查

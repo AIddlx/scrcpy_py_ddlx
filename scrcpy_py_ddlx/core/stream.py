@@ -68,10 +68,14 @@ class VideoPacket:
         header: The packet header
         data: The packet payload data (may be merged with config data)
         codec_id: The codec ID (H264, H265, or AV1)
+        packet_id: Optional ID for latency tracking
+        send_time_ns: Device send time in nanoseconds (for full E2E latency)
     """
     header: PacketHeader
     data: bytes
     codec_id: int
+    packet_id: int = -1  # For latency tracking (-1 means not tracked)
+    send_time_ns: int = 0  # Device send time in nanoseconds
 
     @property
     def size(self) -> int:

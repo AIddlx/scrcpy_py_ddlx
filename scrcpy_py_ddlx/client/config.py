@@ -13,6 +13,30 @@ import numpy as np
 from scrcpy_py_ddlx.core.audio.demuxer import AudioDemuxer as OldAudioDemuxer
 
 
+def _auto_detect_codec() -> str:
+    """Auto-detect optimal codec based on device and PC capabilities."""
+    try:
+        from scrcpy_py_ddlx.client.capability_cache import get_optimal_codec
+        return get_optimal_codec()
+    except Exception:
+        return "h264"  # Fallback
+
+
+def _auto_detect_codec_for_device(device_serial: str) -> str:
+    """Auto-detect optimal codec for a specific device."""
+    try:
+        from scrcpy_py_ddlx.client.capability_cache import get_optimal_codec
+        return get_optimal_codec(device_serial)
+    except Exception:
+        return "h264"  # Fallback
+
+
+class ConnectionMode:
+    """Connection mode constants."""
+    ADB_TUNNEL = "adb_tunnel"  # ADB tunnel mode (default)
+    NETWORK = "network"  # Direct network mode (TCP control + UDP media)
+
+
 @dataclass
 class ClientConfig:
     """
@@ -30,9 +54,9 @@ class ClientConfig:
 
     # Video settings
     video: bool = True
-    bitrate: int = 8000000  # 8 Mbps
+    bitrate: int = 2500000  # 2.5 Mbps (平衡画质和带宽)
     max_fps: int = 60
-    codec: str = "h264"  # h264, h265, or av1
+    codec: str = "auto"  # "auto", "h264", "h265", or "av1" ("auto" = detect optimal)
     codec_options: str = ""
     crop: str = ""
     lock_video_orientation: int = -1  # -1 = unlocked
@@ -77,6 +101,72 @@ class ClientConfig:
     tcpip_port: int = 5555  # TCP/IP port (default ADB port)
     tcpip_auto_disconnect: bool = False  # Auto disconnect TCP/IP on close (False = keep connection for next run, like official scrcpy)
 
+    # Network connection mode (TCP control + UDP media)
+    connection_mode: str = "adb_tunnel"  # "adb_tunnel" or "network"
+    control_port: int = 27184  # TCP control port (network mode)
+    video_port: int = 27185  # UDP video port (network mode)
+    audio_port: int = 27186  # UDP audio port (network mode)
+    discovery_port: int = 27183  # UDP discovery port
+
+    # FEC (Forward Error Correction) settings for UDP mode
+    fec_enabled: bool = False  # Legacy: Enable FEC for both video and audio
+    video_fec_enabled: bool = False  # Enable FEC for video stream only
+    audio_fec_enabled: bool = False  # Enable FEC for audio stream only
+    fec_group_size: int = 4  # K: number of data packets per group
+    fec_parity_count: int = 1  # M: number of parity packets per group
+    fec_mode: str = "frame"  # FEC mode: "frame" (K frames per group) or "fragment" (K fragments per group)
+
+    # Bitrate mode: "cbr" (constant) or "vbr" (variable, default)
+    bitrate_mode: str = "vbr"
+
+    # I-frame interval in seconds (lower = faster recovery but more bandwidth)
+    # Supports floating point values (e.g., 0.5 for half a second)
+    i_frame_interval: float = 10.0
+
+    # GPU rendering: use GPU YUV→RGB conversion instead of CPU
+    # When True: decoder outputs NV12 format, GPU shader does color conversion
+    # When False: decoder outputs RGB format, CPU does color conversion (higher GIL contention)
+    # Default: True (recommended for low latency)
+    gpu_rendering: bool = True
+
+    # Low latency optimization settings (server-side)
+    # Enable MediaCodec low latency mode (Android 11+)
+    # Note: May not be supported on all devices, disable if connection fails
+    low_latency: bool = False
+    # Encoder thread priority: 0=normal, 1=urgent, 2=realtime
+    encoder_priority: int = 1
+    # Encoder internal buffer frames (0=auto, 1=disable B-frames for lower latency)
+    encoder_buffer: int = 0
+    # Skip buffered frames to reduce latency (default: enabled)
+    # When encoder has multiple frames buffered, only send the newest one
+    skip_frames: bool = True
+
+    def resolve_codec(self, device_serial: Optional[str] = None) -> str:
+        """
+        Resolve codec string, auto-detecting if set to "auto".
+
+        Args:
+            device_serial: Device serial for capability detection
+
+        Returns:
+            Resolved codec string: "h264", "h265", or "av1"
+        """
+        if self.codec.lower() == "auto":
+            return _auto_detect_codec() if device_serial is None else _auto_detect_codec_for_device(device_serial)
+        return self.codec.lower()
+
+    def is_auto_codec(self) -> bool:
+        """Check if codec is set to auto-detect."""
+        return self.codec.lower() == "auto"
+
+    def is_video_fec_enabled(self) -> bool:
+        """Check if video FEC is enabled."""
+        return self.video_fec_enabled or (self.fec_enabled and not self.video_fec_enabled and not self.audio_fec_enabled)
+
+    def is_audio_fec_enabled(self) -> bool:
+        """Check if audio FEC is enabled."""
+        return self.audio_fec_enabled or (self.fec_enabled and not self.video_fec_enabled and not self.audio_fec_enabled)
+
 
 @dataclass
 class ClientState:
@@ -105,8 +195,24 @@ class ClientState:
     tcpip_port: int = 5555  # Port of TCP/IP connection
     original_device_type: Optional[str] = None  # "usb" or "tcpip" before TCP/IP switch
 
+    # Network mode state
+    network_mode: bool = False  # Whether using network mode
+    video_udp_socket: Optional[socket.socket] = None  # Original UDP video socket (for cleanup)
+    audio_udp_socket: Optional[socket.socket] = None  # Original UDP audio socket (for cleanup)
+    client_ip: Optional[str] = None  # Client IP for UDP responses
+
+    # UdpPacketReader instances (wrappers for UDP sockets)
+    video_socket: Optional[object] = None  # Can be socket or UdpPacketReader
+    audio_socket: Optional[object] = None  # Can be socket or UdpPacketReader
+
+    # Device capabilities (received during negotiation)
+    capabilities: Optional[object] = None  # DeviceCapabilities object
+    selected_video_codec: int = 0  # Selected video codec ID
+    selected_audio_codec: int = 0  # Selected audio codec ID
+
 
 __all__ = [
     "ClientConfig",
     "ClientState",
+    "ConnectionMode",
 ]

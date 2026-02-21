@@ -25,6 +25,9 @@ import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.locks.Condition;
+import java.util.concurrent.locks.Lock;
+import java.util.concurrent.locks.ReentrantLock;
 
 public class SurfaceEncoder implements AsyncProcessor {
 
@@ -43,12 +46,26 @@ public class SurfaceEncoder implements AsyncProcessor {
     private final int videoBitRate;
     private final float maxFps;
     private final boolean downsizeOnError;
+    private final boolean cbrMode;
+    private final float iFrameInterval;
+
+    // Low latency optimization options
+    private final boolean lowLatency;
+    private final int encoderPriority;
+    private final int encoderBuffer;
+    private final boolean skipFrames;
 
     private boolean firstFrameSent;
     private int consecutiveErrors;
 
     private Thread thread;
     private final AtomicBoolean stopped = new AtomicBoolean();
+
+    // Standby mode support (network mode)
+    private final AtomicBoolean standby = new AtomicBoolean(false);
+    private final AtomicBoolean singleFrameRequested = new AtomicBoolean(false);
+    private final Lock standbyLock = new ReentrantLock();
+    private final Condition standbyCondition = standbyLock.newCondition();
 
     private final CaptureReset reset = new CaptureReset();
 
@@ -60,27 +77,57 @@ public class SurfaceEncoder implements AsyncProcessor {
         this.codecOptions = options.getVideoCodecOptions();
         this.encoderName = options.getVideoEncoder();
         this.downsizeOnError = options.getDownsizeOnError();
+        this.cbrMode = options.isCbrMode();
+        this.iFrameInterval = options.getIFrameInterval();
+        this.lowLatency = options.isLowLatency();
+        this.encoderPriority = options.getEncoderPriority();
+        this.encoderBuffer = options.getEncoderBuffer();
+        this.skipFrames = options.isSkipFrames();
+        Ln.i("SurfaceEncoder initialized: videoBitRate=" + videoBitRate + ", maxFps=" + maxFps
+            + ", cbrMode=" + cbrMode + ", iFrameInterval=" + iFrameInterval
+            + ", lowLatency=" + lowLatency + ", encoderPriority=" + encoderPriority
+            + ", encoderBuffer=" + encoderBuffer + ", skipFrames=" + skipFrames);
+    }
+
+    /**
+     * Get the CaptureReset instance for requesting sync frames.
+     */
+    public CaptureReset getCaptureReset() {
+        return reset;
     }
 
     private void streamCapture() throws IOException, ConfigurationException {
         Codec codec = streamer.getCodec();
         MediaCodec mediaCodec = createMediaCodec(codec, encoderName);
-        MediaFormat format = createFormat(codec.getMimeType(), videoBitRate, maxFps, codecOptions);
+        MediaFormat format = createFormat(codec.getMimeType(), videoBitRate, maxFps, cbrMode, iFrameInterval,
+            lowLatency, encoderBuffer, codecOptions);
 
         capture.init(reset);
 
         try {
             boolean alive;
             boolean headerWritten = false;
+            int restartCount = 0;
+            Size lastSize = null;
 
             do {
                 reset.consumeReset(); // If a capture reset was requested, it is implicitly fulfilled
                 capture.prepare();
                 Size size = capture.getSize();
-                if (!headerWritten) {
+
+                if (restartCount > 0) {
+                    Ln.i("Capture restarted: new size=" + size.getWidth() + "x" + size.getHeight() + " (restart #" + restartCount + ")");
+                }
+
+                // Write video header:
+                // - First time: always write
+                // - On restart: write if size changed (screen rotation)
+                if (!headerWritten || (lastSize != null && !lastSize.equals(size))) {
                     streamer.writeVideoHeader(size);
                     headerWritten = true;
+                    Ln.d("Video header sent: " + size.getWidth() + "x" + size.getHeight());
                 }
+                lastSize = size;
 
                 format.setInteger(MediaFormat.KEY_WIDTH, size.getWidth());
                 format.setInteger(MediaFormat.KEY_HEIGHT, size.getHeight());
@@ -100,6 +147,8 @@ public class SurfaceEncoder implements AsyncProcessor {
 
                     // Set the MediaCodec instance to "interrupt" (by signaling an EOS) on reset
                     reset.setRunningMediaCodec(mediaCodec);
+
+                    Ln.d("Encoder configured and started, entering encode loop (size=" + size.getWidth() + "x" + size.getHeight() + ")");
 
                     if (stopped.get()) {
                         alive = false;
@@ -138,6 +187,7 @@ public class SurfaceEncoder implements AsyncProcessor {
                     if (surface != null) {
                         surface.release();
                     }
+                    restartCount++;
                 }
             } while (alive);
         } finally {
@@ -197,20 +247,70 @@ public class SurfaceEncoder implements AsyncProcessor {
     private void encode(MediaCodec codec, Streamer streamer) throws IOException {
         MediaCodec.BufferInfo bufferInfo = new MediaCodec.BufferInfo();
 
-        boolean eos;
+        boolean eos = false;
+        boolean singleFrameMode = false;
+        int framesInSingleMode = 0;
+
+        // Use timeout to detect stall and allow periodic checks
+        final long DEQUEUE_TIMEOUT_US = 100000; // 100ms timeout
+        int consecutiveTimeouts = 0;
+
         do {
-            int outputBufferId = codec.dequeueOutputBuffer(bufferInfo, -1);
+            // Check standby mode before encoding
+            if (standby.get() && !singleFrameMode) {
+                // Wait in standby mode
+                singleFrameMode = waitInStandby();
+                if (stopped.get()) {
+                    break;
+                }
+                if (!singleFrameMode) {
+                    // Woken up but not for single frame, continue to active mode
+                    continue;
+                }
+                framesInSingleMode = 0;
+            }
+
+            int outputBufferId = codec.dequeueOutputBuffer(bufferInfo, DEQUEUE_TIMEOUT_US);
             try {
+                // Handle timeout (no buffer available)
+                if (outputBufferId < 0) {
+                    // INFO_TRY_AGAIN_LATER (-1) means no buffer is available yet
+                    // Track consecutive timeouts to detect stalled encoder
+                    consecutiveTimeouts++;
+                    if (consecutiveTimeouts >= 100) {  // 100 * 100ms = 10 seconds
+                        Ln.w("Encoder stall detected: no output for 10 seconds");
+                        consecutiveTimeouts = 0;
+                    }
+                    continue;
+                }
+
+                // Reset timeout counter on successful dequeue
+                consecutiveTimeouts = 0;
+
                 eos = (bufferInfo.flags & MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0;
+                if (eos) {
+                    Ln.d("EOS received in encode(), exiting loop");
+                }
                 // On EOS, there might be data or not, depending on bufferInfo.size
                 if (outputBufferId >= 0 && bufferInfo.size > 0) {
+                    boolean isConfig = (bufferInfo.flags & MediaCodec.BUFFER_FLAG_CODEC_CONFIG) != 0;
+
                     ByteBuffer codecBuffer = codec.getOutputBuffer(outputBufferId);
 
-                    boolean isConfig = (bufferInfo.flags & MediaCodec.BUFFER_FLAG_CODEC_CONFIG) != 0;
                     if (!isConfig) {
                         // If this is not a config packet, then it contains a frame
                         firstFrameSent = true;
                         consecutiveErrors = 0;
+
+                        // In single frame mode, count frames and exit after one frame
+                        if (singleFrameMode) {
+                            framesInSingleMode++;
+                            if (framesInSingleMode >= 1) {
+                                // Sent one frame, return to standby mode
+                                singleFrameMode = false;
+                                Ln.d("Single frame sent, returning to standby");
+                            }
+                        }
                     }
 
                     streamer.writePacket(codecBuffer, bufferInfo);
@@ -253,17 +353,35 @@ public class SurfaceEncoder implements AsyncProcessor {
         }
     }
 
-    private static MediaFormat createFormat(String videoMimeType, int bitRate, float maxFps, List<CodecOption> codecOptions) {
+    private static MediaFormat createFormat(String videoMimeType, int bitRate, float maxFps, boolean cbrMode,
+                                            float iFrameInterval, boolean lowLatency, int encoderBuffer,
+                                            List<CodecOption> codecOptions) {
         MediaFormat format = new MediaFormat();
         format.setString(MediaFormat.KEY_MIME, videoMimeType);
         format.setInteger(MediaFormat.KEY_BIT_RATE, bitRate);
+
+        // Set bitrate mode: CBR for strict control, VBR for variable quality
+        // Many hardware encoders (Qualcomm, etc.) ignore KEY_BIT_RATE in VBR mode
+        if (Build.VERSION.SDK_INT >= AndroidVersions.API_26_ANDROID_8_0) {
+            if (cbrMode) {
+                format.setInteger(MediaFormat.KEY_BITRATE_MODE, MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CBR);
+                Ln.i("Using CBR mode for bitrate control");
+            } else {
+                format.setInteger(MediaFormat.KEY_BITRATE_MODE, MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_VBR);
+                Ln.i("Using VBR mode for variable quality");
+            }
+        }
+
+        Ln.i("Video format created: mimeType=" + videoMimeType + ", bitRate=" + bitRate + ", maxFps=" + maxFps
+            + ", iFrameInterval=" + iFrameInterval + ", lowLatency=" + lowLatency + ", encoderBuffer=" + encoderBuffer);
+
         // must be present to configure the encoder, but does not impact the actual frame rate, which is variable
         format.setInteger(MediaFormat.KEY_FRAME_RATE, 60);
         format.setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface);
         if (Build.VERSION.SDK_INT >= AndroidVersions.API_24_ANDROID_7_0) {
             format.setInteger(MediaFormat.KEY_COLOR_RANGE, MediaFormat.COLOR_RANGE_LIMITED);
         }
-        format.setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, DEFAULT_I_FRAME_INTERVAL);
+        format.setFloat(MediaFormat.KEY_I_FRAME_INTERVAL, iFrameInterval);
         // display the very first frame, and recover from bad quality when no new frames
         format.setLong(MediaFormat.KEY_REPEAT_PREVIOUS_FRAME_AFTER, REPEAT_FRAME_DELAY_US); // µs
         if (maxFps > 0) {
@@ -271,6 +389,28 @@ public class SurfaceEncoder implements AsyncProcessor {
             // <https://android.googlesource.com/platform/frameworks/base/+/625f0aad9f7a259b6881006ad8710adce57d1384%5E%21/>
             // <https://github.com/Genymobile/scrcpy/issues/488#issuecomment-567321437>
             format.setFloat(KEY_MAX_FPS_TO_ENCODER, maxFps);
+        }
+
+        // Low latency mode (Android 11+)
+        // Note: Only set standard keys that are known to work
+        if (lowLatency && Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            try {
+                format.setInteger(MediaFormat.KEY_LOW_LATENCY, 1);
+                Ln.i("Low latency mode enabled (KEY_LOW_LATENCY=1)");
+            } catch (Exception e) {
+                Ln.w("Failed to set KEY_LOW_LATENCY: " + e.getMessage());
+            }
+        }
+
+        // Disable B-frames for lower latency (B-frames require future frames)
+        // This is a standard key that should be safe
+        if (encoderBuffer > 0) {
+            try {
+                format.setInteger(MediaFormat.KEY_MAX_B_FRAMES, 0);
+                Ln.i("B-frames disabled for lower latency");
+            } catch (Exception e) {
+                Ln.d("KEY_MAX_B_FRAMES not supported or not applicable");
+            }
         }
 
         if (codecOptions != null) {
@@ -288,6 +428,29 @@ public class SurfaceEncoder implements AsyncProcessor {
     @Override
     public void start(TerminationListener listener) {
         thread = new Thread(() -> {
+            // Set thread priority based on encoderPriority setting
+            // 0 = normal (THREAD_PRIORITY_DEFAULT)
+            // 1 = urgent (THREAD_PRIORITY_URGENT_AUDIO)
+            // 2 = realtime (THREAD_PRIORITY_URGENT_DISPLAY)
+            int priority;
+            String priorityName;
+            switch (encoderPriority) {
+                case 2:
+                    priority = android.os.Process.THREAD_PRIORITY_URGENT_DISPLAY;
+                    priorityName = "URGENT_DISPLAY";
+                    break;
+                case 1:
+                    priority = android.os.Process.THREAD_PRIORITY_URGENT_AUDIO;
+                    priorityName = "URGENT_AUDIO";
+                    break;
+                default:
+                    priority = android.os.Process.THREAD_PRIORITY_DEFAULT;
+                    priorityName = "DEFAULT";
+                    break;
+            }
+            android.os.Process.setThreadPriority(priority);
+            Ln.i("Encoder thread priority set to: " + priorityName + " (" + priority + ")");
+
             // Some devices (Meizu) deadlock if the video encoding thread has no Looper
             // <https://github.com/Genymobile/scrcpy/issues/4143>
             Looper.prepare();
@@ -313,7 +476,67 @@ public class SurfaceEncoder implements AsyncProcessor {
     public void stop() {
         if (thread != null) {
             stopped.set(true);
+            // Wake up from standby if waiting
+            wakeFromStandby();
             reset.reset();
+        }
+    }
+
+    /**
+     * Set standby mode.
+     * In standby mode, the encoder is initialized but does not output frames.
+     */
+    public void setStandby(boolean standby) {
+        boolean wasStandby = this.standby.getAndSet(standby);
+        if (wasStandby && !standby) {
+            // Transitioning from standby to active
+            Ln.i("Video encoder: standby -> active");
+            wakeFromStandby();
+        } else if (!wasStandby && standby) {
+            // Transitioning from active to standby
+            Ln.i("Video encoder: active -> standby");
+        }
+    }
+
+    /**
+     * Request a single frame to be encoded and sent.
+     * Used for screenshot functionality in network mode.
+     */
+    public void requestSingleFrame() {
+        singleFrameRequested.set(true);
+        wakeFromStandby();
+    }
+
+    /**
+     * Wake up the encoder from standby mode.
+     */
+    private void wakeFromStandby() {
+        standbyLock.lock();
+        try {
+            standbyCondition.signalAll();
+        } finally {
+            standbyLock.unlock();
+        }
+    }
+
+    /**
+     * Wait while in standby mode (unless single frame is requested).
+     * Returns true if a single frame was requested, false if woken up for other reasons.
+     */
+    private boolean waitInStandby() {
+        standbyLock.lock();
+        try {
+            while (standby.get() && !singleFrameRequested.get() && !stopped.get()) {
+                try {
+                    standbyCondition.await();
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    return false;
+                }
+            }
+            return singleFrameRequested.getAndSet(false);
+        } finally {
+            standbyLock.unlock();
         }
     }
 

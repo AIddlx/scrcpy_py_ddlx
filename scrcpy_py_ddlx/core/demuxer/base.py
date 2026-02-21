@@ -8,6 +8,7 @@ demuxers, along with their exception types.
 import logging
 import socket
 import threading
+import time
 from typing import Optional, Callable
 from queue import Queue
 
@@ -370,6 +371,10 @@ class StreamingDemuxerBase:
         self._socket.settimeout(self.RECV_TIMEOUT)
         self._packet_queue = packet_queue
 
+        # Additional packet sinks (for recording)
+        self._packet_sinks: List[Queue] = []
+        self._sinks_lock = threading.Lock()
+
         # Threading
         self._thread: Optional[threading.Thread] = None
         self._stopped = threading.Event()
@@ -387,6 +392,10 @@ class StreamingDemuxerBase:
         self._incomplete_reads = 0
         self._bytes_dropped = 0  # Bytes dropped while paused
         self._stats_callback = stats_callback
+
+        # Activity tracking (for screen-off detection)
+        self._last_packet_time: Optional[float] = None
+        self._activity_lock = threading.Lock()
 
     def start(self) -> None:
         """Start the demuxer thread."""
@@ -455,6 +464,49 @@ class StreamingDemuxerBase:
         self._pause_event.set()  # Unblock read loop
         logger.info(f"{self.__class__.__name__} resumed")
 
+    def add_packet_sink(self, queue: Queue) -> None:
+        """
+        Add a packet sink queue (for recording).
+
+        Packets will be copied to all sink queues in addition to the primary queue.
+
+        Args:
+            queue: Queue to receive packet copies
+        """
+        with self._sinks_lock:
+            if queue not in self._packet_sinks:
+                self._packet_sinks.append(queue)
+                logger.info(f"{self.__class__.__name__}: added packet sink ({len(self._packet_sinks)} total)")
+
+    def remove_packet_sink(self, queue: Queue) -> None:
+        """
+        Remove a packet sink queue.
+
+        Args:
+            queue: Queue to remove
+        """
+        with self._sinks_lock:
+            if queue in self._packet_sinks:
+                self._packet_sinks.remove(queue)
+                logger.info(f"{self.__class__.__name__}: removed packet sink ({len(self._packet_sinks)} remaining)")
+
+    def _dispatch_to_sinks(self, packet) -> None:
+        """
+        Dispatch packet to all registered sinks (non-blocking).
+
+        Args:
+            packet: Packet to dispatch
+        """
+        with self._sinks_lock:
+            sinks = list(self._packet_sinks)
+
+        for sink_queue in sinks:
+            try:
+                sink_queue.put_nowait(packet)
+            except queue.Full:
+                # Sink queue full, skip (don't block primary flow)
+                pass
+
     def _run_loop(self) -> None:
         """
         Main demuxer loop.
@@ -491,6 +543,13 @@ class StreamingDemuxerBase:
                     try:
                         self._packet_queue.put(packet, timeout=1.0)
                         self._packets_parsed += 1
+
+                        # Update last packet time (for screen-off detection)
+                        with self._activity_lock:
+                            self._last_packet_time = time.time()
+
+                        # Dispatch to recording sinks (non-blocking)
+                        self._dispatch_to_sinks(packet)
 
                         # Optional: report statistics
                         if self._stats_callback:
@@ -576,3 +635,26 @@ class StreamingDemuxerBase:
             "incomplete_reads": self._incomplete_reads,
             "bytes_dropped": self._bytes_dropped,
         }
+
+    def get_last_packet_time(self) -> Optional[float]:
+        """
+        Get the timestamp of the last received packet.
+
+        Returns:
+            Unix timestamp of last packet, or None if no packets received yet.
+            Used for screen-off detection.
+        """
+        with self._activity_lock:
+            return self._last_packet_time
+
+    def get_idle_seconds(self) -> float:
+        """
+        Get how long since the last packet was received.
+
+        Returns:
+            Seconds since last packet, or float('inf') if no packets received.
+        """
+        with self._activity_lock:
+            if self._last_packet_time is None:
+                return float('inf')
+            return time.time() - self._last_packet_time

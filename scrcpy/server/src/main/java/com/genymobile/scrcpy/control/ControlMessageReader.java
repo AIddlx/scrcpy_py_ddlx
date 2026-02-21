@@ -57,6 +57,8 @@ public class ControlMessageReader {
                 return parseUhidDestroy();
             case ControlMessage.TYPE_START_APP:
                 return parseStartApp();
+            case ControlMessage.TYPE_PING:
+                return parsePing();
             default:
                 throw new ControlProtocolException("Unknown event type: " + type);
         }
@@ -165,6 +167,11 @@ public class ControlMessageReader {
     private ControlMessage parseStartApp() throws IOException {
         String name = parseString(1);
         return ControlMessage.createStartApp(name);
+    }
+
+    private ControlMessage parsePing() throws IOException {
+        long timestamp = dis.readLong();
+        return ControlMessage.createPing(timestamp);
     }
 
     private Position parsePosition() throws IOException {

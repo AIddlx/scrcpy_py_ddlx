@@ -25,6 +25,7 @@ import java.nio.ByteBuffer;
 import java.util.List;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 public final class AudioEncoder implements AsyncProcessor {
 
@@ -70,6 +71,10 @@ public final class AudioEncoder implements AsyncProcessor {
     private Thread outputThread;
 
     private boolean ended;
+
+    // Standby mode support (network mode)
+    private final AtomicBoolean standby = new AtomicBoolean(false);
+    private final Object standbyLock = new Object();
 
     public AudioEncoder(AudioCapture capture, Streamer streamer, Options options) {
         this.capture = capture;
@@ -118,6 +123,17 @@ public final class AudioEncoder implements AsyncProcessor {
         streamer.writeAudioHeader();
 
         while (!Thread.currentThread().isInterrupted()) {
+            // Check standby mode
+            synchronized (standbyLock) {
+                while (standby.get() && !Thread.currentThread().isInterrupted()) {
+                    try {
+                        standbyLock.wait();
+                    } catch (InterruptedException e) {
+                        return;
+                    }
+                }
+            }
+
             OutputTask task = outputTasks.take();
             ByteBuffer buffer = mediaCodec.getOutputBuffer(task.index);
             try {
@@ -184,6 +200,24 @@ public final class AudioEncoder implements AsyncProcessor {
     public void join() throws InterruptedException {
         if (thread != null) {
             thread.join();
+        }
+    }
+
+    /**
+     * Set standby mode.
+     * In standby mode, the encoder is initialized but does not output frames.
+     */
+    public void setStandby(boolean standby) {
+        boolean wasStandby = this.standby.getAndSet(standby);
+        if (wasStandby && !standby) {
+            // Transitioning from standby to active
+            Ln.i("Audio encoder: standby -> active");
+            synchronized (standbyLock) {
+                standbyLock.notifyAll();
+            }
+        } else if (!wasStandby && standby) {
+            // Transitioning from active to standby
+            Ln.i("Audio encoder: active -> standby");
         }
     }
 

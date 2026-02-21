@@ -41,11 +41,21 @@ if TYPE_CHECKING and sd is not None:
 else:
     CallbackFlagsType = Any
 
-# Audio configuration (optimized for low latency)
-DEFAULT_TARGET_BUFFERING_MS = 35  # Target buffering delay (ms)
-DEFAULT_OUTPUT_BUFFER_MS = 13      # Audio output buffer size (ms) - 12.5ms for low latency
-DEFAULT_MAX_BUFFER_MS = 100       # Maximum buffer size (ms) - cap to prevent excess delay
-DEFAULT_BLOCKSIZE = 0             # 0 = optimal (variable) blocksize
+# Audio buffer configuration
+#
+# OPUS format: 48kHz, 2ch, 20ms frames = 50 fps
+# Each frame: 1920 samples = 7680 bytes (float32)
+#
+# Buffer sizing rationale:
+# - PREBUFFER: Enough to survive initial network jitter (200ms = 10 frames)
+# - MAX_BUFFER: Cap to prevent excess latency (500ms = 25 frames)
+# - OUTPUT_BUFFER: Match OPUS frame size for optimal callback timing
+#
+DEFAULT_TARGET_BUFFERING_MS = 50   # Target buffering delay (ms)
+DEFAULT_OUTPUT_BUFFER_MS = 20      # Match OPUS frame size (20ms)
+DEFAULT_MAX_BUFFER_MS = 200        # Max 200ms to limit latency (reduced from 500ms)
+DEFAULT_PREBUFFER_MS = 100         # 100ms pre-buffer (balance between latency and underrun protection)
+DEFAULT_BLOCKSIZE = 0              # 0 = optimal (variable) blocksize
 
 
 class SoundDevicePlayer(FrameSink):
@@ -72,6 +82,7 @@ class SoundDevicePlayer(FrameSink):
         target_buffering_ms: int = DEFAULT_TARGET_BUFFERING_MS,
         output_buffer_ms: int = DEFAULT_OUTPUT_BUFFER_MS,
         max_buffer_ms: int = DEFAULT_MAX_BUFFER_MS,
+        prebuffer_ms: int = DEFAULT_PREBUFFER_MS,
         blocksize: int = DEFAULT_BLOCKSIZE
     ):
         """
@@ -81,6 +92,7 @@ class SoundDevicePlayer(FrameSink):
             target_buffering_ms: Target buffering delay (ms) - not currently used
             output_buffer_ms: Output buffer size (ms) - used to calculate blocksize
             max_buffer_ms: Maximum buffer size (ms) - caps internal buffer to limit delay
+            prebuffer_ms: Pre-buffer amount before starting playback (ms)
             blocksize: Number of frames per callback (0 = optimal/variable)
         """
         if not SOUNDDEVICE_AVAILABLE:
@@ -91,6 +103,7 @@ class SoundDevicePlayer(FrameSink):
         self._target_buffering_ms = target_buffering_ms
         self._output_buffer_ms = output_buffer_ms
         self._max_buffer_ms = max_buffer_ms
+        self._prebuffer_ms = prebuffer_ms
         self._blocksize = blocksize
 
         # Audio configuration
@@ -105,6 +118,7 @@ class SoundDevicePlayer(FrameSink):
 
         # Threading
         self._running = False
+        self._stream_started = False  # Track if stream has actually started
 
         # Statistics
         self._frames_pushed = 0
@@ -269,6 +283,15 @@ class SoundDevicePlayer(FrameSink):
                 self._frames_pushed += 1
                 self._total_bytes_pushed += len(samples)
 
+                # Auto-start stream when pre-buffer is ready
+                if self._running and not self._stream_started:
+                    prebuffer_bytes = int(self._sample_rate * self._channels * 4 * self._prebuffer_ms / 1000)
+                    if len(self._sample_buffer) >= prebuffer_bytes:
+                        self._stream.start()
+                        self._stream_started = True
+                        buffer_ms = (len(self._sample_buffer) // 4 // self._channels * 1000) // self._sample_rate
+                        logger.info(f"SoundDevicePlayer stream started (buffer: {buffer_ms}ms, frames: {self._frames_pushed})")
+
             # Log occasionally
             if self._frames_pushed % 100 == 1:
                 with self._buffer_lock:
@@ -287,20 +310,26 @@ class SoundDevicePlayer(FrameSink):
             return False
 
     def start(self) -> None:
-        """Start audio playback."""
+        """
+        Prepare audio playback (will auto-start when buffer has enough data).
+
+        The actual stream start is delayed until enough data is buffered
+        to avoid initial underruns.
+        """
         if self._running:
             return
 
         if self._stream is not None:
             self._running = True
-            self._stream.start()
-            logger.info("SoundDevicePlayer started")
+            # Don't start stream yet - wait for pre-buffer in push()
+            logger.info(f"SoundDevicePlayer ready (pre-buffer: {self._prebuffer_ms}ms)")
         else:
             logger.warning("Cannot start: stream not initialized")
 
     def stop(self) -> None:
         """Stop audio playback."""
         self._running = False
+        self._stream_started = False
 
         if self._stream is not None and self._stream.active:
             try:

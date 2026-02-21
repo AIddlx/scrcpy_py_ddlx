@@ -1,6 +1,7 @@
 package com.genymobile.scrcpy.device;
 
 import com.genymobile.scrcpy.audio.AudioCodec;
+import com.genymobile.scrcpy.udp.UdpMediaSender;
 import com.genymobile.scrcpy.util.Codec;
 import com.genymobile.scrcpy.util.IO;
 
@@ -8,6 +9,7 @@ import android.media.MediaCodec;
 
 import java.io.FileDescriptor;
 import java.io.IOException;
+import java.io.OutputStream;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.util.Arrays;
@@ -22,6 +24,11 @@ public final class Streamer {
     private final boolean sendCodecMeta;
     private final boolean sendFrameMeta;
 
+    // Network mode fields
+    private final OutputStream outputStream;
+    private final UdpMediaSender udpSender;
+    private final boolean networkMode;
+
     private final ByteBuffer headerBuffer = ByteBuffer.allocate(12);
 
     public Streamer(FileDescriptor fd, Codec codec, boolean sendCodecMeta, boolean sendFrameMeta) {
@@ -29,6 +36,31 @@ public final class Streamer {
         this.codec = codec;
         this.sendCodecMeta = sendCodecMeta;
         this.sendFrameMeta = sendFrameMeta;
+        this.outputStream = null;
+        this.udpSender = null;
+        this.networkMode = false;
+    }
+
+    // Network mode constructor (TCP)
+    public Streamer(OutputStream outputStream, Codec codec, boolean sendCodecMeta, boolean sendFrameMeta) {
+        this.fd = null;
+        this.codec = codec;
+        this.sendCodecMeta = sendCodecMeta;
+        this.sendFrameMeta = sendFrameMeta;
+        this.outputStream = outputStream;
+        this.udpSender = null;
+        this.networkMode = true;
+    }
+
+    // Network mode constructor (UDP)
+    public Streamer(UdpMediaSender udpSender, Codec codec, boolean sendCodecMeta, boolean sendFrameMeta) {
+        this.fd = null;
+        this.codec = codec;
+        this.sendCodecMeta = sendCodecMeta;
+        this.sendFrameMeta = sendFrameMeta;
+        this.outputStream = null;
+        this.udpSender = udpSender;
+        this.networkMode = true;
     }
 
     public Codec getCodec() {
@@ -40,18 +72,54 @@ public final class Streamer {
             ByteBuffer buffer = ByteBuffer.allocate(4);
             buffer.putInt(codec.getId());
             buffer.flip();
-            IO.writeFully(fd, buffer);
+            if (networkMode) {
+                if (udpSender != null) {
+                    // UDP mode: send as config packet with pts=0
+                    udpSender.sendPacket(buffer, 0, true, false);
+                } else if (outputStream != null) {
+                    byte[] data = new byte[buffer.remaining()];
+                    buffer.get(data);
+                    outputStream.write(data);
+                }
+            } else {
+                IO.writeFully(fd, buffer);
+            }
         }
     }
 
     public void writeVideoHeader(Size videoSize) throws IOException {
         if (sendCodecMeta) {
-            ByteBuffer buffer = ByteBuffer.allocate(12);
-            buffer.putInt(codec.getId());
-            buffer.putInt(videoSize.getWidth());
-            buffer.putInt(videoSize.getHeight());
-            buffer.flip();
-            IO.writeFully(fd, buffer);
+            // Prepare codec metadata payload: codec_id + width + height = 12 bytes
+            ByteBuffer payload = ByteBuffer.allocate(12);
+            payload.putInt(codec.getId());
+            payload.putInt(videoSize.getWidth());
+            payload.putInt(videoSize.getHeight());
+            payload.flip();
+
+            if (networkMode) {
+                // In network mode, wrap with scrcpy header (same as video frames)
+                // This ensures consistent format for demuxer
+                if (udpSender != null) {
+                    // Create full packet: scrcpy header + payload
+                    ByteBuffer packet = ByteBuffer.allocate(12 + payload.remaining());
+                    // Scrcpy header: pts_flags (config bit set) + size
+                    long ptsFlags = PACKET_FLAG_CONFIG;  // pts=0, config=true
+                    packet.putLong(ptsFlags);
+                    packet.putInt(payload.remaining());
+                    packet.put(payload);
+                    packet.flip();
+
+                    // Send via UDP (will add UDP header internally)
+                    udpSender.sendPacket(packet, 0, true, false);
+                } else if (outputStream != null) {
+                    byte[] data = new byte[payload.remaining()];
+                    payload.get(data);
+                    outputStream.write(data);
+                }
+            } else {
+                // ADB tunnel mode: raw bytes
+                IO.writeFully(fd, payload);
+            }
         }
     }
 
@@ -63,7 +131,17 @@ public final class Streamer {
         if (error) {
             code[3] = 1;
         }
-        IO.writeFully(fd, code, 0, code.length);
+        if (networkMode) {
+            if (udpSender != null) {
+                // UDP mode: send as config packet
+                ByteBuffer buffer = ByteBuffer.wrap(code);
+                udpSender.sendPacket(buffer, 0, true, false);
+            } else if (outputStream != null) {
+                outputStream.write(code);
+            }
+        } else {
+            IO.writeFully(fd, code, 0, code.length);
+        }
     }
 
     public void writePacket(ByteBuffer buffer, long pts, boolean config, boolean keyFrame) throws IOException {
@@ -75,11 +153,53 @@ public final class Streamer {
             }
         }
 
-        if (sendFrameMeta) {
-            writeFrameMeta(fd, buffer.remaining(), pts, config, keyFrame);
-        }
+        if (networkMode) {
+            // Network mode: use OutputStream or UDP
+            if (udpSender != null) {
+                // UDP mode: ALWAYS add scrcpy header (for consistent packet format)
+                // This matches writeVideoHeader() behavior which always adds header
+                int dataSize = buffer.remaining();
+                ByteBuffer packet = ByteBuffer.allocate(12 + dataSize);
 
-        IO.writeFully(fd, buffer);
+                // Build scrcpy header
+                long ptsAndFlags;
+                if (config) {
+                    ptsAndFlags = PACKET_FLAG_CONFIG;
+                } else {
+                    ptsAndFlags = pts;
+                    if (keyFrame) {
+                        ptsAndFlags |= PACKET_FLAG_KEY_FRAME;
+                    }
+                }
+                packet.putLong(ptsAndFlags);
+                packet.putInt(dataSize);
+
+                // Add data
+                packet.put(buffer);
+                packet.flip();
+
+                // Use FEC-enabled send if FEC is enabled
+                if (udpSender.isFecEnabled()) {
+                    udpSender.sendPacketWithFec(packet, pts, config, keyFrame);
+                } else {
+                    udpSender.sendPacket(packet, pts, config, keyFrame);
+                }
+            } else if (outputStream != null) {
+                // TCP mode
+                if (sendFrameMeta) {
+                    writeFrameMetaNetwork(outputStream, buffer.remaining(), pts, config, keyFrame);
+                }
+                byte[] data = new byte[buffer.remaining()];
+                buffer.get(data);
+                outputStream.write(data);
+            }
+        } else {
+            // ADB tunnel mode: use FileDescriptor
+            if (sendFrameMeta) {
+                writeFrameMeta(fd, buffer.remaining(), pts, config, keyFrame);
+            }
+            IO.writeFully(fd, buffer);
+        }
     }
 
     public void writePacket(ByteBuffer codecBuffer, MediaCodec.BufferInfo bufferInfo) throws IOException {
@@ -106,6 +226,28 @@ public final class Streamer {
         headerBuffer.putInt(packetSize);
         headerBuffer.flip();
         IO.writeFully(fd, headerBuffer);
+    }
+
+    private void writeFrameMetaNetwork(OutputStream os, int packetSize, long pts, boolean config, boolean keyFrame) throws IOException {
+        ByteBuffer netHeaderBuffer = ByteBuffer.allocate(12);
+        netHeaderBuffer.clear();
+
+        long ptsAndFlags;
+        if (config) {
+            ptsAndFlags = PACKET_FLAG_CONFIG; // non-media data packet
+        } else {
+            ptsAndFlags = pts;
+            if (keyFrame) {
+                ptsAndFlags |= PACKET_FLAG_KEY_FRAME;
+            }
+        }
+
+        netHeaderBuffer.putLong(ptsAndFlags);
+        netHeaderBuffer.putInt(packetSize);
+        netHeaderBuffer.flip();
+        byte[] header = new byte[netHeaderBuffer.remaining()];
+        netHeaderBuffer.get(header);
+        os.write(header);
     }
 
     private static void fixOpusConfigPacket(ByteBuffer buffer) throws IOException {

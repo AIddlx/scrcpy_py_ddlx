@@ -97,6 +97,14 @@ class ControlMessageType(IntEnum):
     RESET_VIDEO = 17
     SCREENSHOT = 18
     GET_APP_LIST = 19  # Request list of installed applications
+    # Media stream control (network mode)
+    REQUEST_VIDEO_FRAME = 20  # Request single video frame (for screenshot)
+    START_VIDEO = 21         # Start video stream
+    STOP_VIDEO = 22          # Stop video stream (encoder standby)
+    START_AUDIO = 23         # Start audio stream
+    STOP_AUDIO = 24          # Stop audio stream (encoder standby)
+    # Heartbeat (TCP control channel keepalive)
+    PING = 25                # Heartbeat request (client -> server)
 
 
 # ============================================================================
@@ -109,6 +117,8 @@ class DeviceMessageType(IntEnum):
     ACK_CLIPBOARD = 1
     UHID_OUTPUT = 2
     APP_LIST = 3  # List of installed applications
+    SCREENSHOT = 4  # Screenshot image data (JPEG)
+    PONG = 5      # Heartbeat response (server -> client)
 
 
 # ============================================================================
@@ -260,3 +270,66 @@ def pts_flags_to_string(pts_flags: int) -> str:
     pts = extract_pts(pts_flags)
     flag_str = "|".join(flags) if flags else "NONE"
     return f"PTS={pts}, Flags={flag_str}"
+
+
+# ============================================================================
+# UDP Protocol Constants (for network mode)
+# ============================================================================
+
+# UDP Header format: [seq: 4B] [timestamp: 8B] [flags: 4B] [send_time_ns: 8B] = 24 bytes
+UDP_HEADER_SIZE: Final[int] = 24
+
+# UDP Header FLAGS bit definitions (must match UdpMediaSender.java)
+# These are DIFFERENT from scrcpy packet flags (PACKET_FLAG_*)
+UDP_FLAG_KEY_FRAME: Final[int] = 1 << 0      # Bit 0: Key frame
+UDP_FLAG_CONFIG: Final[int] = 1 << 1         # Bit 1: Config packet
+UDP_FLAG_FEC_DATA: Final[int] = 1 << 2       # Bit 2: FEC data packet (reserved)
+UDP_FLAG_FEC_PARITY: Final[int] = 1 << 3     # Bit 3: FEC parity packet (reserved)
+UDP_FLAG_FRAGMENTED: Final[int] = 1 << 31    # Bit 31: Fragmented packet
+
+# UDP packet type detection helpers
+def get_udp_packet_type(flags: int) -> str:
+    """Determine UDP packet type from flags field."""
+    if flags & UDP_FLAG_FRAGMENTED:
+        return "FRAGMENTED"
+    if flags & UDP_FLAG_FEC_PARITY:
+        return "FEC_PARITY"
+    if flags & UDP_FLAG_FEC_DATA:
+        return "FEC_DATA"
+    return "NORMAL"
+
+
+# ============================================================================
+# FEC Configuration (reserved for future implementation)
+# ============================================================================
+
+# Default FEC parameters
+DEFAULT_FEC_GROUP_SIZE: Final[int] = 4       # K: data packets per group
+DEFAULT_FEC_PARITY_COUNT: Final[int] = 1     # M: parity packets per group
+
+# FEC Group Header size: [group_id: 2B] [idx: 1B] [total: 1B] = 4 bytes
+FEC_GROUP_HEADER_SIZE: Final[int] = 4
+
+
+# ============================================================================
+# PLI (Picture Loss Indication) Configuration
+# ============================================================================
+
+# PLI uses existing RESET_VIDEO control message (type 17 = 0x11)
+# No new message type needed for basic PLI support
+
+# PLI trigger thresholds
+DEFAULT_PLI_THRESHOLD: Final[int] = 10       # Consecutive drops before PLI
+DEFAULT_PLI_COOLDOWN: Final[float] = 1.0     # Seconds between PLI requests
+
+
+# ============================================================================
+# UDP Statistics
+# ============================================================================
+
+class UdpPacketType(IntEnum):
+    """UDP packet type enumeration for statistics."""
+    NORMAL = 0
+    FRAGMENTED = 1
+    FEC_DATA = 2
+    FEC_PARITY = 3

@@ -224,6 +224,10 @@ class StreamingVideoDemuxer(StreamingDemuxerBase):
             # Step 1: Read exactly 12 bytes for header
             header_data = self._recv_exact(self.VIDEO_HEADER_SIZE)
 
+            # Debug: Log raw header bytes for diagnosis
+            if self._packets_parsed < 5:
+                logger.debug(f"Raw header bytes: {header_data.hex()}")
+
             # Step 2: Parse header
             pts_flags, payload_size = struct.unpack('>QI', header_data)
             is_config = bool(pts_flags & (1 << 63))
@@ -257,6 +261,16 @@ class StreamingVideoDemuxer(StreamingDemuxerBase):
                 codec_id=self._codec_id
             )
 
+            # Latency tracking: record receive time for ADB/TCP mode
+            # In TCP mode, this tracks when we received the packet from socket
+            try:
+                from scrcpy_py_ddlx.latency_tracker import get_tracker
+                import time
+                recv_time = time.time()
+                packet.packet_id = get_tracker().start_packet_with_time(recv_time, pts)
+            except Exception:
+                pass
+
             # Step 6: Handle config merging for H.264/H.265
             if self._codec_id in (CodecId.H264, CodecId.H265):
                 packet = self._merge_config(packet)
@@ -287,38 +301,25 @@ class StreamingVideoDemuxer(StreamingDemuxerBase):
 
     def _merge_config(self, packet: VideoPacket) -> Optional[VideoPacket]:
         """
-        Merge config packet with media packet for H.264/H.265.
+        Handle config packets for H.264/H.265.
 
-        If packet is config, store it for next packet.
-        If packet is media and config is buffered, prepend config.
+        Config is cached and will be sent to sinks (for recorder to use as extradata).
+        Keyframes are sent WITHOUT config prepended - the recorder handles extradata.
 
-        This matches the behavior of PacketMerger from the buffer-based demuxer.
+        For the decoder, config will be prepended separately in the decoder thread.
 
         Returns:
-            VideoPacket or None if merging fails
+            VideoPacket (including config packets for recorder to process)
         """
         if packet.header.is_config:
-            # Store config for next media packet
+            # Store config for future reference
             self._config_data = packet.data
-            # Return the config packet itself (it should be queued)
+            logger.info(f"[CONFIG] Config packet received: {len(packet.data)} bytes")
+            # Return config packet so recorder can set it as extradata
             return packet
 
-        if self._config_data is not None:
-            # Prepend config to media packet
-            merged_data = self._config_data + packet.data
-            self._config_data = None
-
-            # Create new packet with merged data
-            # Note: Using original header (size field doesn't match actual data size)
-            # This matches the behavior of PacketMerger in buffer-based demuxer
-            merged_packet = VideoPacket(
-                header=packet.header,
-                data=merged_data,
-                codec_id=self._codec_id
-            )
-
-            return merged_packet
-
+        # Keyframes are sent as-is (without config prepended)
+        # The recorder will use extradata, decoder may need separate handling
         return packet
 
     def _get_thread_name(self) -> str:

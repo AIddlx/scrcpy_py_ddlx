@@ -389,6 +389,10 @@ class Recorder(PacketSink):
         self._video_packets_written = 0
         self._audio_packets_written = 0
 
+        # Frame counters for PTS generation
+        self._video_frame_count = 0
+        self._audio_frame_count = 0
+
     def open(self, codec_context: Any) -> bool:
         """
         Initialize a stream with codec parameters.
@@ -425,7 +429,7 @@ class Recorder(PacketSink):
         return "video"  # Default
 
     def _open_video_stream(self, codec_context: Any) -> bool:
-        """Open video stream."""
+        """Open video stream for passthrough recording."""
         with self._lock:
             try:
                 # Extract video parameters
@@ -447,14 +451,27 @@ class Recorder(PacketSink):
                 if self._output is None:
                     self._output = av.open(self._filename, mode='w', format=self._format)
 
-                # Add video stream
+                # Add video stream for passthrough
                 codec_name = self._get_codec_name(codec_id)
-                self._video_stream = self._output.add_stream(codec_name, rate=30)
-                self._video_stream.width = width
-                self._video_stream.height = height
-                self._video_stream.pix_fmt = "yuv420p"
+                self._video_stream = self._output.add_stream(codec_name)
 
-                logger.info(f"Video stream opened: {width}x{height}, codec={codec_name}")
+                # Set time_base for proper PTS handling (milliseconds)
+                from fractions import Fraction
+                self._video_stream.time_base = Fraction(1, 1000)  # 1 millisecond
+
+                # Set width/height for container metadata (not encoding params)
+                # This ensures the file reports correct resolution
+                try:
+                    self._video_stream.width = width
+                    self._video_stream.height = height
+                except Exception as e:
+                    logger.debug(f"Could not set width/height: {e}")
+
+                # Store dimensions for reference
+                self._video_width = width
+                self._video_height = height
+
+                logger.info(f"Video stream opened: {width}x{height}, codec={codec_name}, time_base=1/1000")
                 return True
 
             except Exception as e:
@@ -462,7 +479,7 @@ class Recorder(PacketSink):
                 return False
 
     def _open_audio_stream(self, codec_context: Any) -> bool:
-        """Open audio stream."""
+        """Open audio stream for passthrough recording (OPUS for MKV)."""
         with self._lock:
             try:
                 # Extract audio parameters
@@ -482,12 +499,23 @@ class Recorder(PacketSink):
                 if self._output is None:
                     self._output = av.open(self._filename, mode='w', format=self._format)
 
-                # Add audio stream
-                self._audio_stream = self._output.add_stream('aac', rate=sample_rate)
-                self._audio_stream.channels = channels
-                self._audio_stream.layout = 'stereo' if channels == 2 else 'mono'
+                # For MKV/matroska, use OPUS codec for passthrough (scrcpy sends OPUS)
+                # For MP4, use AAC (requires transcoding, not implemented)
+                layout = 'stereo' if channels == 2 else 'mono'
 
-                logger.info(f"Audio stream opened: {sample_rate}Hz, {channels} channels")
+                if self._format in ('mkv', 'matroska'):
+                    # OPUS passthrough for MKV - use layout parameter, not channels
+                    self._audio_stream = self._output.add_stream('opus', rate=sample_rate, layout=layout)
+                else:
+                    # AAC for MP4 (transcoding would be needed for OPUS source)
+                    logger.warning("MP4 container with OPUS audio requires transcoding. Use MKV for passthrough.")
+                    self._audio_stream = self._output.add_stream('aac', rate=sample_rate, layout=layout)
+
+                # Set time_base for proper PTS handling (milliseconds)
+                from fractions import Fraction
+                self._audio_stream.time_base = Fraction(1, 1000)  # 1 millisecond
+
+                logger.info(f"Audio stream opened: {sample_rate}Hz, {channels} channels, codec={'opus' if self._format in ('mkv', 'matroska') else 'aac'}, time_base=1/1000")
                 return True
 
             except Exception as e:
@@ -505,10 +533,134 @@ class Recorder(PacketSink):
             return 'av1'
         return 'h264'  # Default
 
+    def _convert_annexb_to_length_prefixed(self, data: bytes) -> bytes:
+        """
+        Convert Annex B format (with start codes) to length-prefixed format.
+
+        Annex B: [start code][NAL][start code][NAL]...
+        Length-prefixed: [4-byte size][NAL][4-byte size][NAL]...
+
+        Args:
+            data: Annex B format data
+
+        Returns:
+            Length-prefixed format data
+        """
+        import struct
+        result = bytearray()
+
+        # Find all NAL units
+        i = 0
+        data_len = len(data)
+
+        while i < data_len:
+            # Look for start code
+            if i + 4 <= data_len and data[i:i+4] == b'\x00\x00\x00\x01':
+                nal_start = i + 4
+                i = nal_start
+            elif i + 3 <= data_len and data[i:i+3] == b'\x00\x00\x01':
+                nal_start = i + 3
+                i = nal_start
+            else:
+                i += 1
+                continue
+
+            # Find end of this NAL unit
+            nal_end = data_len
+            for j in range(i, data_len - 3):
+                if data[j:j+4] == b'\x00\x00\x00\x01' or data[j:j+3] == b'\x00\x00\x01':
+                    nal_end = j
+                    break
+
+            if i < nal_end:
+                nal_data = data[i:nal_end]
+                # Write 4-byte size (big-endian) + NAL data
+                result.extend(struct.pack('>I', len(nal_data)))
+                result.extend(nal_data)
+                i = nal_end
+            else:
+                break
+
+        return bytes(result)
+
+    def _convert_annexb_to_extradata(self, data: bytes) -> Optional[bytes]:
+        """
+        Convert Annex B format to extradata format for MKV/MP4.
+
+        IMPORTANT: Original scrcpy uses Annex B format DIRECTLY as extradata!
+        See scrcpy/app/src/recorder.c sc_recorder_set_extradata().
+
+        For maximum compatibility with players, we also try length-prefixed format.
+
+        Args:
+            data: Annex B format data (VPS+SPS+PPS for H.265, SPS+PPS for H.264)
+
+        Returns:
+            Extradata suitable for container, or None if conversion fails
+        """
+        try:
+            import struct
+
+            # Find NAL units by looking for start codes
+            nal_units = []
+            i = 0
+            data_len = len(data)
+
+            while i < data_len:
+                # Look for start code (0x00000001 or 0x000001)
+                if i + 4 <= data_len and data[i:i+4] == b'\x00\x00\x00\x01':
+                    start = i + 4
+                    i = start
+                elif i + 3 <= data_len and data[i:i+3] == b'\x00\x00\x01':
+                    start = i + 3
+                    i = start
+                else:
+                    i += 1
+                    continue
+
+                # Find end of this NAL unit (next start code or end of data)
+                end = data_len
+                for j in range(i, data_len - 3):
+                    if data[j:j+4] == b'\x00\x00\x00\x01' or data[j:j+3] == b'\x00\x00\x01':
+                        end = j
+                        break
+
+                if i < end:
+                    nal_units.append(data[i:end])
+                    i = end
+                else:
+                    break
+
+            if not nal_units:
+                logger.warning("No NAL units found in config data, using raw data")
+                return data  # Return original if parsing fails
+
+            logger.info(f"[EXTRADATA] Found {len(nal_units)} NAL units: sizes={[len(n) for n in nal_units]}")
+
+            # Build HVCC-style extradata for H.265
+            # This is the format expected by MP4/MKV containers
+            # Each NAL unit is prefixed with its size (4 bytes, big-endian)
+            result = bytearray()
+            for nal in nal_units:
+                # 4-byte size prefix + NAL data
+                result.extend(struct.pack('>I', len(nal)))
+                result.extend(nal)
+
+            logger.info(f"[EXTRADATA] Converted to length-prefixed format: {len(result)} bytes")
+            return bytes(result)
+
+        except Exception as e:
+            logger.error(f"Error converting Annex B to extradata: {e}")
+            return data  # Return original on error
+
     def start(self) -> None:
         """Start recording."""
         if self._running:
             return
+
+        # Reset frame counters for new recording
+        self._video_frame_count = 0
+        self._audio_frame_count = 0
 
         self._running = True
         self._thread = threading.Thread(target=self._run_recorder, daemon=True)
@@ -573,12 +725,9 @@ class Recorder(PacketSink):
     def _run_recorder(self) -> None:
         """Recorder thread main loop."""
         try:
-            # Write header
-            if self._output is not None:
-                self._output.start()
-
-            last_video_pts = None
-            last_audio_pts = None
+            logger.info(f"Recorder thread started, video={self._video_enabled}, audio={self._audio_enabled}")
+            packets_processed = 0
+            config_received = False
 
             while self._running:
                 # Get next packet (prioritize video)
@@ -602,25 +751,65 @@ class Recorder(PacketSink):
                 if packet is None:
                     continue
 
+                # Handle video config packets - set as extradata
+                if is_video and hasattr(packet, 'header') and packet.header.is_config:
+                    config_data = packet.data
+                    logger.info(f"[RECORDER] Config packet received: {len(config_data)} bytes")
+
+                    # Convert Annex B to length-prefixed format for MKV/MP4
+                    converted_config = self._convert_annexb_to_length_prefixed(config_data)
+                    logger.info(f"[RECORDER] Config converted: {len(config_data)} -> {len(converted_config)} bytes")
+
+                    if self._video_stream is not None:
+                        try:
+                            # Set extradata BEFORE any frames are written
+                            self._video_stream.codec_context.extradata = converted_config
+                            config_received = True
+                            logger.info(f"[RECORDER] Extradata set successfully")
+                        except Exception as e:
+                            logger.error(f"[RECORDER] Error setting extradata: {e}")
+                    continue  # Config packet not written as frame
+
+                # Skip video frames if no config received yet
+                if is_video and not config_received:
+                    logger.debug("[RECORDER] Skipping frame - no config received yet")
+                    continue
+
                 # Convert packet to PyAV format
                 av_packet = self._convert_packet(packet, is_video)
                 if av_packet is None:
+                    logger.warning(f"Failed to convert {'video' if is_video else 'audio'} packet")
                     continue
 
                 # Write packet
                 stream = self._video_stream if is_video else self._audio_stream
-                if stream is not None:
-                    # Rescale PTS if needed
+                if stream is None:
+                    logger.warning(f"{'Video' if is_video else 'Audio'} stream not initialized")
+                    continue
+
+                try:
+                    # Set stream and mux
                     av_packet.stream = stream
                     self._output.mux(av_packet)
 
+                    packets_processed += 1
                     if is_video:
                         self._video_packets_written += 1
                     else:
                         self._audio_packets_written += 1
 
+                    # Log every 100 packets
+                    if packets_processed % 100 == 0:
+                        logger.debug(f"Recorder: {self._video_packets_written} video, {self._audio_packets_written} audio packets written")
+
+                except Exception as mux_error:
+                    logger.error(f"Error muxing {'video' if is_video else 'audio'} packet: {mux_error}")
+                    # Continue processing other packets
+
+            logger.info(f"Recorder thread finished, total packets: {packets_processed}")
+
         except Exception as e:
-            logger.error(f"Recorder error: {e}")
+            logger.error(f"Recorder error: {e}", exc_info=True)
 
         finally:
             # Write trailer
@@ -640,30 +829,54 @@ class Recorder(PacketSink):
                     logger.error(f"Error in on_ended callback: {e}")
 
     def _convert_packet(self, packet: Any, is_video: bool) -> Optional[av.Packet]:
-        """Convert packet to PyAV format."""
+        """Convert packet to PyAV format with frame-based PTS."""
         try:
             # Get packet data
             if hasattr(packet, "data"):
                 data = packet.data
+            elif isinstance(packet, dict):
+                data = packet.get("data", b"")
             elif isinstance(packet, bytes):
                 data = packet
-            elif hasattr(packet, "get"):
-                data = packet.get("data", b"")
             else:
+                logger.warning("Packet has no data attribute")
                 return None
 
-            # Get PTS
-            if hasattr(packet, "pts"):
-                pts = packet.pts
-            elif hasattr(packet, "header") and hasattr(packet.header, "pts"):
-                pts = packet.header.pts
+            # Get the stream for this packet
+            stream = self._video_stream if is_video else self._audio_stream
+            if stream is None:
+                logger.warning(f"{'Video' if is_video else 'Audio'} stream not available")
+                return None
+
+            # For video frames, convert Annex B to length-prefixed format
+            # This is required for MKV/MP4 containers
+            if is_video and self._format in ('mkv', 'matroska', 'mp4'):
+                data = self._convert_annexb_to_length_prefixed(data)
+
+            # Generate PTS based on frame count
+            # Use milliseconds as the base unit (more compatible)
+            # Video: ~30fps = 33ms per frame
+            # Audio: ~50fps = 20ms per frame
+            if is_video:
+                pts_ms = self._video_frame_count * 33  # milliseconds
+                self._video_frame_count += 1
             else:
-                pts = 0
+                pts_ms = self._audio_frame_count * 20  # milliseconds
+                self._audio_frame_count += 1
 
             # Create PyAV packet
             av_packet = av.Packet(data)
-            av_packet.pts = pts
-            av_packet.dts = pts
+
+            # Set PTS/DTS in the stream's time_base
+            # time_base = 1/1000 means 1 unit = 1ms
+            av_packet.pts = pts_ms
+            av_packet.dts = pts_ms
+            av_packet.time_base = stream.time_base
+
+            # Log first few packets for debugging
+            total = self._video_frame_count + self._audio_frame_count
+            if total <= 3:
+                logger.info(f"Packet {total}: type={'video' if is_video else 'audio'}, pts={pts_ms}, time_base={stream.time_base}")
 
             return av_packet
 
@@ -814,7 +1027,10 @@ class Screen(FrameSink):
             Current frame or None
         """
         if self._delay_buffer is not None:
-            return self._delay_buffer.get_nowait()
+            result = self._delay_buffer.get_nowait()
+            if result is not None:
+                # DelayBuffer returns FrameWithMetadata, extract frame
+                return result.frame if hasattr(result, 'frame') else result
         return None
 
     def consume_frame(self) -> Optional[Any]:
@@ -827,10 +1043,11 @@ class Screen(FrameSink):
             Current frame or None
         """
         if self._delay_buffer is not None:
-            frame = self._delay_buffer.consume()
-            if frame is not None:
+            result = self._delay_buffer.consume()
+            if result is not None:
                 self._frames_shown += 1
-            return frame
+                # DelayBuffer returns FrameWithMetadata, extract frame
+                return result.frame if hasattr(result, 'frame') else result
         return None
 
     def set_delay_buffer(self, delay_buffer: 'DelayBuffer') -> None:

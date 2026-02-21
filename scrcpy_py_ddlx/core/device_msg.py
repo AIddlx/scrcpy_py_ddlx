@@ -35,6 +35,8 @@ class DeviceMessageType(Enum):
     ACK_CLIPBOARD = 1        # Clipboard acknowledge
     UHID_OUTPUT = 2         # UHID output data
     APP_LIST = 3            # List of installed applications
+    SCREENSHOT = 4          # Screenshot image data (JPEG)
+    PONG = 5                # Heartbeat response (server -> client)
 
 
 # Receiver buffer size (from official scrcpy)
@@ -77,9 +79,11 @@ class ReceiverCallbacks:
     These callbacks are called from the receiver thread to notify
     the main thread about device events.
     """
-    on_clipboard: Optional[Callable[[str, int], None]]
-    on_uhid_output: Optional[Callable[[int, bytes, int], None]]
-    on_app_list: Optional[Callable[[List[Dict[str, Any]]], None]]
+    on_clipboard: Optional[Callable[[str, int], None]] = None
+    on_uhid_output: Optional[Callable[[int, bytes, int], None]] = None
+    on_app_list: Optional[Callable[[List[Dict[str, Any]]], None]] = None
+    on_screenshot: Optional[Callable[[Optional[bytes]], None]] = None  # JPEG data or None if failed
+    on_pong: Optional[Callable[[int], None]] = None  # Heartbeat response callback (timestamp)
 
 
 class DeviceMessageReceiver:
@@ -248,6 +252,12 @@ class DeviceMessageReceiver:
 
         elif msg_type == DeviceMessageType.APP_LIST.value:
             return self._process_app_list(buffer, size)
+
+        elif msg_type == DeviceMessageType.SCREENSHOT.value:
+            return self._process_screenshot(buffer, size)
+
+        elif msg_type == DeviceMessageType.PONG.value:
+            return self._process_pong(buffer, size)
 
         else:
             logger.warning(f"Unknown device message type: {msg_type}")
@@ -439,6 +449,74 @@ class DeviceMessageReceiver:
             logger.warning("[DeviceReceiver] App list message received but no callback registered!")
 
         return offset
+
+    def _process_screenshot(self, buffer: bytearray, size: int) -> int:
+        """
+        Process screenshot message (type 4).
+
+        Format:
+        - 1 byte: type = 4
+        - 4 bytes: length (big-endian)
+        - N bytes: JPEG image data (may be 0 if failed)
+
+        Returns:
+            Number of bytes consumed (0 if message incomplete)
+        """
+        if size < 5:  # type (1) + length (4)
+            return 0
+
+        # Read length
+        data_length = struct.unpack(">I", buffer[1:5])[0]
+
+        if size < 5 + data_length:
+            return 0  # Incomplete message
+
+        # Extract JPEG data
+        jpeg_data = bytes(buffer[5:5 + data_length]) if data_length > 0 else None
+
+        if jpeg_data:
+            logger.info(f"[DeviceReceiver] SCREENSHOT message received: {data_length} bytes")
+        else:
+            logger.warning("[DeviceReceiver] SCREENSHOT message received: empty (failed)")
+
+        # Trigger callback
+        if self._callbacks.on_screenshot:
+            try:
+                self._callbacks.on_screenshot(jpeg_data)
+            except Exception as e:
+                logger.error(f"Screenshot callback error: {e}")
+        else:
+            logger.warning("[DeviceReceiver] Screenshot message received but no callback registered!")
+
+        return 5 + data_length
+
+    def _process_pong(self, buffer: bytearray, size: int) -> int:
+        """
+        Process PONG message (type 5) - heartbeat response.
+
+        Format:
+        - 1 byte: type = 5
+        - 8 bytes: timestamp (big-endian, echoed from PING)
+
+        Returns:
+            Number of bytes consumed (always 9 if size >= 9)
+        """
+        if size < 9:
+            return 0
+
+        # Read timestamp
+        timestamp = struct.unpack(">Q", buffer[1:9])[0]
+
+        logger.debug(f"[DeviceReceiver] PONG message received: timestamp={timestamp}")
+
+        # Trigger callback
+        if self._callbacks.on_pong:
+            try:
+                self._callbacks.on_pong(timestamp)
+            except Exception as e:
+                logger.error(f"PONG callback error: {e}")
+
+        return 9
 
 
 class DeviceMessageParser:

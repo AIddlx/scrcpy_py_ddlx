@@ -23,6 +23,8 @@ import threading
 import subprocess
 import urllib.request
 import os
+import socket
+import select
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -45,15 +47,49 @@ log_dir.mkdir(exist_ok=True)
 timestamp = datetime.now()
 log_file = log_dir / f"scrcpy_http_mcp_{timestamp.strftime('%Y%m%d_%H%M%S')}.log"
 
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s | %(levelname)-8s | %(message)s',
-    handlers=[
-        logging.FileHandler(log_file, encoding='utf-8'),
-        logging.StreamHandler(sys.stdout)
-    ]
-)
+# 创建日志格式
+log_format = '%(asctime)s | %(levelname)-8s | %(name)s | %(message)s'
+
+
+class ConsoleFilter(logging.Filter):
+    """
+    控制台日志过滤器
+
+    - 对于音频模块：只显示 WARNING 及以上
+    - 对于其他模块：显示 INFO 及以上
+    """
+    def filter(self, record):
+        # 音频模块只显示 WARNING+
+        if 'audio' in record.name.lower():
+            return record.levelno >= logging.WARNING
+        # 其他模块显示 INFO+
+        return record.levelno >= logging.INFO
+
+
+# 文件处理器：保存全部日志（DEBUG 及以上）
+file_handler = logging.FileHandler(log_file, encoding='utf-8')
+file_handler.setLevel(logging.DEBUG)
+file_handler.setFormatter(logging.Formatter(log_format))
+# 文件不使用过滤器，保存所有日志
+
+# 控制台处理器：使用过滤器控制显示
+console_handler = logging.StreamHandler(sys.stdout)
+console_handler.setLevel(logging.DEBUG)  # 设为 DEBUG，让过滤器决定
+console_handler.setFormatter(logging.Formatter(log_format))
+console_handler.addFilter(ConsoleFilter())  # 添加自定义过滤器
+
+# 配置根日志器
+root_logger = logging.getLogger()
+root_logger.setLevel(logging.DEBUG)  # 根级别设为 DEBUG，允许所有日志通过
+root_logger.addHandler(file_handler)
+root_logger.addHandler(console_handler)
+
 logger = logging.getLogger(__name__)
+
+# 启用 scrcpy_py_ddlx 模块的日志
+# 不在这里设置级别，让日志传播到根日志器处理
+scrcpy_logger = logging.getLogger('scrcpy_py_ddlx')
+# 不要设置级别，使用默认的 NOTSET，让日志传播到根日志器
 
 # 默认音频配置（可通过 --audio 命令行参数修改）
 DEFAULT_AUDIO_ENABLED = False
@@ -62,37 +98,90 @@ DEFAULT_AUDIO_ENABLED = False
 MCP_PROTOCOL_VERSION = "2024-11-05"
 SERVER_INFO = {
     "name": "scrcpy-http-mcp-server",
-    "version": "1.0.0",
+    "version": "2.0.0",  # 支持网络模式和更多参数
     "protocolVersion": MCP_PROTOCOL_VERSION
 }
 
 # 统一坐标系统描述（用于所有涉及坐标的工具）
 COORDINATE_SYSTEM = """
 COORDINATE SYSTEM:
-- Origin (0, 0): Top-left corner of the screen
-- X axis: Increases from left to right (0 to width-1)
-- Y axis: Increases from top to bottom (0 to height-1)
-- Example: For a 1080x2400 screen (portrait), coordinates are:
+- Origin (0, 0): Top-left corner of the screen (regardless of rotation)
+- X axis: Horizontal, increases from left to right (0 to width-1)
+- Y axis: Vertical, increases from top to bottom (0 to height-1)
+- IMPORTANT: width and height change with device rotation:
+
+PORTRAIT (竖屏):  width < height
+  Example: 1080x2400 screen (width=1080, height=2400)
   - Top-left: (0, 0)
   - Top-right: (1079, 0)
   - Bottom-left: (0, 2399)
   - Bottom-right: (1079, 2399)
   - Center: (540, 1200)
+
+LANDSCAPE (横屏):  width > height
+  Example: 2400x1080 screen (width=2400, height=1080)
+  - Top-left: (0, 0)
+  - Top-right: (2399, 0)
+  - Bottom-left: (0, 1079)
+  - Bottom-right: (2399, 1079)
+  - Center: (1200, 540)
+
+NOTE: Call get_state() to get current width, height, and orientation before using coordinates.
 """
 
-# Scrcpy MCP 工具定义（47 个工具）
+# Scrcpy MCP 工具定义（47+ 个工具）
 TOOLS = [
     # 连接管理
     {
         "name": "connect",
-        "description": "Connect to an Android device. IMPORTANT: After discover_devices() finds devices, use device_id='IP:PORT' (e.g., '192.168.1.100:5555') to connect. For USB devices, use device_id from list_devices().",
+        "description": "Connect to an Android device. RECOMMENDED: Use USB with adb_tunnel mode (default, most secure). For wireless, first run push_server(stay_alive=True) via USB, then use network mode. SECURITY: ADB WiFi (5555) is insecure - do NOT use in public networks. Network mode should only be used in trusted private networks.",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "device_id": {"type": "string", "description": "Device ID: use 'IP:PORT' format (e.g., '192.168.1.100:5555') for wireless devices, or serial number for USB devices"},
-                "audio": {"type": "boolean", "description": "Enable audio streaming", "default": False},
-                "tcpip": {"type": "boolean", "description": "Enable TCP/IP wireless mode", "default": False},
-                "stay_awake": {"type": "boolean", "description": "Keep device awake", "default": True}
+                # 连接模式
+                "connection_mode": {
+                    "type": "string",
+                    "enum": ["adb_tunnel", "network"],
+                    "default": "adb_tunnel",
+                    "description": "Connection mode: 'adb_tunnel' (default, secure, uses USB) or 'network' (direct TCP+UDP, requires server running on device)"
+                },
+                "device_id": {
+                    "type": "string",
+                    "description": "Device serial (USB) or IP address (network mode). For network mode, use just IP like '192.168.1.100'"
+                },
+                # 网络模式参数
+                "control_port": {"type": "integer", "default": 27184, "description": "TCP control port (network mode, default: 27184)"},
+                "video_port": {"type": "integer", "default": 27185, "description": "UDP video port (network mode, default: 27185)"},
+                "audio_port": {"type": "integer", "default": 27186, "description": "UDP audio port (network mode, default: 27186)"},
+                "stay_alive": {"type": "boolean", "default": False, "description": "Stay-alive mode: server keeps running after disconnect (network mode)"},
+                "wake_server": {"type": "boolean", "default": True, "description": "Use UDP wake packet to connect to sleeping server (network mode, stay-alive)"},
+                # 媒体参数
+                "video": {"type": "boolean", "default": True, "description": "Enable video streaming"},
+                "audio": {"type": "boolean", "default": False, "description": "Enable audio streaming"},
+                "codec": {
+                    "type": "string",
+                    "enum": ["auto", "h264", "h265", "av1"],
+                    "default": "auto",
+                    "description": "Video codec: auto (detect), h264, h265, or av1"
+                },
+                "bitrate": {"type": "integer", "default": 8000000, "description": "Video bitrate in bps (default: 8 Mbps)"},
+                "max_fps": {"type": "integer", "default": 60, "description": "Max frame rate (30, 60, 90, 120)"},
+                "bitrate_mode": {
+                    "type": "string",
+                    "enum": ["vbr", "cbr"],
+                    "default": "vbr",
+                    "description": "Bitrate mode: vbr (variable quality) or cbr (constant bandwidth)"
+                },
+                "i_frame_interval": {"type": "number", "default": 10.0, "description": "I-frame (keyframe) interval in seconds. Lower = faster recovery but more bandwidth"},
+                # FEC 参数
+                "fec_enabled": {"type": "boolean", "default": False, "description": "Enable FEC for both video and audio (network mode)"},
+                "video_fec_enabled": {"type": "boolean", "default": False, "description": "Enable FEC for video only (network mode)"},
+                "audio_fec_enabled": {"type": "boolean", "default": False, "description": "Enable FEC for audio only (network mode)"},
+                "fec_group_size": {"type": "integer", "default": 4, "description": "FEC data packets per group (K), default: 4"},
+                "fec_parity_count": {"type": "integer", "default": 1, "description": "FEC parity packets per group (M), default: 1"},
+                # 兼容旧参数
+                "tcpip": {"type": "boolean", "default": False, "description": "[DEPRECATED - Insecure] Enable TCP/IP wireless mode via ADB. Use network mode instead."},
+                "stay_awake": {"type": "boolean", "default": True, "description": "Keep device screen awake"}
             }
         }
     },
@@ -102,8 +191,30 @@ TOOLS = [
         "inputSchema": {"type": "object", "properties": {}}
     },
     {
+        "name": "set_video",
+        "description": "Enable or disable video streaming. Requires reconnection to take effect.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "enabled": {"type": "boolean", "description": "Enable (true) or disable (false) video streaming"}
+            },
+            "required": ["enabled"]
+        }
+    },
+    {
+        "name": "set_audio",
+        "description": "Enable or disable audio streaming. Requires reconnection to take effect.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "enabled": {"type": "boolean", "description": "Enable (true) or disable (false) audio streaming"}
+            },
+            "required": ["enabled"]
+        }
+    },
+    {
         "name": "get_state",
-        "description": "Get current device state (name, size, connection status). IMPORTANT: If this returns 'Not connected', first call discover_devices() or list_devices() to find available devices.",
+        "description": "Get current device state including width, height, orientation (portrait/landscape), and connection status. Call this before using any coordinate-based tools to get current screen dimensions. IMPORTANT: If this returns 'Not connected', first call discover_devices() or list_devices() to find available devices.",
         "inputSchema": {"type": "object", "properties": {}}
     },
     {
@@ -124,7 +235,7 @@ TOOLS = [
     },
     {
         "name": "enable_wireless",
-        "description": "Enable wireless debugging on a USB-connected device. Use this when list_devices() shows USB devices but you need wireless connection.",
+        "description": "⚠️ NOT RECOMMENDED - Enable ADB WiFi (5555) which is INSECURE (plaintext, anyone can connect). RECOMMENDED ALTERNATIVE: Use USB for adb_tunnel mode, or use network mode (push_server first). Only use this in trusted private networks.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -136,7 +247,7 @@ TOOLS = [
     },
     {
         "name": "connect_wireless",
-        "description": "Connect to a device via WiFi using its IP address. The device must have wireless debugging enabled first.",
+        "description": "⚠️ NOT RECOMMENDED - Connect via ADB WiFi (5555) which is INSECURE. RECOMMENDED: For wireless, use network mode - first push_server(stay_alive=True) via USB, then connect(connection_mode='network', device_id='IP').",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -148,7 +259,7 @@ TOOLS = [
     },
     {
         "name": "disconnect_wireless",
-        "description": "Disconnect from a wireless device",
+        "description": "Disconnect from an ADB WiFi device (5555 port)",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -159,8 +270,97 @@ TOOLS = [
         }
     },
     {
+        "name": "push_server",
+        "description": "[DEPRECATED] Use push_server_onetime or push_server_persistent instead. Deploy scrcpy server for network mode.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                # 基础参数
+                "device_id": {"type": "string", "description": "Device serial number (USB device, uses first device if not specified)"},
+                "server_path": {"type": "string", "description": "Path to scrcpy-server file (default: ./scrcpy-server)", "default": "./scrcpy-server"},
+                "push": {"type": "boolean", "description": "Push server APK to device", "default": True},
+                "start": {"type": "boolean", "description": "Start server after push with nohup", "default": True},
+                "kill_old": {"type": "boolean", "description": "Kill old server before starting new one", "default": True},
+                "reuse": {"type": "boolean", "description": "Reuse existing server if running, skip push/start", "default": False},
+                "stay_alive": {"type": "boolean", "description": "Start in stay-alive mode for persistent UDP discovery and hot-reconnect", "default": True},
+                # 端口配置
+                "control_port": {"type": "integer", "description": "TCP control port", "default": 27184},
+                "video_port": {"type": "integer", "description": "UDP video port", "default": 27185},
+                "audio_port": {"type": "integer", "description": "UDP audio port", "default": 27186},
+                # 视频参数
+                "video_codec": {
+                    "type": "string",
+                    "enum": ["auto", "h264", "h265", "av1"],
+                    "default": "auto",
+                    "description": "Video codec: auto (detect best), h264 (compatible), h265 (efficient), av1 (newest)"
+                },
+                "video_bitrate": {"type": "integer", "default": 8000000, "description": "Video bitrate in bps (default: 8 Mbps)"},
+                "max_fps": {"type": "integer", "default": 60, "description": "Max frame rate (30, 60, 90, 120)"},
+                "bitrate_mode": {
+                    "type": "string",
+                    "enum": ["vbr", "cbr"],
+                    "default": "vbr",
+                    "description": "Bitrate mode: vbr (variable quality) or cbr (constant bandwidth)"
+                },
+                "i_frame_interval": {"type": "number", "default": 2.0, "description": "I-frame interval in seconds. Lower = faster recovery but more bandwidth (default=2.0 for network mode)"},
+                # 音频参数
+                "audio": {"type": "boolean", "default": False, "description": "Enable audio streaming"},
+                # FEC 参数
+                "fec_enabled": {"type": "boolean", "default": False, "description": "Enable FEC for both video and audio"},
+                "video_fec_enabled": {"type": "boolean", "default": False, "description": "Enable FEC for video only (recommended for bandwidth)"},
+                "audio_fec_enabled": {"type": "boolean", "default": False, "description": "Enable FEC for audio only"},
+                "fec_group_size": {"type": "integer", "default": 4, "description": "FEC data packets per group (K), default: 4"},
+                "fec_parity_count": {"type": "integer", "default": 1, "description": "FEC parity packets per group (M), default: 1"}
+            }
+        }
+    },
+    # 网络模式专用推送工具
+    {
+        "name": "push_server_onetime",
+        "description": "Push and start scrcpy server for ONE-TIME network connection. REQUIRES USB. Server exits after disconnect. Set auto_connect=true to connect immediately after push. DEFAULT: control-only (no video/audio). Set video=true for preview/screenshot, audio=true for recording.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "device_id": {"type": "string", "description": "Device serial (optional, uses first USB device)"},
+                "video": {"type": "boolean", "default": False, "description": "Enable video (for preview/screenshot)"},
+                "audio": {"type": "boolean", "default": False, "description": "Enable audio (for recording)"},
+                "video_codec": {"type": "string", "enum": ["auto", "h264", "h265", "av1"], "default": "auto"},
+                "video_bitrate": {"type": "integer", "default": 8000000},
+                "max_fps": {"type": "integer", "default": 60},
+                "auto_connect": {"type": "boolean", "default": False, "description": "Auto connect via network after push (one-step flow)"}
+            }
+        }
+    },
+    {
+        "name": "push_server_persistent",
+        "description": "Push and start scrcpy server for PERSISTENT network connection. REQUIRES USB. Server keeps running after disconnect, supports hot-reconnect. DEFAULT: control-only (no video/audio). Set video=true for preview/screenshot, audio=true for recording. Flow: 1) USB connect, 2) push_server_persistent(video=true,audio=true), 3) unplug USB, 4) connect/disconnect anytime. Server runs until stop_server() or device reboot.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "device_id": {"type": "string", "description": "Device serial (optional, uses first USB device)"},
+                "video": {"type": "boolean", "default": False, "description": "Enable video (for preview/screenshot)"},
+                "audio": {"type": "boolean", "default": False, "description": "Enable audio (for recording)"},
+                "video_codec": {"type": "string", "enum": ["auto", "h264", "h265", "av1"], "default": "auto"},
+                "video_bitrate": {"type": "integer", "default": 8000000},
+                "max_fps": {"type": "integer", "default": 60},
+                "max_connections": {"type": "integer", "default": -1, "description": "Max connections before exit (-1 = unlimited)"},
+                "fec_enabled": {"type": "boolean", "default": False, "description": "Enable FEC for unstable networks"}
+            }
+        }
+    },
+    {
+        "name": "stop_server",
+        "description": "Stop scrcpy server on device (for persistent mode cleanup). Use when you want to completely shut down the server.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "device_id": {"type": "string", "description": "Device serial (optional)"}
+            }
+        }
+    },
+    {
         "name": "discover_devices",
-        "description": "CRITICAL: Auto-discover devices on local network. ALWAYS call this FIRST when list_devices() returns empty or get_state() returns 'Not connected'. Scans for ADB wireless debugging (port 5555). Returns devices you can connect to using connect(device_id='ip:port').",
+        "description": "Auto-discover devices on local network. Scans for: 1) ADB connected devices (USB/WiFi), 2) Running scrcpy servers (UDP broadcast on port 27183). RECOMMENDED: Use USB when possible. For network mode, first push_server via USB, then discover and connect.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -171,10 +371,24 @@ TOOLS = [
     # 屏幕
     {
         "name": "screenshot",
-        "description": "Capture a screenshot from the device and save to file. Returns the file path.",
+        "description": "Capture screenshot from device. MODES: 1) video=true (default): Fast screenshot from video stream (~16ms). 2) video=false (low power): Screenshot via ADB screencap (~500ms), no video stream needed. Recording requires audio=true.",
         "inputSchema": {
             "type": "object",
-            "properties": {}
+            "properties": {
+                "format": {
+                    "type": "string",
+                    "enum": ["jpg", "png"],
+                    "default": "jpg",
+                    "description": "Image format: jpg (smaller, lossy) or png (larger, lossless)"
+                },
+                "quality": {
+                    "type": "integer",
+                    "default": 80,
+                    "minimum": 1,
+                    "maximum": 100,
+                    "description": "JPEG quality (1-100, only for jpg format). 80=default (good balance), 95=high quality, 40=minimum recommended"
+                }
+            }
         }
     },
     {
@@ -196,6 +410,22 @@ TOOLS = [
                 "filename": {"type": "string", "description": "Optional filename to save (PNG format)"}
             }
         }
+    },
+    # 预览窗口 (分离进程)
+    {
+        "name": "start_preview",
+        "description": "Start a real-time preview window in a separate process. Requires video=true and device must be connected. The preview runs independently and shows live screen.",
+        "inputSchema": {"type": "object", "properties": {}}
+    },
+    {
+        "name": "stop_preview",
+        "description": "Stop the preview window. Connection remains active.",
+        "inputSchema": {"type": "object", "properties": {}}
+    },
+    {
+        "name": "get_preview_status",
+        "description": "Check if preview window is running",
+        "inputSchema": {"type": "object", "properties": {}}
     },
     # 剪贴板
     {
@@ -417,16 +647,16 @@ TOOLS = [
         "description": "Wake up the device screen",
         "inputSchema": {"type": "object", "properties": {}}
     },
-    # 录音
+    # 录 音
     {
         "name": "record_audio",
-        "description": "Record audio to file for a specific duration",
+        "description": "Record audio to file for a specific duration. Three modes: (1) format=auto or omit -> passthrough original OPUS to .ogg (best quality), (2) format=wav -> decode to PCM WAV, (3) format=opus/mp3 -> decode and re-encode",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "filename": {"type": "string", "description": "Output filename. Extension determines format: .wav, .opus, .mp3"},
+                "filename": {"type": "string", "description": "Output filename. Extension determines format: .wav, .opus, .mp3, .ogg"},
                 "duration": {"type": "number", "description": "Recording duration in seconds"},
-                "format": {"type": "string", "description": "Output format: 'wav', 'opus', 'mp3'", "enum": ["wav", "opus", "mp3"]}
+                "format": {"type": "string", "description": "Output format: 'auto' (passthrough), 'wav' (PCM), 'opus' (re-encode), 'mp3' (re-encode)", "enum": ["auto", "wav", "opus", "mp3"]}
             },
             "required": ["filename", "duration"]
         }
@@ -446,6 +676,20 @@ TOOLS = [
         "description": "Get the current recording duration in seconds",
         "inputSchema": {"type": "object", "properties": {}}
     },
+    # 视频录制 - 功能不完整，暂时禁用
+    # TODO: 视频录制功能存在帧同步和编码问题，待修复后启用
+    # {
+    #     "name": "record_video",
+    #     "description": "Record video with audio (MKV format for audio support, MP4 for video only)",
+    #     "inputSchema": {
+    #         "type": "object",
+    #         "properties": {
+    #             "duration": {"type": "number", "description": "Recording duration in seconds"},
+    #             "fps": {"type": "integer", "description": "Video frame rate (default 30)"}
+    #         },
+    #         "required": ["duration"]
+    #     }
+    # },
 ]
 
 # 服务器资源列表
@@ -561,38 +805,547 @@ class ScrcpyMCPHandler:
     def __init__(self):
         self._client = None
         self._server = None
+        self._lock = threading.Lock()
+        self._current_config = None
+        self._preview_manager = None  # Separated preview process
+        self._server = None
         self._lock = threading.Lock()  # 线程安全锁
+        self._current_config = None    # 当前配置
 
     def _is_client_connected(self) -> bool:
         """检查客户端是否已连接"""
         return self._client is not None and self._client.is_connected
 
-    def _ensure_connected(self, audio: bool = None) -> Optional[Any]:
-        """确保已连接到设备
+    def _check_server_alive(self) -> tuple:
+        """
+        检查服务端是否还存活。
+
+        Returns:
+            tuple: (is_alive: bool, error_message: str or None)
+
+        对于不同连接模式使用不同的检测方式：
+        - 网络模式：检查 TCP 控制通道是否可写
+        - ADB 隧道模式：检查 demuxer 线程是否还活跃
+        """
+        if not self._is_client_connected():
+            return False, "Not connected"
+
+        if self._current_config is None:
+            return False, "No configuration"
+
+        try:
+            # 检查客户端状态
+            if self._client and hasattr(self._client, 'state') and self._client.state:
+                state = self._client.state
+
+                # 首先检查 state.connected 标志
+                if not getattr(state, 'connected', False):
+                    return False, "Client state disconnected"
+
+                # 检查视频 demuxer 是否还在运行（如果视频启用）
+                if self._current_config.video:
+                    video_demuxer = getattr(self._client, '_video_demuxer', None)
+                    if video_demuxer is not None:
+                        # 检查线程是否还活着
+                        demuxer_thread = getattr(video_demuxer, '_thread', None)
+                        stopped_event = getattr(video_demuxer, '_stopped', None)
+
+                        # 如果线程不存在或已停止
+                        if demuxer_thread is None or not demuxer_thread.is_alive():
+                            return False, "Video demuxer thread dead"
+
+                        # 如果 stopped 标志被设置
+                        if stopped_event and stopped_event.is_set():
+                            return False, "Video demuxer stopped"
+
+                # 网络模式额外检查：TCP 控制通道
+                connection_mode = getattr(self._current_config, 'connection_mode', 'adb_tunnel')
+                if connection_mode == "network":
+                    control_socket = getattr(state, 'control_socket', None)
+                    if control_socket:
+                        try:
+                            control_socket.getpeername()
+                        except (OSError, ConnectionError, socket.error) as e:
+                            return False, f"Network connection lost: {e}"
+
+                return True, None
+            else:
+                return False, "Client state not available"
+
+        except Exception as e:
+            logger.exception(f"Server alive check failed: {e}")
+            return False, f"Alive check error: {e}"
+
+    def _check_screen_off(self) -> Optional[str]:
+        """
+        检测手机是否可能息屏。
+
+        Returns:
+            None if screen likely on, or warning message if screen may be off.
+
+        检测方式：检查视频 demuxer 最近是否收到新数据。
+        如果超过 3 秒没有新数据包，可能手机息屏了。
+        """
+        if not self._current_config or not self._current_config.video:
+            return None
+
+        if not self._client:
+            return None
+
+        video_demuxer = getattr(self._client, '_video_demuxer', None)
+        if video_demuxer is None:
+            return None
+
+        # 检查是否有 get_idle_seconds 方法
+        if not hasattr(video_demuxer, 'get_idle_seconds'):
+            return None
+
+        try:
+            idle_seconds = video_demuxer.get_idle_seconds()
+
+            # 处理无穷大的情况（从未收到数据）
+            if idle_seconds == float('inf'):
+                return "No video data received yet. Screen may be off or connection not established."
+
+            # 超过 3 秒没有新数据，可能息屏
+            if idle_seconds > 3.0:
+                return f"Screen may be off (no video for {idle_seconds:.1f}s). Please unlock the device."
+
+        except Exception as e:
+            logger.debug(f"Screen off check error: {e}")
+
+        return None
+
+    def _ensure_server_alive_for_operation(self, operation_name: str) -> Optional[Dict]:
+        """
+        确保服务端存活才能执行操作。
 
         Args:
-            audio: 是否启用音频流 (None 使用命令行配置，默认 False)
+            operation_name: 操作名称（用于错误提示）
+
+        Returns:
+            None if server is alive, or error dict if not alive
         """
-        # 使用全局默认配置
-        if audio is None:
-            audio = DEFAULT_AUDIO_ENABLED
-        # 如果客户端已连接，检查音频配置是否匹配
-        if self._is_client_connected():
-            # 检查音频配置是否匹配
-            current_audio = self._client.config.audio if hasattr(self._client, 'config') else False
-            if current_audio == audio:
-                return self._server
-            # 音频配置不匹配，需要重新连接
-            logger.info(f"Audio config changed ({current_audio} -> {audio}), reconnecting...")
-            try:
-                self._server.disconnect()
-            except Exception:
-                pass
+        is_alive, error_msg = self._check_server_alive()
+        if not is_alive:
+            logger.warning(f"Server not alive for {operation_name}: {error_msg}")
+            # 清理无效连接
+            self._cleanup_dead_connection()
+            return {
+                "success": False,
+                "error": f"Server not available: {error_msg}",
+                "hint": "The server has stopped or disconnected. Reconnect with connect() or push_server() first.",
+                "operation": operation_name
+            }
+        return None
+
+    def _cleanup_dead_connection(self):
+        """清理无效的连接状态"""
+        try:
+            if self._server is not None:
+                try:
+                    self._server.disconnect()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        finally:
             self._server = None
             self._client = None
+            self._current_config = None
+            logger.info("Cleaned up dead connection")
 
-        # 清理旧连接（资源泄漏修复）
+    def _config_matches(self, **kwargs) -> bool:
+        """检查配置是否匹配当前连接
+
+        只检查明确提供的参数。未提供的参数被认为匹配当前配置。
+        """
+        if not self._is_client_connected() or self._current_config is None:
+            return False
+
+        config = self._current_config
+
+        # audio: 只有明确提供时才检查
+        if 'audio' in kwargs:
+            if config.audio != kwargs['audio']:
+                return False
+
+        # video: 只有明确提供时才检查
+        if 'video' in kwargs:
+            if config.video != kwargs['video']:
+                return False
+
+        # connection_mode: 只有明确提供时才检查
+        if 'connection_mode' in kwargs:
+            if config.connection_mode != kwargs['connection_mode']:
+                return False
+
+        # host/device_id: 只有明确提供 device_id 时才检查
+        if 'device_id' in kwargs and kwargs['device_id']:
+            expected_host = kwargs['device_id'].split(':')[0]
+            if config.host != expected_host:
+                return False
+
+        return True
+
+    def _start_frame_sender(self):
+        """Start background thread to send frames to preview window."""
+        if not self._preview_manager or not self._preview_manager.is_running:
+            return
+
+        # Check if frame sender is already running
+        if hasattr(self, '_frame_sender_thread') and self._frame_sender_thread is not None:
+            if self._frame_sender_thread.is_alive():
+                logger.warning("Frame sender already running, skipping")
+                return
+
+        def frame_sender_loop():
+            """Send frames from decoder to preview manager and handle control events."""
+            import time
+            import numpy as np
+            last_frame_time = 0
+            frame_interval = 1.0 / 60  # Poll at 60fps
+            frames_sent = 0
+            error_count = 0
+            control_events_sent = 0
+            loop_count = 0
+            has_new_frame_false_count = 0
+            consume_none_count = 0  # Track when consume() returns None
+            send_failed_count = 0  # Track when send_frame() returns False
+            last_log_time = time.time()
+
+            # PTS Clock Drift Diagnostic variables
+            last_sender_pts = 0
+            last_sender_pts_time = 0.0
+            first_sender_pts = 0
+            first_sender_pts_time = 0.0
+
+            logger.info("Frame sender loop started (60fps polling)")
+
+            while self._preview_manager and self._preview_manager.is_running:
+                try:
+                    loop_count += 1
+                    current_time = time.time()
+
+                    # Check connection
+                    if not self._is_client_connected():
+                        time.sleep(0.1)
+                        continue
+
+                    # Handle control events from preview window
+                    try:
+                        events = self._preview_manager.get_control_events()
+                        for event in events:
+                            if self._handle_preview_control_event(event):
+                                control_events_sent += 1
+                    except Exception as e:
+                        if error_count <= 5:
+                            logger.warning(f"Control event handling error: {e}")
+
+                    # Event-driven frame consumption (eliminates polling latency)
+                    frame = None
+                    pts = 0
+                    capture_time = 0.0
+
+                    if self._client:
+                        decoder = getattr(self._client, '_video_decoder', None)
+                        if decoder:
+                            frame_buffer = getattr(decoder, '_frame_buffer', None)
+
+                            if frame_buffer:
+                                # Try non-blocking consume first (fast path)
+                                result = frame_buffer.consume()
+                                if result is not None:
+                                    frame = result.frame if hasattr(result, 'frame') else result
+                                    pts = result.pts if hasattr(result, 'pts') else 0
+                                    capture_time = result.capture_time if hasattr(result, 'capture_time') else 0.0
+                                    udp_recv_time = result.udp_recv_time if hasattr(result, 'udp_recv_time') else 0.0
+                                    # Get frame dimensions from metadata (works for NV12 too!)
+                                    frame_w = result.width if hasattr(result, 'width') else 0
+                                    frame_h = result.height if hasattr(result, 'height') else 0
+                                else:
+                                    # No frame available, briefly yield CPU to decoder
+                                    time.sleep(0.001)  # 1ms - allows decoder to run
+                                    has_new_frame_false_count += 1
+
+                    if frame is not None:
+                        # PTS Clock Drift Diagnostic in frame_sender
+                        # IMPORTANT: PTS from scrcpy device is in MICROSECONDS, not nanoseconds!
+                        sender_current_time = time.time()
+                        if last_sender_pts != 0 and pts != 0:
+                            pts_delta_us = pts - last_sender_pts  # PTS increment in MICROSECONDS
+                            wall_delta_us = int((sender_current_time - last_sender_pts_time) * 1e6)  # Wall clock in MICROSECONDS
+                            drift_us = pts_delta_us - wall_delta_us
+
+                            # Log every 60 frames
+                            if frames_sent % 60 == 0 and first_sender_pts != 0:
+                                total_pts_us = pts - first_sender_pts  # MICROSECONDS
+                                total_wall_us = int((sender_current_time - first_sender_pts_time) * 1e6)  # MICROSECONDS
+                                total_drift_ms = (total_pts_us - total_wall_us) / 1e3  # us to ms
+
+                                true_e2e_at_sender = (sender_current_time - udp_recv_time) * 1000 if udp_recv_time > 0 else 0
+
+                                logger.info(
+                                    f"[SENDER_PTS] Frame #{frames_sent}: "
+                                    f"pts={pts}, "
+                                    f"pts_delta={pts_delta_us/1e3:.1f}ms, "  # us to ms
+                                    f"wall_delta={wall_delta_us/1e3:.1f}ms, "  # us to ms
+                                    f"drift={drift_us/1e3:.2f}ms/frame, "  # us to ms
+                                    f"total_drift={total_drift_ms:.0f}ms, "
+                                    f"TRUE_E2E={true_e2e_at_sender:.0f}ms"
+                                )
+
+                                # CRITICAL WARNING: Detect clock mismatch
+                                if abs(total_drift_ms) > 1000 and true_e2e_at_sender < 200:
+                                    logger.warning(
+                                        f"[SENDER_PTS] CLOCK MISMATCH! "
+                                        f"TRUE_E2E={true_e2e_at_sender:.0f}ms looks OK, but "
+                                        f"total_drift={total_drift_ms:.0f}ms indicates "
+                                        f"{'device clock faster than PC' if total_drift_ms > 0 else 'device clock slower than PC'}"
+                                    )
+
+                        # Record first PTS
+                        if first_sender_pts == 0 and pts != 0:
+                            first_sender_pts = pts
+                            first_sender_pts_time = sender_current_time
+                            logger.info(f"[SENDER_PTS] First frame: pts={pts}")
+
+                        last_sender_pts = pts
+                        last_sender_pts_time = sender_current_time
+
+                        # Check for device rotation (frame size change)
+                        # Use metadata width/height (works for NV12 too!)
+                        if frame_w > 0 and frame_h > 0:
+                            current_w, current_h = self._client.state.device_size
+                            if (frame_w, frame_h) != (current_w, current_h):
+                                logger.info(f"Device rotation detected: {current_w}x{current_h} -> {frame_w}x{frame_h}")
+                                self._client.state.device_size = (frame_w, frame_h)
+                        else:
+                            # Fallback: use frame.shape for RGB format
+                            if len(frame.shape) >= 2:
+                                frame_h, frame_w = frame.shape[:2]
+                                current_w, current_h = self._client.state.device_size
+                                if (frame_w, frame_h) != (current_w, current_h):
+                                    logger.info(f"Device rotation detected: {current_w}x{current_h} -> {frame_w}x{frame_h}")
+                                    self._client.state.device_size = (frame_w, frame_h)
+
+                        # Calculate TRUE_E2E latency at frame_sender stage
+                        sender_time = time.time()
+                        true_e2e_at_sender = (sender_time - udp_recv_time) * 1000 if udp_recv_time > 0 else 0
+
+                        # CRITICAL DIAGNOSTIC: Log every 100 frames with human-readable times
+                        if frames_sent % 100 == 0:
+                            from datetime import datetime as dt
+                            udp_time_str = dt.fromtimestamp(udp_recv_time).strftime('%H:%M:%S.%f')[:-3] if udp_recv_time > 0 else "N/A"
+                            sender_time_str = dt.fromtimestamp(sender_time).strftime('%H:%M:%S.%f')[:-3]
+                            logger.info(f"[FRAME_SENDER] Frame #{frames_sent}: UDP={udp_time_str}, SENDER={sender_time_str}, E2E={true_e2e_at_sender:.0f}ms, pts={pts}")
+
+                        # Log if latency is high at this stage (before sending to preview)
+                        if true_e2e_at_sender > 100:
+                            logger.info(f"[FRAME_SENDER] TRUE_E2E at sender: {true_e2e_at_sender:.0f}ms, pts={pts}")
+
+                        # Send frame directly (shared memory handles copy internally)
+                        try:
+                            sent = self._preview_manager.send_frame(frame, pts, capture_time, udp_recv_time)
+                            if sent:
+                                frames_sent += 1
+                                last_frame_time = current_time
+                                if frames_sent <= 5:
+                                    logger.debug(f"Sent frame #{frames_sent}, shape={frame.shape}")
+                            else:
+                                send_failed_count += 1
+                                if send_failed_count <= 10:
+                                    logger.warning(f"[FRAME_SENDER] send_frame() returned False (count={send_failed_count})")
+                        except Exception as e:
+                            error_count += 1
+                            if error_count <= 5:
+                                logger.warning(f"Frame send error: {e}")
+
+                    # Log stats every 5 seconds for debugging
+                    current_time = time.time()
+                    if current_time - last_log_time >= 5.0:
+                        logger.info(f"[FRAME_SENDER] Sent={frames_sent}, timeout={has_new_frame_false_count}")
+                        last_log_time = current_time
+                        has_new_frame_false_count = 0
+                        send_failed_count = 0
+
+                except Exception as e:
+                    error_count += 1
+                    if error_count <= 10:
+                        logger.warning(f"Frame sender error: {e}")
+                    time.sleep(0.1)
+
+            logger.info(f"Frame sender stopped, sent {frames_sent} frames, {control_events_sent} control events")
+
+        import threading
+        self._frame_sender_thread = threading.Thread(target=frame_sender_loop, daemon=True, name="PreviewFrameSender")
+        self._frame_sender_thread.start()
+        logger.info("Frame sender thread started")
+
+    def _handle_preview_control_event(self, event) -> bool:
+        """Handle control event from preview window.
+
+        Args:
+            event: Tuple of (type, *args)
+                - ('touch_down', x, y) for touch start
+                - ('touch_move', x, y) for touch move
+                - ('touch_up', x, y) for touch end
+                - ('tap', x, y) for simple tap (legacy)
+                - ('swipe', x1, y1, x2, y2) for swipe (legacy)
+                - ('scroll', x, y, hscroll, vscroll) for scroll
+                - ('key', action) for key press
+
+        Returns:
+            True if event was handled successfully
+        """
+        if not self._client:
+            return False
+
+        try:
+            event_type = event[0]
+
+            # Real-time touch events
+            if event_type == 'touch_down':
+                x, y = event[1], event[2]
+                logger.debug(f"Preview touch DOWN: ({x}, {y})")
+                if hasattr(self._client, 'inject_touch_event'):
+                    from scrcpy_py_ddlx.core.protocol import AndroidMotionEventAction, POINTER_ID_GENERIC_FINGER
+                    width, height = self._client.state.device_size
+                    self._client.inject_touch_event(
+                        AndroidMotionEventAction.DOWN,
+                        POINTER_ID_GENERIC_FINGER,
+                        x, y, width, height, 1.0  # pressure = 1.0 for DOWN
+                    )
+                    return True
+
+            elif event_type == 'touch_move':
+                x, y = event[1], event[2]
+                logger.debug(f"Preview touch MOVE: ({x}, {y})")
+                if hasattr(self._client, 'inject_touch_event'):
+                    from scrcpy_py_ddlx.core.protocol import AndroidMotionEventAction, POINTER_ID_GENERIC_FINGER
+                    width, height = self._client.state.device_size
+                    self._client.inject_touch_event(
+                        AndroidMotionEventAction.MOVE,
+                        POINTER_ID_GENERIC_FINGER,
+                        x, y, width, height, 1.0  # pressure = 1.0 for MOVE
+                    )
+                    return True
+
+            elif event_type == 'touch_up':
+                x, y = event[1], event[2]
+                logger.debug(f"Preview touch UP: ({x}, {y})")
+                if hasattr(self._client, 'inject_touch_event'):
+                    from scrcpy_py_ddlx.core.protocol import AndroidMotionEventAction, POINTER_ID_GENERIC_FINGER
+                    width, height = self._client.state.device_size
+                    self._client.inject_touch_event(
+                        AndroidMotionEventAction.UP,
+                        POINTER_ID_GENERIC_FINGER,
+                        x, y, width, height, 0.0  # pressure = 0.0 for UP
+                    )
+                    return True
+
+            # Legacy tap and swipe (for backward compatibility)
+            elif event_type == 'tap':
+                x, y = event[1], event[2]
+                logger.debug(f"Preview tap: ({x}, {y})")
+                if hasattr(self._client, 'tap'):
+                    self._client.tap(x, y)
+                    return True
+
+            elif event_type == 'swipe':
+                x1, y1, x2, y2 = event[1], event[2], event[3], event[4]
+                logger.debug(f"Preview swipe: ({x1}, {y1}) -> ({x2}, {y2})")
+                if hasattr(self._client, 'swipe'):
+                    self._client.swipe(x1, y1, x2, y2, duration_ms=300)
+                    return True
+
+            elif event_type == 'scroll':
+                x, y, hscroll, vscroll = event[1], event[2], event[3], event[4]
+                logger.debug(f"Preview scroll: ({x}, {y}) h={hscroll} v={vscroll}")
+                if hasattr(self._client, 'inject_scroll_event'):
+                    width, height = self._client.state.device_size
+                    self._client.inject_scroll_event(x, y, width, height, hscroll, vscroll)
+                    return True
+
+            elif event_type == 'key':
+                action = event[1]
+                logger.debug(f"Preview key: {action}")
+                # Use inject_keycode method (client doesn't have key_event)
+                if hasattr(self._client, 'inject_keycode'):
+                    from scrcpy_py_ddlx.core.protocol import AndroidKeyEventAction
+                    # Map action names to Android key codes
+                    key_map = {
+                        'back': 4,      # KEYCODE_BACK
+                        'home': 3,      # KEYCODE_HOME
+                        'menu': 82,     # KEYCODE_MENU
+                        'enter': 66,    # KEYCODE_ENTER
+                    }
+                    keycode = key_map.get(action)
+                    if keycode:
+                        # Send DOWN and UP events
+                        self._client.inject_keycode(keycode, AndroidKeyEventAction.DOWN)
+                        self._client.inject_keycode(keycode, AndroidKeyEventAction.UP)
+                        return True
+
+            return False
+
+        except Exception as e:
+            logger.warning(f"Failed to handle preview control event: {e}")
+            return False
+
+    def _ensure_connected(self, **kwargs) -> Optional[Any]:
+        """确保已连接到设备，支持完整的配置参数
+
+        Args:
+            **kwargs: 连接参数
+                - connection_mode: "adb_tunnel" 或 "network"
+                - device_id: 设备 ID 或 IP 地址
+                - video: 启用视频
+                - audio: 启用音频
+                - codec: 视频编码器
+                - bitrate: 视频码率
+                - max_fps: 最大帧率
+                - bitrate_mode: 码率模式 (vbr/cbr)
+                - i_frame_interval: 关键帧间隔
+                - control_port, video_port, audio_port: 网络模式端口
+                - stay_alive: stay-alive 模式
+                - wake_server: UDP wake 唤醒
+                - fec_enabled, video_fec_enabled, audio_fec_enabled: FEC 开关
+                - fec_group_size, fec_parity_count: FEC 参数
+        """
+        # 提取参数
+        connection_mode = kwargs.get('connection_mode', 'adb_tunnel')
+        device_id = kwargs.get('device_id', None)
+        video = kwargs.get('video', True)
+        audio = kwargs.get('audio', DEFAULT_AUDIO_ENABLED)
+        codec = kwargs.get('codec', 'auto')
+        bitrate = kwargs.get('bitrate', 8000000)
+        max_fps = kwargs.get('max_fps', 60)
+        bitrate_mode = kwargs.get('bitrate_mode', 'vbr')
+        i_frame_interval = kwargs.get('i_frame_interval', 10.0)
+        stay_alive = kwargs.get('stay_alive', False)
+        stay_awake = kwargs.get('stay_awake', True)
+
+        # 网络模式参数
+        control_port = kwargs.get('control_port', 27184)
+        video_port = kwargs.get('video_port', 27185)
+        audio_port = kwargs.get('audio_port', 27186)
+        wake_server = kwargs.get('wake_server', True)
+
+        # FEC 参数
+        fec_enabled = kwargs.get('fec_enabled', False)
+        video_fec_enabled = kwargs.get('video_fec_enabled', False)
+        audio_fec_enabled = kwargs.get('audio_fec_enabled', False)
+        fec_group_size = kwargs.get('fec_group_size', 4)
+        fec_parity_count = kwargs.get('fec_parity_count', 1)
+
+        # 如果客户端已连接且配置匹配，直接返回
+        if self._config_matches(**kwargs):
+            return self._server
+
+        # 配置不匹配，需要重新连接
         if self._server is not None:
+            logger.info("Config changed, reconnecting...")
             try:
                 self._server.disconnect()
             except Exception:
@@ -600,22 +1353,59 @@ class ScrcpyMCPHandler:
             self._server = None
             self._client = None
 
-        # 尝试重新连接
+        # 创建配置
         try:
             from scrcpy_py_ddlx import create_mcp_server, ClientConfig
-            # MCP 服务器需要持续解码视频以支持随时截图
-            # 默认启用音频以支持录音功能
+
             config = ClientConfig(
+                # 连接设置
+                connection_mode=connection_mode,
+                host=device_id.split(':')[0] if device_id and ':' in device_id else (device_id or "localhost"),
+                port=int(device_id.split(':')[1]) if device_id and ':' in device_id else 27183,
+                control_port=control_port,
+                video_port=video_port,
+                audio_port=audio_port,
+
+                # 媒体设置
+                video=video,
+                audio=audio,
+                codec=codec,
+                bitrate=bitrate,
+                max_fps=max_fps,
+                bitrate_mode=bitrate_mode,
+                i_frame_interval=i_frame_interval,
+
+                # FEC 设置
+                fec_enabled=fec_enabled,
+                video_fec_enabled=video_fec_enabled,
+                audio_fec_enabled=audio_fec_enabled,
+                fec_group_size=fec_group_size,
+                fec_parity_count=fec_parity_count,
+
+                # 其他设置
                 show_window=False,
                 control=True,
-                audio=audio,
-                bitrate=2000000,  # 2 Mbps 码率
-                lazy_decode=False,  # 禁用懒加载，保持视频持续解码
+                stay_awake=stay_awake,
+                lazy_decode=False,  # MCP 模式：解码器持续运行，截图低延迟
+
+                # ADB 设置
+                tcpip=kwargs.get('tcpip', False),
             )
+
+            self._current_config = config
+
+            # 创建服务器
             self._server = create_mcp_server(default_config=config, log_file=None, enable_console_log=False)
-            # 自动连接 - 显式传递 audio 参数
-            result = self._server.connect(audio=audio)
-            # "Already connected" 也是成功的
+
+            # 连接
+            if connection_mode == "network":
+                # 网络模式：直接连接
+                result = self._server.connect()
+            else:
+                # ADB 隧道模式
+                result = self._server.connect(audio=audio)
+
+            # 检查连接结果
             if result.get("success") or "Already connected" in str(result.get("error", "")):
                 self._client = self._server._client
 
@@ -627,56 +1417,101 @@ class ScrcpyMCPHandler:
                     except Exception as e:
                         logger.warning(f"[YADB] 自动安装失败（中文输入可能不可用）: {e}")
 
+                logger.info(f"Connected: mode={connection_mode}, video={video}, audio={audio}")
                 return self._server
+
+            logger.error(f"Connection failed: {result}")
             return None
+
         except Exception as e:
-            logger.error(f"连接失败: {e}")
+            logger.exception(f"连接失败: {e}")
             return None
 
     def call_tool(self, tool_name: str, arguments: Dict) -> Dict:
         """调用工具（线程安全）"""
         with self._lock:
             try:
-                # connect 操作特殊处理
+                # connect 操作特殊处理 - 支持完整参数
                 if tool_name == "connect":
-                    # 获取 audio 参数
-                    audio = arguments.get("audio", False)
-                    if self._is_client_connected():
-                        # 检查音频配置是否匹配
-                        current_audio = self._client.config.audio if hasattr(self._client, 'config') else False
-                        if current_audio == audio:
-                            # 已连接且配置匹配，返回成功状态
-                            result = {
-                                "success": True,
-                                "already_connected": True,
-                                "device_name": self._client.device_name,
-                                "device_size": self._client.device_size,
-                                "audio": current_audio
-                            }
-                        else:
-                            # 音频配置不匹配，重新连接
-                            server = self._ensure_connected(audio=audio)
-                            if server is not None:
-                                result = {
-                                    "success": True,
-                                    "device_name": self._client.device_name,
-                                    "device_size": self._client.device_size,
-                                    "audio": audio
-                                }
-                            else:
-                                result = {"success": False, "error": "Failed to connect"}
+                    server = self._ensure_connected(**arguments)
+                    if server is not None:
+                        # Get codec info
+                        codec_id = getattr(self._client.state, "codec_id", 0) if self._client else 0
+                        codec_name = "unknown"
+                        if codec_id == 0x68323634:  # 'h264'
+                            codec_name = "h264"
+                        elif codec_id == 0x68323635:  # 'h265'
+                            codec_name = "h265"
+                        elif codec_id == 0x61763031:  # 'av01'
+                            codec_name = "av1"
+
+                        # Get cached encoder info if available
+                        encoder_info = {}
+                        try:
+                            from scrcpy_py_ddlx.client.capability_cache import CapabilityCache
+                            cache = CapabilityCache.get_instance()
+                            device_serial = getattr(self._client.state, "device_serial", None) if self._client else None
+                            if device_serial:
+                                device_cap = cache.get_device_capability(device_serial, force_refresh=False)
+                                if device_cap and device_cap.video_encoders:
+                                    encoder_info = {
+                                        "h264": device_cap.video_encoders.get("h264", []),
+                                        "h265": device_cap.video_encoders.get("h265", []),
+                                        "av1": device_cap.video_encoders.get("av1", []),
+                                    }
+                        except Exception as e:
+                            logger.debug(f"Failed to get encoder info from cache: {e}")
+
+                        result = {
+                            "success": True,
+                            "device_name": self._client.device_name if self._client else "unknown",
+                            "device_size": self._client.device_size if self._client else [0, 0],
+                            "connection_mode": arguments.get("connection_mode", "adb_tunnel"),
+                            "video": arguments.get("video", True),
+                            "audio": arguments.get("audio", False),
+                            "codec": {
+                                "name": codec_name,
+                                "id": f"0x{codec_id:08x}" if codec_id else None,
+                            },
+                            "hardware_encoders": encoder_info if encoder_info else "not cached"
+                        }
                     else:
-                        # 尝试连接
-                        server = self._ensure_connected(audio=audio)
-                        if server is not None:
-                            result = {
-                                "success": True,
-                                "device_name": self._client.device_name,
-                                "device_size": self._client.device_size,
-                                "audio": audio
-                            }
-                        else:
-                            result = {"success": False, "error": "Failed to connect"}
+                        result = {
+                            "success": False,
+                            "error": "Failed to connect",
+                            "hint": "For network mode, ensure scrcpy server is running on device. For ADB mode, ensure device is connected."
+                        }
+                    result_text = json.dumps(result, ensure_ascii=False, indent=2)
+                    return {"content": [{"type": "text", "text": result_text}]}
+
+                # set_video 操作 - 设置视频启用状态（需要重连）
+                if tool_name == "set_video":
+                    enabled = arguments.get("enabled", True)
+                    if self._current_config:
+                        self._current_config.video = enabled
+                        # 需要重连才能生效
+                        result = {
+                            "success": True,
+                            "video": enabled,
+                            "note": "Reconnect required for changes to take effect"
+                        }
+                    else:
+                        result = {"success": False, "error": "Not configured"}
+                    result_text = json.dumps(result, ensure_ascii=False, indent=2)
+                    return {"content": [{"type": "text", "text": result_text}]}
+
+                # set_audio 操作 - 设置音频启用状态（需要重连）
+                if tool_name == "set_audio":
+                    enabled = arguments.get("enabled", True)
+                    if self._current_config:
+                        self._current_config.audio = enabled
+                        result = {
+                            "success": True,
+                            "audio": enabled,
+                            "note": "Reconnect required for changes to take effect"
+                        }
+                    else:
+                        result = {"success": False, "error": "Not configured"}
                     result_text = json.dumps(result, ensure_ascii=False, indent=2)
                     return {"content": [{"type": "text", "text": result_text}]}
 
@@ -686,6 +1521,7 @@ class ScrcpyMCPHandler:
                         result = self._server.disconnect()
                         self._client = None
                         self._server = None
+                        self._current_config = None
                         result_text = json.dumps(result, ensure_ascii=False, indent=2)
                         return {"content": [{"type": "text", "text": result_text}]}
                     else:
@@ -810,91 +1646,552 @@ class ScrcpyMCPHandler:
                     except Exception as e:
                         return {"content": [{"type": "text", "text": json.dumps({"success": False, "error": str(e)}, ensure_ascii=False)}]}
 
+                # start_preview - 启动分离进程预览窗口
+                if tool_name == "start_preview":
+                    try:
+                        if not self._is_client_connected():
+                            return {"content": [{"type": "text", "text": json.dumps({
+                                "success": False,
+                                "error": "Not connected",
+                                "hint": "Connect first with connect()"
+                            }, ensure_ascii=False)}]}
+
+                        if self._current_config and not self._current_config.video:
+                            return {"content": [{"type": "text", "text": json.dumps({
+                                "success": False,
+                                "error": "Video not enabled",
+                                "hint": "Reconnect with video=true to use preview"
+                            }, ensure_ascii=False)}]}
+
+                        # Check if already running
+                        if self._preview_manager and self._preview_manager.is_running:
+                            return {"content": [{"type": "text", "text": json.dumps({
+                                "success": True,
+                                "message": "Preview already running",
+                                "device": self._client.state.device_name if self._client else "unknown"
+                            }, ensure_ascii=False)}]}
+
+                        # CRITICAL: Resume video decoder if paused (lazy decode mode)
+                        # When show_window=False, the decoder is paused to save CPU
+                        # We need to resume it to get frames for the preview window
+                        was_paused = False
+                        if hasattr(self._client, '_video_enabled') and not self._client._video_enabled:
+                            was_paused = True
+                            logger.info("Preview: Resuming video decoder from lazy decode mode")
+                            if hasattr(self._client, 'enable_video'):
+                                self._client.enable_video()
+
+                            # Request a new keyframe to ensure proper decoding after resume
+                            # Without this, the decoder might get P-frames without reference
+                            if hasattr(self._client, 'reset_video'):
+                                self._client.reset_video()
+                                logger.info("Preview: Requested keyframe (reset_video)")
+
+                        # Track lazy decode state for auto-pause on preview stop
+                        self._preview_was_lazy = was_paused
+
+                        # Import and create preview manager
+                        from scrcpy_py_ddlx.preview_process import PreviewManager
+
+                        device_name = getattr(self._client.state, 'device_name', 'Device')
+                        device_size = getattr(self._client.state, 'device_size', (1080, 1920))
+                        width, height = device_size[0], device_size[1]
+
+                        # Use small queue (2 frames) for minimal latency
+                        self._preview_manager = PreviewManager(max_queue_size=2)
+                        success = self._preview_manager.start(device_name, width, height)
+
+                        if success:
+                            # Wait for preview window to be ready before starting frame sender
+                            # This prevents frame loss during preview initialization
+                            logger.info("Waiting for preview window to be ready...")
+                            ready = self._preview_manager.wait_for_ready(timeout=5.0)
+                            if not ready:
+                                logger.warning("Preview window not ready, starting frame sender anyway")
+
+                            # Get the SimpleSHMWriter and pass it to the decoder for direct writing
+                            # This eliminates the frame_sender_thread and GIL contention
+                            shm_writer = self._preview_manager.get_shm_writer()
+                            if shm_writer is not None and self._client is not None:
+                                decoder = getattr(self._client, '_video_decoder', None)
+                                if decoder is not None:
+                                    decoder._shm_writer = shm_writer
+                                    # Try GPU NV12 mode first
+                                    try:
+                                        decoder._output_nv12 = True
+                                        logger.info("Direct SHM mode enabled: GPU NV12 rendering")
+                                    except Exception as e:
+                                        decoder._output_nv12 = False
+                                        logger.warning(f"GPU NV12 not available, falling back to CPU: {e}")
+                                        logger.warning("CPU mode: NOT recommended for >2Mbps or >30fps due to GIL contention")
+                                else:
+                                    logger.warning("Decoder not found, falling back to frame_sender_thread")
+                                    self._start_frame_sender()
+                            else:
+                                logger.warning("SHM writer not available, falling back to frame_sender_thread")
+                                self._start_frame_sender()
+
+                            result = {
+                                "success": True,
+                                "message": "Preview window started",
+                                "device": device_name,
+                                "resolution": f"{width}x{height}"
+                            }
+                        else:
+                            result = {"success": False, "error": "Failed to start preview process"}
+
+                        result_text = json.dumps(result, ensure_ascii=False, indent=2)
+                        return {"content": [{"type": "text", "text": result_text}]}
+                    except Exception as e:
+                        logger.exception(f"start_preview error: {e}")
+                        return {"content": [{"type": "text", "text": json.dumps({"success": False, "error": str(e)}, ensure_ascii=False)}]}
+
+                # stop_preview - 停止预览窗口
+                if tool_name == "stop_preview":
+                    try:
+                        if self._preview_manager:
+                            # Clear the decoder's SHM writer reference and disable NV12
+                            if self._client is not None:
+                                decoder = getattr(self._client, '_video_decoder', None)
+                                if decoder is not None:
+                                    decoder._shm_writer = None
+                                    decoder._output_nv12 = False  # Disable NV12 output
+                                    logger.info("Direct SHM mode disabled (NV12 disabled)")
+
+                            self._preview_manager.stop()
+                            self._preview_manager = None
+
+                            # Re-pause video if it was in lazy decode mode before preview
+                            if getattr(self, '_preview_was_lazy', False):
+                                logger.info("Preview: Re-pausing video decoder (lazy decode mode)")
+                                if hasattr(self._client, 'disable_video'):
+                                    self._client.disable_video()
+                                self._preview_was_lazy = False
+
+                            result = {"success": True, "message": "Preview stopped"}
+                        else:
+                            result = {"success": True, "message": "Preview was not running"}
+
+                        result_text = json.dumps(result, ensure_ascii=False, indent=2)
+                        return {"content": [{"type": "text", "text": result_text}]}
+                    except Exception as e:
+                        return {"content": [{"type": "text", "text": json.dumps({"success": False, "error": str(e)}, ensure_ascii=False)}]}
+
+                # get_preview_status - 获取预览状态
+                if tool_name == "get_preview_status":
+                    try:
+                        is_running = self._preview_manager and self._preview_manager.is_running
+                        result = {
+                            "success": True,
+                            "running": is_running,
+                            "device": getattr(self._client.state, 'device_name', None) if self._client else None
+                        }
+                        result_text = json.dumps(result, ensure_ascii=False, indent=2)
+                        return {"content": [{"type": "text", "text": result_text}]}
+                    except Exception as e:
+                        return {"content": [{"type": "text", "text": json.dumps({"success": False, "error": str(e)}, ensure_ascii=False)}]}
+
+                # push_server_onetime / push_server_persistent - 必须在 push_server 之前处理
+                auto_connect_after_push = False
+                if tool_name == "push_server_onetime":
+                    # 一次性模式：stay_alive=false，断开后服务端退出
+                    # video/audio 由用户控制，默认都关闭（仅控制消息）
+                    arguments["stay_alive"] = False
+                    arguments["video"] = arguments.get("video", False)
+                    arguments["audio"] = arguments.get("audio", False)
+                    auto_connect_after_push = arguments.pop("auto_connect", False)  # 保存并移除
+                    tool_name = "push_server"  # 继续到 push_server 的处理
+
+                if tool_name == "push_server_persistent":
+                    # 常驻模式：stay_alive=true，断开后服务端继续运行
+                    # video/audio 由用户控制，默认都关闭（仅控制消息）
+                    arguments["stay_alive"] = True
+                    arguments["video"] = arguments.get("video", False)
+                    arguments["audio"] = arguments.get("audio", False)
+                    max_conn = arguments.get("max_connections", -1)
+                    if max_conn > 0:
+                        arguments["max_connections"] = max_conn
+                    tool_name = "push_server"  # 继续到 push_server 的处理
+
+                # push_server 操作 - 推送服务器文件到设备
+                if tool_name == "push_server":
+                    try:
+                        import subprocess
+                        import os
+                        import time
+
+                        # 基础参数
+                        server_path = arguments.get("server_path", "./scrcpy-server")
+                        device_id = arguments.get("device_id")
+                        do_push = arguments.get("push", True)
+                        start_server = arguments.get("start", True)
+                        kill_old = arguments.get("kill_old", True)
+                        reuse_server = arguments.get("reuse", False)
+                        stay_alive = arguments.get("stay_alive", True)
+
+                        # 端口配置
+                        control_port = arguments.get("control_port", 27184)
+                        video_port = arguments.get("video_port", 27185)
+                        audio_port = arguments.get("audio_port", 27186)
+
+                        # 视频参数
+                        video_enabled = arguments.get("video", True)  # 默认开启（兼容旧版）
+                        video_codec = arguments.get("video_codec", "auto")
+                        video_bitrate = arguments.get("video_bitrate", 8000000)
+                        max_fps = arguments.get("max_fps", 60)
+                        bitrate_mode = arguments.get("bitrate_mode", "vbr")
+                        i_frame_interval = arguments.get("i_frame_interval", 10.0)
+
+                        # 音频参数
+                        audio_enabled = arguments.get("audio", False)
+
+                        # FEC 参数
+                        fec_enabled = arguments.get("fec_enabled", False)
+                        video_fec_enabled = arguments.get("video_fec_enabled", False)
+                        audio_fec_enabled = arguments.get("audio_fec_enabled", False)
+                        fec_group_size = arguments.get("fec_group_size", 4)
+                        fec_parity_count = arguments.get("fec_parity_count", 1)
+
+                        # 构建基础 adb 命令前缀
+                        def adb_cmd(args):
+                            if device_id:
+                                return ["adb", "-s", device_id] + args
+                            return ["adb"] + args
+
+                        # 检查是否有服务端在运行
+                        def check_server_running():
+                            try:
+                                result = subprocess.run(
+                                    adb_cmd(["shell", "ps -A | grep app_process"]),
+                                    capture_output=True, text=True, timeout=5
+                                )
+                                return "app_process" in result.stdout
+                            except Exception:
+                                return False
+
+                        server_running = check_server_running()
+                        result_data = {"success": True}
+
+                        # 复用模式：如果服务端已运行，跳过所有操作
+                        if reuse_server and server_running:
+                            result_data["message"] = "Server already running, reusing it"
+                            result_data["action"] = "reuse"
+                            result_data["server_running"] = True
+
+                            # 获取设备 IP
+                            try:
+                                ip_result = subprocess.run(
+                                    adb_cmd(["shell", "ip route | awk '/src/ {print $NF}' | head -1"]),
+                                    capture_output=True, text=True, timeout=5
+                                )
+                                device_ip = ip_result.stdout.strip() if ip_result.returncode == 0 else None
+                                if device_ip:
+                                    result_data["device_ip"] = device_ip
+                                    result_data["next_step"] = f"Use connect(connection_mode='network', device_id='{device_ip}') to connect"
+                            except Exception:
+                                pass
+
+                            result_text = json.dumps(result_data, ensure_ascii=False, indent=2)
+                            return {"content": [{"type": "text", "text": result_text}]}
+
+                        # 杀掉旧服务端（如果需要）
+                        if start_server and kill_old and server_running:
+                            logger.info("Killing old server...")
+                            subprocess.run(
+                                adb_cmd(["shell", "pkill -9 -f app_process"]),
+                                capture_output=True, timeout=5
+                            )
+                            time.sleep(1)
+                            result_data["killed_old"] = True
+
+                        # 推送服务器文件
+                        if do_push:
+                            # 检查服务器文件是否存在
+                            if not os.path.exists(server_path):
+                                project_root = os.path.dirname(os.path.abspath(__file__))
+                                alt_path = os.path.join(project_root, "scrcpy-server")
+                                if os.path.exists(alt_path):
+                                    server_path = alt_path
+                                else:
+                                    return {"content": [{"type": "text", "text": json.dumps({
+                                        "success": False,
+                                        "error": f"Server file not found: {server_path}",
+                                        "hint": "Build the server first or specify correct path"
+                                    }, ensure_ascii=False)}]}
+
+                            server_path = os.path.abspath(server_path)
+                            logger.info(f"Pushing server from: {server_path}")
+
+                            remote_path = "/data/local/tmp/scrcpy-server.apk"
+                            push_result = subprocess.run(
+                                adb_cmd(["push", server_path, remote_path]),
+                                capture_output=True, text=True, timeout=60
+                            )
+
+                            if push_result.returncode != 0:
+                                result_data = {
+                                    "success": False,
+                                    "error": push_result.stderr.strip() or "adb push failed",
+                                    "command": " ".join(adb_cmd(["push", server_path, remote_path]))
+                                }
+                                result_text = json.dumps(result_data, ensure_ascii=False, indent=2)
+                                return {"content": [{"type": "text", "text": result_text}]}
+
+                            result_data["push"] = {
+                                "source": server_path,
+                                "destination": remote_path,
+                                "output": push_result.stdout.strip()
+                            }
+                        else:
+                            result_data["push"] = "skipped"
+
+                        # 启动服务端
+                        if start_server:
+                            logger.info("Starting server with nohup...")
+                            remote_path = "/data/local/tmp/scrcpy-server.apk"
+
+                            # 构建服务端启动命令
+                            stay_alive_str = "true" if stay_alive else "false"
+                            audio_str = "true" if audio_enabled else "false"
+
+                            # 获取 discovery_port（用于 UDP 唤醒）
+                            discovery_port = arguments.get("discovery_port", 27183)
+
+                            # 自动检测编解码器（auto 不能直接传给服务端）
+                            actual_codec = video_codec
+                            if video_codec.lower() == "auto":
+                                try:
+                                    from scrcpy_py_ddlx.client.capability_cache import CapabilityCache
+                                    cache = CapabilityCache.get_instance()
+                                    # 获取当前设备 serial
+                                    serial_arg = ["-s", device_id] if device_id else []
+                                    serial_result = subprocess.run(
+                                        ["adb"] + serial_arg + ["shell", "getprop ro.serialno"],
+                                        capture_output=True, text=True, timeout=5
+                                    )
+                                    device_serial = serial_result.stdout.strip() if serial_result.returncode == 0 else None
+                                    if device_serial:
+                                        optimal_config = cache.get_optimal_config(device_serial)
+                                        actual_codec = optimal_config.codec
+                                        logger.info(f"Auto-selected codec for {device_serial}: {actual_codec}")
+                                    else:
+                                        actual_codec = "h264"
+                                        logger.warning("Could not get device serial, using h264")
+                                except Exception as e:
+                                    actual_codec = "h264"
+                                    logger.warning(f"Failed to auto-select codec: {e}, using h264")
+
+                            server_cmd = (
+                                f"CLASSPATH={remote_path} app_process / "
+                                f"com.genymobile.scrcpy.Server 3.3.4 log_level=info "
+                                f"discovery_port={discovery_port} "
+                                f"control_port={control_port} video_port={video_port} audio_port={audio_port} "
+                                f"video_codec={actual_codec} video_bit_rate={video_bitrate} max_fps={max_fps} "
+                                f"bitrate_mode={bitrate_mode} i_frame_interval={i_frame_interval} "
+                                f"stay_alive={stay_alive_str} "
+                            )
+
+                            # FEC 参数
+                            if fec_enabled:
+                                server_cmd += f"fec_enabled=true fec_group_size={fec_group_size} fec_parity_count={fec_parity_count} "
+                            else:
+                                if video_fec_enabled:
+                                    server_cmd += f"video_fec_enabled=true "
+                                if audio_fec_enabled:
+                                    server_cmd += f"audio_fec_enabled=true "
+                                if video_fec_enabled or audio_fec_enabled:
+                                    server_cmd += f"fec_group_size={fec_group_size} fec_parity_count={fec_parity_count} "
+
+                            server_cmd += (
+                                f"video={'true' if video_enabled else 'false'} audio={audio_str} control=true send_device_meta=true send_dummy_byte=true cleanup=false"
+                            )
+
+                            shell_cmd = f"nohup sh -c '{server_cmd}' > /data/local/tmp/scrcpy_server.log 2>&1 &"
+
+                            logger.info(f"Start command: adb shell {shell_cmd}")
+                            subprocess.run(
+                                adb_cmd(["shell", shell_cmd]),
+                                capture_output=True, text=True, timeout=10
+                            )
+
+                            # 等待服务端启动
+                            server_started = False
+                            for i in range(10):
+                                time.sleep(0.5)
+                                if check_server_running():
+                                    server_started = True
+                                    break
+
+                            result_data["start"] = {
+                                "status": "running" if server_started else "failed",
+                                "stay_alive": stay_alive,
+                                "ports": {"control": control_port, "video": video_port, "audio": audio_port},
+                                "video": {"codec": video_codec, "bitrate": video_bitrate, "max_fps": max_fps, "bitrate_mode": bitrate_mode},
+                                "audio": audio_enabled,
+                                "fec": {"enabled": fec_enabled, "video": video_fec_enabled, "audio": audio_fec_enabled}
+                            }
+
+                            if server_started:
+                                result_data["message"] = "Server pushed and started"
+                                result_data["action"] = "push_and_start"
+
+                                # 获取设备 IP
+                                try:
+                                    ip_result = subprocess.run(
+                                        adb_cmd(["shell", "ip route | awk '/src/ {print $NF}' | head -1"]),
+                                        capture_output=True, text=True, timeout=5
+                                    )
+                                    device_ip = ip_result.stdout.strip() if ip_result.returncode == 0 else None
+                                    if device_ip:
+                                        result_data["start"]["device_ip"] = device_ip
+                                        result_data["next_step"] = f"Use connect(connection_mode='network', device_id='{device_ip}') to connect"
+                                except Exception as e:
+                                    result_data["start"]["ip_check_error"] = str(e)
+                            else:
+                                result_data["success"] = False
+                                result_data["message"] = "Server pushed but failed to start"
+                                result_data["start"]["hint"] = "Check /data/local/tmp/scrcpy_server.log on device"
+                        else:
+                            result_data["message"] = "Server pushed" if do_push else "No action (push=false, start=false)"
+                            result_data["action"] = "push_only" if do_push else "none"
+
+                        # 自动连接（如果请求且条件满足）
+                        if auto_connect_after_push and result_data.get("success") and device_ip:
+                            logger.info(f"[auto_connect] Attempting network connection to {device_ip}")
+                            connect_args = {
+                                "connection_mode": "network",
+                                "device_id": device_ip,
+                                "video": video_enabled,
+                                "audio": audio_enabled,
+                                "codec": video_codec,
+                                "bitrate": video_bitrate,
+                                "max_fps": max_fps
+                            }
+                            server = self._ensure_connected(**connect_args)
+                            if server is not None:
+                                result_data["auto_connect"] = {
+                                    "success": True,
+                                    "device_ip": device_ip,
+                                    "mode": "network"
+                                }
+                                result_data["message"] = "Server pushed and connected via network"
+                            else:
+                                result_data["auto_connect"] = {
+                                    "success": False,
+                                    "device_ip": device_ip,
+                                    "error": "Connection failed"
+                                }
+                                result_data["message"] = "Server pushed but auto-connect failed"
+
+                        result_text = json.dumps(result_data, ensure_ascii=False, indent=2)
+                        return {"content": [{"type": "text", "text": result_text}]}
+                    except subprocess.TimeoutExpired:
+                        return {"content": [{"type": "text", "text": json.dumps({"success": False, "error": "Timeout: adb command took too long"}, ensure_ascii=False)}]}
+                    except FileNotFoundError:
+                        return {"content": [{"type": "text", "text": json.dumps({"success": False, "error": "adb command not found in PATH"}, ensure_ascii=False)}]}
+                    except Exception as e:
+                        return {"content": [{"type": "text", "text": json.dumps({"success": False, "error": str(e)}, ensure_ascii=False)}]}
+
+                # stop_server - 停止设备上的服务端
+                if tool_name == "stop_server":
+                    try:
+                        import subprocess
+                        device_id = arguments.get("device_id")
+
+                        def adb_cmd(args):
+                            if device_id:
+                                return ["adb", "-s", device_id] + args
+                            return ["adb"] + args
+
+                        result = subprocess.run(
+                            adb_cmd(["shell", "pkill -9 -f app_process"]),
+                            capture_output=True, text=True, timeout=5
+                        )
+
+                        result_data = {
+                            "success": True,
+                            "message": "Server stopped",
+                            "device_id": device_id
+                        }
+                        result_text = json.dumps(result_data, ensure_ascii=False, indent=2)
+                        return {"content": [{"type": "text", "text": result_text}]}
+                    except Exception as e:
+                        return {"content": [{"type": "text", "text": json.dumps({"success": False, "error": str(e)}, ensure_ascii=False)}]}
+
                 # discover_devices 操作特殊处理 - 不需要先连接
                 if tool_name == "discover_devices":
                     try:
-                        import socket
-                        import concurrent.futures
+                        all_devices = []
 
-                        timeout_ms = arguments.get("timeout", 500)
-                        timeout_sec = timeout_ms / 1000.0
+                        # 1. 获取已连接的 ADB 设备
+                        try:
+                            from scrcpy_py_ddlx.core.adb import ADBManager
+                            adb = ADBManager()
+                            adb_devices = adb.list_devices(long_format=True)
 
-                        # 获取本机 IP 和网段
-                        def get_local_network():
-                            try:
-                                s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-                                s.connect(("8.8.8.8", 80))
-                                local_ip = s.getsockname()[0]
-                                s.close()
-                                network_prefix = '.'.join(local_ip.split('.')[:3])
-                                return network_prefix, local_ip
-                            except Exception as e:
-                                logger.error(f"Failed to get local network: {e}")
-                                return None, None
+                            for d in adb_devices:
+                                if d.is_ready():
+                                    ip = None
+                                    try:
+                                        ip = adb.get_device_ip(d.serial, timeout=2.0)
+                                    except Exception:
+                                        pass
 
-                        def check_adb_port(ip):
-                            """检查指定 IP 的 5555 端口是否开放"""
-                            try:
-                                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                                sock.settimeout(timeout_sec)
-                                result = sock.connect_ex((ip, 5555))
-                                sock.close()
-                                return ip if result == 0 else None
-                            except Exception:
-                                return None
+                                    all_devices.append({
+                                        "type": "adb",
+                                        "serial": d.serial,
+                                        "model": d.model,
+                                        "ip": ip,
+                                        "state": d.state,
+                                        "ready": True
+                                    })
+                                    logger.info(f"[ADB] Found: {d.model or d.serial} ({ip or d.serial})")
 
-                        network_prefix, local_ip = get_local_network()
-                        if not network_prefix:
-                            return {"content": [{"type": "text", "text": json.dumps({"success": False, "error": "Failed to determine local network"}, ensure_ascii=False)}]}
+                        except Exception as e:
+                            logger.warning(f"[ADB] Scan failed: {e}")
 
-                        logger.info(f"Scanning network segment: {network_prefix}.0/24")
-                        found_ips = []
+                        # 2. UDP 广播发现 scrcpy 服务端（快速，约 2 秒）
+                        try:
+                            from scrcpy_py_ddlx.client.udp_wake import discover_devices as udp_discover
+                            logger.info("[UDP] Broadcasting discovery...")
+                            udp_devices = udp_discover(timeout=2.0)
 
-                        # 使用线程池并发扫描
-                        with concurrent.futures.ThreadPoolExecutor(max_workers=50) as executor:
-                            futures = {}
-                            for i in range(1, 255):
-                                ip = f"{network_prefix}.{i}"
-                                futures[executor.submit(check_adb_port, ip)] = ip
+                            for dev in udp_devices:
+                                # 避免重复
+                                if not any(d.get('ip') == dev['ip'] for d in all_devices):
+                                    all_devices.append({
+                                        "type": "udp_server",
+                                        "name": dev['name'],
+                                        "ip": dev['ip'],
+                                        "ready": True
+                                    })
+                                    logger.info(f"[UDP] Found server: {dev['name']} ({dev['ip']})")
 
-                            for future in concurrent.futures.as_completed(futures):
-                                result = future.result()
-                                if result:
-                                    found_ips.append(result)
-                                    logger.info(f"Found device: {result}:5555")
+                        except Exception as e:
+                            logger.warning(f"[UDP] Discovery failed: {e}")
 
-                        # 尝试连接找到的设备以验证
-                        from scrcpy_py_ddlx.core.adb import ADBManager
-                        adb = ADBManager()
-                        verified_devices = []
-
-                        for device_ip in found_ips:
-                            try:
-                                # 尝试连接
-                                if adb.connect_tcpip(device_ip, port=5555, timeout=10.0):
-                                    # 获取设备信息
-                                    devices = adb.list_devices(long_format=True)
-                                    for d in devices:
-                                        if device_ip in d.serial or d.device_type.value == "tcpip":
-                                            verified_devices.append({
-                                                "serial": d.serial,
-                                                "ip": device_ip,
-                                                "state": d.state,
-                                                "model": d.model,
-                                                "ready": d.is_ready()
-                                            })
-                                            break
-                            except Exception as e:
-                                logger.debug(f"Failed to connect to {device_ip}: {e}")
+                        # 3. 获取本机 IP
+                        local_ip = "unknown"
+                        try:
+                            import socket
+                            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                            s.connect(("8.8.8.8", 80))
+                            local_ip = s.getsockname()[0]
+                            s.close()
+                        except Exception:
+                            pass
 
                         result = {
                             "success": True,
                             "local_ip": local_ip,
-                            "network": f"{network_prefix}.0/24",
-                            "scanned": 254,
-                            "found": len(verified_devices),
-                            "devices": verified_devices
+                            "found": len(all_devices),
+                            "devices": all_devices
                         }
+
+                        # 添加提示
+                        if not all_devices:
+                            result["hint"] = "No devices found. For ADB mode, connect device via USB/WiFi. For network mode, ensure scrcpy server is running on device."
+
                         result_text = json.dumps(result, ensure_ascii=False, indent=2)
                         return {"content": [{"type": "text", "text": result_text}]}
                     except Exception as e:
@@ -902,13 +2199,81 @@ class ScrcpyMCPHandler:
                         logger.exception("discover_devices error")
                         return {"content": [{"type": "text", "text": json.dumps({"success": False, "error": str(e), "traceback": traceback.format_exc()}, ensure_ascii=False)}]}
 
-                # screenshot 操作特殊处理 - 自动生成文件名
+                # screenshot 操作特殊处理 - 自动生成文件名 + 处理 video=False 情况
                 if tool_name == "screenshot":
                     from datetime import datetime
+                    from pathlib import Path
                     screenshots_dir = Path("screenshots")
                     screenshots_dir.mkdir(exist_ok=True)
                     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S_%f')[:-3]  # 毫秒精度
-                    filename = str(screenshots_dir / f"screenshot_{timestamp}.jpg")
+
+                    # 获取格式和质量参数
+                    img_format = arguments.pop("format", "jpg")  # 使用 pop 移除，不传给 server
+                    quality = arguments.get("quality", 80)
+
+                    # 根据格式生成文件名
+                    filename = str(screenshots_dir / f"screenshot_{timestamp}.{img_format}")
+                    arguments["filename"] = filename
+                    arguments["quality"] = quality
+
+                # record_audio 操作特殊处理 - 处理 audio=False 情况 + 格式选择
+                if tool_name == "record_audio":
+                    # 检查音频是否启用
+                    if self._current_config and not self._current_config.audio:
+                        return {
+                            "content": [{"type": "text", "text": json.dumps({
+                                "success": False,
+                                "error": "Audio not enabled",
+                                "hint": "Reconnect with audio=true to enable recording, or use ADB to record directly on device."
+                            }, ensure_ascii=False)}]}
+                    from datetime import datetime
+                    from pathlib import Path
+                    recordings_dir = Path("recordings")
+                    recordings_dir.mkdir(exist_ok=True)
+                    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+
+                    # 获取格式参数，默认 auto（透传原始格式）
+                    audio_format = arguments.get("format", "auto")
+
+                    # 根据格式确定文件扩展名和录制模式
+                    # auto -> 透传原始 OPUS -> .ogg
+                    # wav -> 解码为 PCM -> .wav
+                    # opus -> 解码后重新编码 -> .opus
+                    # mp3 -> 解码后重新编码 -> .mp3
+                    format_to_ext = {
+                        "auto": "ogg",   # 透传模式：OPUS -> OGG 容器
+                        "wav": "wav",    # 解码模式：PCM WAV
+                        "opus": "opus",  # 转码模式：重新编码为 OPUS
+                        "mp3": "mp3",    # 转码模式：重新编码为 MP3
+                    }
+
+                    ext = format_to_ext.get(audio_format, "ogg")
+                    filename = str(recordings_dir / f"recording_{timestamp}.{ext}")
+                    arguments["filename"] = filename
+
+                    # 添加录制模式标记
+                    if audio_format == "auto":
+                        arguments["passthrough"] = True
+                        arguments["auto_convert_to"] = None
+                    elif audio_format == "wav":
+                        arguments["passthrough"] = False
+                        arguments["auto_convert_to"] = None
+                    else:
+                        # opus 或 mp3：解码后重新编码
+                        arguments["passthrough"] = False
+                        arguments["auto_convert_to"] = audio_format
+
+                # record_video 操作特殊处理 - 自动生成文件名
+                if tool_name == "record_video":
+                    from datetime import datetime
+                    from pathlib import Path
+                    recordings_dir = Path("recordings")
+                    recordings_dir.mkdir(exist_ok=True)
+                    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+                    # Use MKV format if audio is enabled (supports OPUS passthrough)
+                    audio_enabled = self._current_config and self._current_config.audio
+                    ext = "mkv" if audio_enabled else "mp4"
+                    filename = str(recordings_dir / f"video_{timestamp}.{ext}")
                     arguments["filename"] = filename
 
                 # 其他工具需要确保已连接
@@ -918,18 +2283,128 @@ class ScrcpyMCPHandler:
                         "content": [{"type": "text", "text": json.dumps({
                             "error": "Not connected to device",
                             "hint": "CRITICAL: Call discover_devices() FIRST to scan local network for devices, then use connect(device_id='IP:PORT') to connect."
-                        }, ensure_ascii=False)}]
-                    }
+                        }, ensure_ascii=False)}]}
 
-                # 调用 MCP 服务器的方法
-                method = getattr(server, tool_name, None)
-                if method is None:
-                    return {
-                        "content": [{"type": "text", "text": json.dumps({"error": f"Unknown tool: {tool_name}"}, ensure_ascii=False)}]
-                    }
+                # 需要服务端存活检查的操作列表
+                # 这些操作在服务端停止后不应该返回假的成功
+                server_required_tools = {
+                    'screenshot', 'get_clipboard', 'set_clipboard',
+                    'tap', 'swipe', 'long_press', 'scroll', 'pinch',
+                    'press_back', 'press_home', 'press_menu', 'press_power',
+                    'volume_up', 'volume_down', 'wake_up', 'inject_keycode',
+                    'type_text', 'start_app', 'stop_app',
+                    'record_audio', 'stop_audio_recording', 'is_recording_audio',
+                    'record_video', 'stop_video_recording', 'is_recording_video',
+                    'get_screen_power_state'
+                }
 
-                # 执行方法
-                result = method(**arguments)
+                # 对于需要服务端存活的操作，进行存活检查
+                if tool_name in server_required_tools:
+                    alive_error = self._ensure_server_alive_for_operation(tool_name)
+                    if alive_error:
+                        return {"content": [{"type": "text", "text": json.dumps(alive_error, ensure_ascii=False)}]}
+
+                # screenshot: 根据 video 配置和连接模式选择方法
+                if tool_name == "screenshot":
+                    video_enabled = self._current_config and self._current_config.video
+                    connection_mode = getattr(self._current_config, 'connection_mode', 'adb_tunnel') if self._current_config else 'adb_tunnel'
+
+                    if video_enabled:
+                        # 模式一：实时预览模式 - 从视频流截取当前帧 (~16ms)
+                        logger.info("Screenshot from video stream (video=true)")
+                        result = server.screenshot(**arguments)
+                        if result.get("success"):
+                            result["method"] = "video_stream"
+                            # 检查是否可能息屏
+                            screen_warning = self._check_screen_off()
+                            if screen_warning:
+                                result["warning"] = screen_warning
+                                logger.warning(f"Screen off detected during screenshot: {screen_warning}")
+                    elif connection_mode == "adb_tunnel":
+                        # ADB 隧道模式 + video=False：直接用 ADB screencap (~300ms)
+                        logger.info("Screenshot via ADB screencap (video=false)")
+                        try:
+                            import subprocess
+                            from pathlib import Path
+                            from PIL import Image
+                            import io
+
+                            device_serial = getattr(self._client.state, 'device_serial', None) if self._client else None
+
+                            # 构建 ADB 命令
+                            adb_cmd = ['adb']
+                            if device_serial:
+                                adb_cmd.extend(['-s', device_serial])
+                            adb_cmd.extend(['exec-out', 'screencap', '-p'])
+
+                            # 执行截图
+                            proc = subprocess.run(adb_cmd, capture_output=True, timeout=10)
+                            if proc.returncode != 0:
+                                raise Exception(f"ADB screencap failed: {proc.stderr.decode()}")
+
+                            # 获取格式和质量参数
+                            img_format = arguments.get('format', 'jpg') if 'format' in arguments else 'jpg'
+                            quality = arguments.get('quality', 80)
+
+                            # 打开图片
+                            img = Image.open(io.BytesIO(proc.stdout))
+                            width, height = img.size
+
+                            # 根据格式保存
+                            timestamp = __import__("datetime").datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
+                            filename = str(Path("screenshots") / f"screenshot_{timestamp}.{img_format}")
+                            Path("screenshots").mkdir(exist_ok=True)
+
+                            if img_format.lower() in ('jpg', 'jpeg'):
+                                # JPEG with quality
+                                if img.mode == 'RGBA':
+                                    img = img.convert('RGB')  # JPEG doesn't support alpha
+                                img.save(filename, 'JPEG', quality=quality)
+                            else:
+                                # PNG (lossless)
+                                img.save(filename, 'PNG')
+
+                            result = {
+                                "success": True,
+                                "filename": filename,
+                                "width": width,
+                                "height": height,
+                                "orientation": "portrait" if height > width else "landscape",
+                                "format": img_format,
+                                "quality": quality if img_format.lower() in ('jpg', 'jpeg') else None,
+                                "method": "adb_screencap"
+                            }
+                        except Exception as e:
+                            logger.warning(f"ADB screencap failed: {e}")
+                            result = {
+                                "success": False,
+                                "error": str(e),
+                                "hint": "Check ADB connection"
+                            }
+                    else:
+                        # 网络模式 + video=False：使用 REQUEST_VIDEO_FRAME 控制消息
+                        logger.info("Screenshot via REQUEST_VIDEO_FRAME (network mode, video=false)")
+                        try:
+                            server._client.request_video_frame()
+                            import time
+                            time.sleep(0.5)
+                            result = server.screenshot(**arguments)
+                        except Exception as e:
+                            logger.warning(f"request_video_frame failed: {e}")
+                            result = {
+                                "success": False,
+                                "error": f"Screenshot failed: {e}",
+                                "hint": "Reconnect with video=true"
+                            }
+                else:
+                    # 调用 MCP 服务器的方法
+                    method = getattr(server, tool_name, None)
+                    if method is None:
+                        return {
+                            "content": [{"type": "text", "text": json.dumps({"error": f"Unknown tool: {tool_name}"}, ensure_ascii=False)}]}
+
+                    # 执行方法
+                    result = method(**arguments)
 
                 # 如果是 screenshot，转换为绝对路径返回，并添加明确的尺寸信息
                 if tool_name == "screenshot" and result.get("success") and "filename" in result:
@@ -951,6 +2426,11 @@ class ScrcpyMCPHandler:
                 if tool_name in ("record_audio", "stop_audio_recording") and result.get("success") and "filename" in result:
                     result["filepath"] = str(Path(result["filename"]).absolute())
                     result["message"] = f"Audio recording saved to: {result['filepath']}"
+
+                # 如果是视频录制，转换为绝对路径返回
+                if tool_name == "record_video" and result.get("success") and "filename" in result:
+                    result["filepath"] = str(Path(result["filename"]).absolute())
+                    result["message"] = f"Video recording saved to: {result['filepath']}"
 
                 # 如果是 get_state，添加明确的尺寸信息
                 if tool_name == "get_state" and result.get("connected") and "device_size" in result:
@@ -982,6 +2462,7 @@ handler = ScrcpyMCPHandler()
 
 async def handle_mcp_request(request: Request) -> JSONResponse:
     """处理 MCP JSON-RPC 请求"""
+    body = {}  # 预先初始化，防止异常处理时 UnboundLocalError
     try:
         body = await request.json()
         logger.debug(f"收到请求: {json.dumps(body, ensure_ascii=False)[:200]}")
@@ -1092,7 +2573,84 @@ routes = [
     Route("/health", health_check, methods=["GET"]),
 ]
 
-app = Starlette(debug=False, routes=routes)
+
+def on_shutdown():
+    """Cleanup on server shutdown."""
+    import threading
+    import sys
+    import multiprocessing as mp
+
+    logger.info("Server shutting down, cleaning up resources...")
+
+    # 打印所有活跃线程
+    logger.info(f"Active threads: {threading.active_count()}")
+    for thread in threading.enumerate():
+        logger.info(f"  Thread: {thread.name} (daemon={thread.daemon}, alive={thread.is_alive()})")
+
+    # 打印活跃的子进程
+    logger.info(f"Active children processes: {len(mp.active_children())}")
+    for child in mp.active_children():
+        logger.info(f"  Process: {child.name} (alive={child.is_alive()})")
+
+    # Stop preview FIRST (before disconnecting client)
+    try:
+        if handler._preview_manager is not None:
+            logger.info("Stopping preview...")
+            handler._preview_manager.stop()
+            handler._preview_manager = None
+            logger.info("Preview stopped")
+    except Exception as e:
+        logger.warning(f"Error stopping preview: {e}")
+
+    # 打印线程状态
+    logger.info(f"After preview stop - Active threads: {threading.active_count()}")
+    for thread in threading.enumerate():
+        logger.info(f"  Thread: {thread.name} (daemon={thread.daemon}, alive={thread.is_alive()})")
+
+    # 打印活跃的子进程
+    logger.info(f"After preview stop - Active children: {len(mp.active_children())}")
+    for child in mp.active_children():
+        logger.info(f"  Process: {child.name} (alive={child.is_alive()})")
+
+    # Disconnect client
+    try:
+        if handler._client is not None:
+            logger.info("Disconnecting client...")
+            handler._client.disconnect()
+            handler._client = None
+            logger.info("Client disconnected")
+    except Exception as e:
+        logger.warning(f"Error during client disconnect: {e}")
+
+    # 打印线程状态
+    logger.info(f"After client disconnect - Active threads: {threading.active_count()}")
+    for thread in threading.enumerate():
+        logger.info(f"  Thread: {thread.name} (daemon={thread.daemon}, alive={thread.is_alive()})")
+
+    # 打印活跃的子进程
+    logger.info(f"After client disconnect - Active children: {len(mp.active_children())}")
+    for child in mp.active_children():
+        logger.info(f"  Process: {child.name} (alive={child.is_alive()})")
+
+    # Also try server disconnect
+    try:
+        if handler._server is not None:
+            handler._server.disconnect()
+            handler._server = None
+    except Exception as e:
+        logger.debug(f"Server disconnect: {e}")
+
+    logger.info("Cleanup complete")
+    logger.info(f"Final state - Threads: {threading.active_count()}, Children: {len(mp.active_children())}")
+
+    # Force exit to bypass lingering QueueFeederThread issues
+    # These daemon threads shouldn't block exit, but sometimes do on Windows
+    import os
+    logger.info("Forcing exit to ensure clean shutdown...")
+    os._exit(0)
+
+
+app = Starlette(debug=False, routes=routes, on_shutdown=[on_shutdown])
 
 
 def main():
@@ -1145,7 +2703,7 @@ def main():
     print("[模式] 标准 HTTP POST (JSON-RPC)")
     print(f"[端点] http://{host}:{port}/mcp")
     print(f"[健康检查] http://{host}:{port}/health")
-    print(f"[默认音频] {'✓ 启用' if DEFAULT_AUDIO_ENABLED else '✗ 禁用'}")
+    print(f"[默认音频] {'[ON] 启用' if DEFAULT_AUDIO_ENABLED else '[OFF] 禁用'}")
     print("")
     print("[Claude Code 配置]")
     print('{')
@@ -1158,8 +2716,32 @@ def main():
     print("=" * 70)
     print("")
 
-    # 启动服务器
-    uvicorn.run(app, host=host, port=port, log_level="info")
+    # 设置信号处理器 - 第二次 Ctrl+C 强制退出
+    import signal
+    import os
+
+    def signal_handler(signum, frame):
+        """Handle Ctrl+C - force exit on second interrupt."""
+        if not hasattr(signal_handler, 'count'):
+            signal_handler.count = 0
+        signal_handler.count += 1
+
+        if signal_handler.count >= 2:
+            print("\n强制退出...")
+            os._exit(0)
+        else:
+            print("\n按 Ctrl+C 再次强制退出...")
+
+    signal.signal(signal.SIGINT, signal_handler)
+
+    # 启动服务器 - 使用更短的关闭超时
+    uvicorn.run(
+        app,
+        host=host,
+        port=port,
+        log_level="info",
+        timeout_graceful_shutdown=1  # 减少优雅关闭等待时间（默认5秒）
+    )
 
 
 if __name__ == "__main__":

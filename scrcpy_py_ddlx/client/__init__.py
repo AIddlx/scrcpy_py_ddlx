@@ -20,8 +20,11 @@ Usage:
 """
 
 from .client import ScrcpyClient, connect_to_device, main
-from .config import ClientConfig, ClientState
+from .config import ClientConfig, ClientState, ConnectionMode
 from .components import ComponentFactory, USE_STREAMING_DEMUXER
+from .connection import ConnectionManager, NetworkConnection
+from .udp_wake import UdpWakeClient, wake_device
+from .udp_discovery import UdpDiscovery, discover_devices
 
 __all__ = [
     # Main client
@@ -32,6 +35,17 @@ __all__ = [
     # Configuration
     "ClientConfig",
     "ClientState",
+    "ConnectionMode",
+
+    # Connection
+    "ConnectionManager",
+    "NetworkConnection",
+
+    # UDP utilities
+    "UdpWakeClient",
+    "wake_device",
+    "UdpDiscovery",
+    "discover_devices",
 
     # Components
     "ComponentFactory",

@@ -2,6 +2,7 @@ package com.genymobile.scrcpy;
 
 import com.genymobile.scrcpy.audio.AudioCodec;
 import com.genymobile.scrcpy.audio.AudioSource;
+import com.genymobile.scrcpy.device.CapabilityNegotiation;
 import com.genymobile.scrcpy.device.Device;
 import com.genymobile.scrcpy.device.NewDisplay;
 import com.genymobile.scrcpy.device.Orientation;
@@ -73,6 +74,38 @@ public class Options {
     private boolean listCameras;
     private boolean listCameraSizes;
     private boolean listApps;
+
+    // Network mode ports (0 = ADB tunnel mode)
+    private int controlPort = 0;
+    private int videoPort = 27185;
+    private int audioPort = 27186;
+    private int discoveryPort = 27183;
+
+    // FEC (Forward Error Correction) for UDP mode
+    private boolean fecEnabled = false;      // Legacy: enable FEC for both video and audio
+    private boolean videoFecEnabled = false; // Enable FEC for video stream
+    private boolean audioFecEnabled = false; // Enable FEC for audio stream
+    private int fecGroupSize = 4;            // K: data packets per group
+    private int fecParityCount = 1;          // M: parity packets per group
+    private String fecMode = "frame";        // FEC mode: "frame" or "fragment"
+
+    // Bitrate mode: "cbr" (constant) or "vbr" (variable, default)
+    private String bitrateMode = "vbr";
+
+    // I-frame interval in seconds (default 10, lower = faster recovery but more bandwidth)
+    // Supports floating point values (e.g., 0.5 for half a second)
+    private float iFrameInterval = 10;
+
+    // Hot-connection (stay-alive) mode
+    private boolean stayAlive = false;      // Keep server running after disconnect
+    private int maxConnections = -1;        // Max connections before exit (-1 = unlimited)
+
+    // Low latency optimization options
+    // Note: lowLatency may cause configure() to fail on some devices
+    private boolean lowLatency = false;     // Enable MediaCodec low latency mode (Android 11+)
+    private int encoderPriority = 1;        // Encoder thread priority: 0=normal, 1=urgent, 2=realtime
+    private int encoderBuffer = 0;          // Encoder buffer: 0=auto, 1=disable B-frames
+    private boolean skipFrames = true;      // Skip buffered frames to reduce latency (default: enabled)
 
     // Options not used by the scrcpy client, but useful to use scrcpy-server directly
     private boolean sendDeviceMeta = true; // send device name and size
@@ -288,6 +321,116 @@ public class Options {
         return sendCodecMeta;
     }
 
+    public int getControlPort() {
+        return controlPort;
+    }
+
+    public int getVideoPort() {
+        return videoPort;
+    }
+
+    public int getAudioPort() {
+        return audioPort;
+    }
+
+    public int getDiscoveryPort() {
+        return discoveryPort;
+    }
+
+    public boolean isNetworkMode() {
+        return controlPort > 0;
+    }
+
+    public boolean isFecEnabled() {
+        return fecEnabled;
+    }
+
+    public boolean isVideoFecEnabled() {
+        // Video FEC enabled if: video_fec_enabled=true OR (fec_enabled=true and video_fec_enabled not explicitly set)
+        return videoFecEnabled || (fecEnabled && !videoFecEnabled && !audioFecEnabled);
+    }
+
+    public boolean isAudioFecEnabled() {
+        // Audio FEC enabled if: audio_fec_enabled=true OR (fec_enabled=true and audio_fec_enabled not explicitly set)
+        return audioFecEnabled || (fecEnabled && !videoFecEnabled && !audioFecEnabled);
+    }
+
+    public int getFecGroupSize() {
+        return fecGroupSize;
+    }
+
+    public int getFecParityCount() {
+        return fecParityCount;
+    }
+
+    public String getBitrateMode() {
+        return bitrateMode;
+    }
+
+    public boolean isCbrMode() {
+        return "cbr".equalsIgnoreCase(bitrateMode);
+    }
+
+    public float getIFrameInterval() {
+        return iFrameInterval;
+    }
+
+    public void setIFrameInterval(float iFrameInterval) {
+        this.iFrameInterval = iFrameInterval;
+    }
+
+    public boolean isStayAlive() {
+        return stayAlive;
+    }
+
+    public int getMaxConnections() {
+        return maxConnections;
+    }
+
+    public boolean isLowLatency() {
+        return lowLatency;
+    }
+
+    public int getEncoderPriority() {
+        return encoderPriority;
+    }
+
+    public int getEncoderBuffer() {
+        return encoderBuffer;
+    }
+
+    public boolean isSkipFrames() {
+        return skipFrames;
+    }
+
+    public void setFecEnabled(boolean fecEnabled) {
+        this.fecEnabled = fecEnabled;
+    }
+
+    public void setVideoFecEnabled(boolean videoFecEnabled) {
+        this.videoFecEnabled = videoFecEnabled;
+    }
+
+    public void setAudioFecEnabled(boolean audioFecEnabled) {
+        this.audioFecEnabled = audioFecEnabled;
+    }
+
+    public void setFecGroupSize(int fecGroupSize) {
+        this.fecGroupSize = fecGroupSize;
+    }
+
+    public void setFecParityCount(int fecParityCount) {
+        this.fecParityCount = fecParityCount;
+    }
+
+    public String getFecMode() {
+        return fecMode;
+    }
+
+    public void setFecMode(String fecMode) {
+        this.fecMode = fecMode;
+    }
+
     @SuppressWarnings("MethodLength")
     public static Options parse(String... args) {
         if (args.length < 1) {
@@ -363,6 +506,7 @@ public class Options {
                     break;
                 case "video_bit_rate":
                     options.videoBitRate = Integer.parseInt(value);
+                    Ln.i("Parsed video_bit_rate: " + options.videoBitRate);
                     break;
                 case "audio_bit_rate":
                     options.audioBitRate = Integer.parseInt(value);
@@ -512,6 +656,67 @@ public class Options {
                         options.sendCodecMeta = false;
                     }
                     break;
+                case "control_port":
+                    options.controlPort = Integer.parseInt(value);
+                    break;
+                case "video_port":
+                    options.videoPort = Integer.parseInt(value);
+                    break;
+                case "audio_port":
+                    options.audioPort = Integer.parseInt(value);
+                    break;
+                case "discovery_port":
+                    options.discoveryPort = Integer.parseInt(value);
+                    break;
+                case "fec_enabled":
+                    options.fecEnabled = Boolean.parseBoolean(value);
+                    break;
+                case "video_fec_enabled":
+                    options.videoFecEnabled = Boolean.parseBoolean(value);
+                    break;
+                case "audio_fec_enabled":
+                    options.audioFecEnabled = Boolean.parseBoolean(value);
+                    break;
+                case "fec_group_size":
+                    options.fecGroupSize = Integer.parseInt(value);
+                    break;
+                case "fec_parity_count":
+                    options.fecParityCount = Integer.parseInt(value);
+                    break;
+                case "fec_mode":
+                    options.fecMode = value.toLowerCase(Locale.ENGLISH);
+                    break;
+                case "bitrate_mode":
+                    options.bitrateMode = value.toLowerCase(Locale.ENGLISH);
+                    break;
+                case "i_frame_interval":
+                    options.iFrameInterval = Float.parseFloat(value);
+                    Ln.i("Parsed i_frame_interval: " + options.iFrameInterval + " seconds");
+                    break;
+                case "stay_alive":
+                    options.stayAlive = Boolean.parseBoolean(value);
+                    Ln.i("Stay-alive mode: " + options.stayAlive);
+                    break;
+                case "max_connections":
+                    options.maxConnections = Integer.parseInt(value);
+                    Ln.i("Max connections: " + options.maxConnections);
+                    break;
+                case "low_latency":
+                    options.lowLatency = Boolean.parseBoolean(value);
+                    Ln.i("Low latency mode: " + options.lowLatency);
+                    break;
+                case "encoder_priority":
+                    options.encoderPriority = Integer.parseInt(value);
+                    Ln.i("Encoder priority: " + options.encoderPriority);
+                    break;
+                case "encoder_buffer":
+                    options.encoderBuffer = Integer.parseInt(value);
+                    Ln.i("Encoder buffer frames: " + options.encoderBuffer);
+                    break;
+                case "skip_frames":
+                    options.skipFrames = Boolean.parseBoolean(value);
+                    Ln.i("Skip frames mode: " + options.skipFrames);
+                    break;
                 default:
                     Ln.w("Unknown server option: " + key);
                     break;
@@ -647,5 +852,52 @@ public class Options {
             default:
                 throw new IllegalArgumentException("Invalid display IME policy: " + value);
         }
+    }
+
+    /**
+     * Apply client configuration from capability negotiation.
+     *
+     * This updates the options based on client's selected configuration.
+     *
+     * @param clientConfig Client configuration received from client
+     */
+    public void applyClientConfig(CapabilityNegotiation.ClientConfig clientConfig) {
+        // Apply video codec
+        this.videoCodec = clientConfig.getVideoCodec();
+        Ln.i("Applied client video codec: " + this.videoCodec.getName());
+
+        // Apply audio codec
+        this.audioCodec = clientConfig.getAudioCodec();
+        Ln.i("Applied client audio codec: " + this.audioCodec.getName());
+
+        // Apply bitrates
+        this.videoBitRate = clientConfig.videoBitrate;
+        this.audioBitRate = clientConfig.audioBitrate;
+        Ln.i("Applied client bitrates: video=" + this.videoBitRate + ", audio=" + this.audioBitRate);
+
+        // Apply max fps
+        this.maxFps = clientConfig.maxFps;
+        Ln.i("Applied client max fps: " + this.maxFps);
+
+        // Apply I-frame interval
+        this.iFrameInterval = clientConfig.iFrameInterval;
+        Ln.i("Applied client I-frame interval: " + this.iFrameInterval);
+
+        // Apply flags
+        this.video = clientConfig.isVideoEnabled();
+        this.audio = clientConfig.isAudioEnabled();
+        this.videoFecEnabled = clientConfig.isVideoFecEnabled();
+        this.audioFecEnabled = clientConfig.isAudioFecEnabled();
+
+        // Apply CBR mode
+        if (clientConfig.isCbrMode()) {
+            this.bitrateMode = "cbr";
+        } else {
+            this.bitrateMode = "vbr";
+        }
+
+        Ln.i("Applied client flags: video=" + this.video + ", audio=" + this.audio
+             + ", videoFec=" + this.videoFecEnabled + ", audioFec=" + this.audioFecEnabled
+             + ", cbr=" + clientConfig.isCbrMode());
     }
 }

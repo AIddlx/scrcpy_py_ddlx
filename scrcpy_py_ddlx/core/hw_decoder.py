@@ -76,30 +76,28 @@ class HWAccelConfig:
                 logger.warning("VideoToolbox not available, will use software decoding")
                 return cls(HWDeviceType.NONE)
 
-        # Windows - try D3D11VA first, then NVDEC, then QSV
+        # Windows - 厂商专用硬解优先，通用接口最后
+        # 优先级: NVDEC (NVIDIA) > QSV (Intel) > D3D11VA (通用)
         elif system == "Windows":
-            # Try D3D11VA (most reliable on Windows, works on all GPUs)
-            if cls._is_codec_available("h264_d3d11va"):
-                logger.info("Auto-detected D3D11VA for hardware decoding")
-                return cls(HWDeviceType.D3D11VA)
-            # Try NVDEC for NVIDIA GPUs (best performance if available)
+            # Try NVDEC for NVIDIA GPUs (best performance)
             if cls._is_codec_available("h264_nvdec"):
                 logger.info("Auto-detected NVIDIA NVDEC for hardware decoding")
                 return cls(HWDeviceType.NVIDIA)
-            # QSV is last resort due to driver compatibility issues
+            # Try Intel QSV (good performance on Intel GPUs)
             if cls._is_codec_available("h264_qsv"):
-                logger.info("Auto-detected Intel QSV for hardware decoding (may have compatibility issues)")
+                logger.info("Auto-detected Intel QSV for hardware decoding")
                 return cls(HWDeviceType.INTEL_QSV)
+            # D3D11VA as fallback (works on all GPUs, but less efficient)
+            if cls._is_codec_available("h264_d3d11va"):
+                logger.info("Auto-detected D3D11VA for hardware decoding (generic)")
+                return cls(HWDeviceType.D3D11VA)
             logger.warning("No hardware decoder available on Windows, will use software decoding")
             return cls(HWDeviceType.NONE)
 
-        # Linux - try VAAPI first, then NVDEC, then VDPAU
+        # Linux - 厂商专用硬解优先，通用接口最后
+        # 优先级: NVDEC (NVIDIA) > QSV (Intel) > VAAPI (通用) > VDPAU (旧)
         elif system == "Linux":
-            # Try VAAPI (works on Intel/AMD GPUs)
-            if cls._is_codec_available("h264_vaapi"):
-                logger.info("Auto-detected VAAPI for hardware decoding")
-                return cls(HWDeviceType.VAAPI)
-            # Try NVDEC for NVIDIA GPUs
+            # Try NVDEC for NVIDIA GPUs (best performance)
             if cls._is_codec_available("h264_nvdec"):
                 logger.info("Auto-detected NVIDIA NVDEC for hardware decoding")
                 return cls(HWDeviceType.NVIDIA)
@@ -107,9 +105,13 @@ class HWAccelConfig:
             if cls._is_codec_available("h264_qsv"):
                 logger.info("Auto-detected Intel QSV for hardware decoding")
                 return cls(HWDeviceType.INTEL_QSV)
+            # Try VAAPI (works on Intel/AMD GPUs, generic)
+            if cls._is_codec_available("h264_vaapi"):
+                logger.info("Auto-detected VAAPI for hardware decoding (generic)")
+                return cls(HWDeviceType.VAAPI)
             # Try VDPAU (legacy)
             if cls._is_codec_available("h264_vdpau"):
-                logger.info("Auto-detected VDPAU for hardware decoding")
+                logger.info("Auto-detected VDPAU for hardware decoding (legacy)")
                 return cls(HWDeviceType.VDPAU)
             logger.warning("No hardware decoder available on Linux, will use software decoding")
             return cls(HWDeviceType.NONE)

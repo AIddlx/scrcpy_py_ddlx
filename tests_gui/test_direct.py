@@ -404,8 +404,8 @@ def main():
         show_window=True,  # 显示视频窗口
         audio=True,  # 启用音频
         clipboard_autosync=True,  # 启用剪贴板自动同步（PC ↔ 设备）
-        bitrate=8000000,  # 8 Mbps - 标准码率，保证画质
-        max_fps=60,  # 60fps - 流畅帧率
+        bitrate=2500000,  # 8 Mbps - 标准码率，保证画质
+        max_fps=30,  # 60fps - 流畅帧率
     )
 
     # 创建客户端

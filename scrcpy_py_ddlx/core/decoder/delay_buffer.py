@@ -5,41 +5,64 @@ Single-frame delay buffer for minimal latency video decoding.
 
 This module implements the DelayBuffer class, which matches the official
 scrcpy delay_buffer design for thread-safe frame updates with minimal latency.
+
+Features:
+- Event-driven notification (eliminates polling latency)
+- Single-frame buffer with consumed flag
+- Thread-safe with Condition variable
 """
 
 import logging
-from threading import Lock
-from typing import Optional, Tuple
+import time
+from threading import Lock, Condition
+from typing import Optional, Tuple, NamedTuple
 
 
 logger = logging.getLogger(__name__)
 
 
-__all__ = ['DelayBuffer']
+__all__ = ['DelayBuffer', 'FrameWithMetadata']
+
+
+class FrameWithMetadata(NamedTuple):
+    """Frame with metadata for latency tracking."""
+    frame: any
+    packet_id: int = -1
+    pts: int = 0  # Presentation timestamp from device (nanoseconds)
+    capture_time: float = 0.0  # Time when frame was decoded on PC (seconds)
+    udp_recv_time: float = 0.0  # Time when UDP packet was received (seconds) - for TRUE e2e latency
+    send_time_ns: int = 0  # Device send time in nanoseconds (for full E2E latency)
+    width: int = 0  # Frame width in pixels (for rotation detection)
+    height: int = 0  # Frame height in pixels (for rotation detection)
 
 
 class DelayBuffer:
     """
-    Single-frame delay buffer matching official scrcpy delay_buffer design.
+    Single-frame delay buffer with event-driven notification.
 
     Official scrcpy uses a single-frame buffer with tmp_frame for atomic swap.
     This prevents tearing and ensures thread-safe frame updates.
 
-    Based on: scrcpy/app/src/frame_buffer.c
+    Enhanced with Condition variable for event-driven consumption,
+    eliminating fixed polling latency.
 
-    Thread-safe with consumed flag to prevent overwriting frames during rendering.
+    Based on: scrcpy/app/src/frame_buffer.c
     """
 
     def __init__(self):
-        """Initialize an empty delay buffer with tmp_frame mechanism."""
-        self._pending_frame = None      # Current pending frame (equivalent to pending_frame)
+        """Initialize an empty delay buffer with event notification."""
+        self._pending_frame: Optional[FrameWithMetadata] = None  # Current pending frame with metadata
         self._tmp_frame = None          # Temporary frame for atomic swap (equivalent to tmp_frame)
         self._consumed = True           # Track if frame has been consumed
         self._lock = Lock()
+        self._condition = Condition(self._lock)  # Event-driven notification
+        self._lock_wait_count = 0  # Track lock contention
+        self._total_lock_wait_time = 0.0  # Total time spent waiting for lock
 
-    def push(self, frame) -> Tuple[bool, bool]:
+    def push(self, frame, packet_id: int = -1, pts: int = 0, capture_time: float = 0.0,
+             udp_recv_time: float = 0.0, send_time_ns: int = 0, width: int = 0, height: int = 0) -> Tuple[bool, bool]:
         """
-        Push a frame to the buffer.
+        Push a frame to the buffer and notify waiting consumers.
 
         CRITICAL: Direct assignment (no tmp_frame copy).
         consume() returns a copy, so we don't need to copy here.
@@ -47,55 +70,107 @@ class DelayBuffer:
 
         Args:
             frame: Frame to push (numpy array or any object)
+            packet_id: Packet ID for latency tracking (default: -1 for no tracking)
+            pts: Presentation timestamp from device (nanoseconds)
+            capture_time: Time when frame was decoded on PC (seconds)
+            udp_recv_time: Time when UDP packet was received (seconds) - for TRUE e2e latency
+            send_time_ns: Device send time in nanoseconds (for full E2E latency)
+            width: Frame width in pixels (for rotation detection)
+            height: Frame height in pixels (for rotation detection)
 
         Returns:
             Tuple of (success, previous_skipped)
         """
-        with self._lock:
+        with self._condition:
             # Check if previous frame was consumed BEFORE replacing
             previous_skipped = not self._consumed
 
             # Direct assignment (consume() will make a copy for the renderer)
-            self._pending_frame = frame
+            self._pending_frame = FrameWithMetadata(
+                frame=frame, packet_id=packet_id, pts=pts,
+                capture_time=capture_time, udp_recv_time=udp_recv_time,
+                send_time_ns=send_time_ns, width=width, height=height
+            )
 
             # Reset consumed flag to indicate new frame is available
             self._consumed = False
 
+            # Notify waiting consumer (event-driven, eliminates polling latency)
+            self._condition.notify()
+
             return True, previous_skipped
 
-    def consume(self) -> Optional:
+    def wait_for_frame(self, timeout: float = 0.001) -> Optional[FrameWithMetadata]:
+        """
+        Wait for a new frame to be available, then consume it.
+
+        This is the event-driven alternative to polling has_new_frame() + consume().
+        Eliminates fixed polling latency by using Condition variable.
+
+        CRITICAL OPTIMIZATION: Returns frame reference, NOT a copy!
+        The caller (frame_sender) writes directly to SimpleSHM, which does its own copy.
+        This eliminates duplicate copying and prevents lock contention.
+
+        Args:
+            timeout: Maximum time to wait in seconds (default: 1ms for low latency)
+
+        Returns:
+            FrameWithMetadata if available, None if timeout
+        """
+        with self._condition:
+            # Wait for notification if no frame available
+            if self._consumed or self._pending_frame is None:
+                self._condition.wait(timeout)
+
+            # Check again after wait
+            if self._consumed or self._pending_frame is None:
+                return None
+
+            # Get frame reference and metadata - NO COPY HERE!
+            # The caller must process the frame quickly before decoder overwrites it
+            raw_frame = self._pending_frame.frame
+            packet_id = self._pending_frame.packet_id
+            pts = self._pending_frame.pts
+            capture_time = self._pending_frame.capture_time
+            udp_recv_time = self._pending_frame.udp_recv_time
+
+            # Mark as consumed immediately
+            self._consumed = True
+
+        # Return frame reference (caller must handle it quickly)
+        return FrameWithMetadata(
+            frame=raw_frame, packet_id=packet_id, pts=pts,
+            capture_time=capture_time, udp_recv_time=udp_recv_time
+        )
+
+    def consume(self) -> Optional[FrameWithMetadata]:
         """
         Consume the frame from buffer, marking it as consumed.
 
-        CRITICAL: Returns a COPY of the frame to prevent data corruption.
-        The renderer may take time to upload the frame to GPU (glTexSubImage2D),
-        during which the decoder may overwrite pending_frame. By returning a copy,
-        we ensure the renderer has stable data that won't be modified.
-
-        This is the key fix that made 135752.log stable.
+        CRITICAL OPTIMIZATION: Returns frame reference, NOT a copy!
+        Same reason as wait_for_frame() - prevents lock contention.
 
         Returns:
-            A copy of the current frame, or None if buffer is empty
+            FrameWithMetadata with frame reference, or None if buffer is empty
         """
-        with self._lock:
-            # Official scrcpy has: assert(!fb->pending_frame_consumed)
-            # We'll just check and log instead of crashing
-            if self._consumed:
-                logger.debug("Attempted to consume already-consumed frame")
+        with self._condition:
+            if self._consumed or self._pending_frame is None:
                 return None
 
-            # CRITICAL: Copy the frame data
-            # Without this, the decoder thread may overwrite the frame while
-            # the renderer is uploading it to GPU, causing visual corruption
-            if self._pending_frame is not None and hasattr(self._pending_frame, 'copy'):
-                frame = self._pending_frame.copy()
-            else:
-                frame = self._pending_frame
+            # Get frame reference and metadata - NO COPY
+            raw_frame = self._pending_frame.frame
+            packet_id = self._pending_frame.packet_id
+            pts = self._pending_frame.pts
+            capture_time = self._pending_frame.capture_time
+            udp_recv_time = self._pending_frame.udp_recv_time
 
-            # Mark as consumed (allows new frame to replace it)
+            # Mark as consumed immediately
             self._consumed = True
 
-            return frame
+        return FrameWithMetadata(
+            frame=raw_frame, packet_id=packet_id, pts=pts,
+            capture_time=capture_time, udp_recv_time=udp_recv_time
+        )
 
     def pop(self) -> Optional:
         """
@@ -140,3 +215,13 @@ class DelayBuffer:
         """
         with self._lock:
             return 1 if self._pending_frame is not None else 0
+
+    def has_new_frame(self) -> bool:
+        """
+        Check if there is a new frame available to consume.
+
+        Returns:
+            True if there is a frame that hasn't been consumed yet
+        """
+        with self._lock:
+            return self._pending_frame is not None and not self._consumed

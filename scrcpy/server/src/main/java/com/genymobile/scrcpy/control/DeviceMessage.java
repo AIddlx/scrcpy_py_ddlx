@@ -9,6 +9,8 @@ public final class DeviceMessage {
     public static final int TYPE_ACK_CLIPBOARD = 1;
     public static final int TYPE_UHID_OUTPUT = 2;
     public static final int TYPE_APP_LIST = 3;
+    public static final int TYPE_SCREENSHOT = 4;  // Screenshot image data (JPEG)
+    public static final int TYPE_PONG = 5;        // Heartbeat response (server -> client)
 
     private int type;
     private String text;
@@ -16,6 +18,7 @@ public final class DeviceMessage {
     private int id;
     private byte[] data;
     private List<DeviceApp> apps;
+    private long timestamp;  // For PONG message
 
     private DeviceMessage() {
     }
@@ -49,6 +52,20 @@ public final class DeviceMessage {
         return event;
     }
 
+    public static DeviceMessage createScreenshot(byte[] data) {
+        DeviceMessage event = new DeviceMessage();
+        event.type = TYPE_SCREENSHOT;
+        event.data = data;
+        return event;
+    }
+
+    public static DeviceMessage createPong(long timestamp) {
+        DeviceMessage event = new DeviceMessage();
+        event.type = TYPE_PONG;
+        event.timestamp = timestamp;
+        return event;
+    }
+
     public int getType() {
         return type;
     }
@@ -71,5 +88,9 @@ public final class DeviceMessage {
 
     public List<DeviceApp> getApps() {
         return apps;
+    }
+
+    public long getTimestamp() {
+        return timestamp;
     }
 }

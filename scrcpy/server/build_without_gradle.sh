@@ -46,10 +46,11 @@ public final class BuildConfig {
 EOF
 
 echo "Generating java from aidl..."
-cd "$SERVER_DIR/src/main/aidl"
-"$BUILD_TOOLS_DIR/aidl" -o"$GEN_DIR" -I. \
+AIDL_DIR="$(realpath "$SERVER_DIR/src/main/aidl")"
+cd "$AIDL_DIR"
+"$BUILD_TOOLS_DIR/aidl" -o"$GEN_DIR" -I"$AIDL_DIR" -I. \
     android/content/IOnPrimaryClipChangedListener.aidl
-"$BUILD_TOOLS_DIR/aidl" -o"$GEN_DIR" -I. -p "$ANDROID_AIDL" \
+"$BUILD_TOOLS_DIR/aidl" -o"$GEN_DIR" -I"$AIDL_DIR" -I. -p "$ANDROID_AIDL" \
     android/view/IDisplayWindowListener.aidl
 
 # Fake sources to expose hidden Android types to the project
@@ -63,6 +64,7 @@ SRC=( \
     com/genymobile/scrcpy/control/*.java \
     com/genymobile/scrcpy/device/*.java \
     com/genymobile/scrcpy/opengl/*.java \
+    com/genymobile/scrcpy/udp/*.java \
     com/genymobile/scrcpy/util/*.java \
     com/genymobile/scrcpy/video/*.java \
     com/genymobile/scrcpy/wrappers/*.java \
@@ -112,4 +114,7 @@ fi
 
 rm -rf "$GEN_DIR" "$CLASSES_DIR"
 
+# Copy to project root for easy access
+cp "$BUILD_DIR/$SERVER_BINARY" "$SERVER_DIR/../../$SERVER_BINARY"
 echo "Server generated in $BUILD_DIR/$SERVER_BINARY"
+echo "Also copied to project root: $SERVER_DIR/../../$SERVER_BINARY"

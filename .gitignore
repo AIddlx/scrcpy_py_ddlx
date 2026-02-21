@@ -106,3 +106,6 @@ docs/development/CLAUDE.md
 
 # 根目录的 CLAUDE.md（不提交到 GitHub）
 CLAUDE.md
+
+# Windows reserved names
+nul

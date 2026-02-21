@@ -23,6 +23,8 @@ from scrcpy_py_ddlx.core.demuxer import (
     StreamingVideoDemuxer,
     create_streaming_video_demuxer,
     create_streaming_audio_demuxer,
+    create_video_demuxer_for_mode,
+    create_audio_demuxer_for_mode,
 )
 from scrcpy_py_ddlx.core.audio.demuxer import AudioDemuxer as OldAudioDemuxer
 from scrcpy_py_ddlx.core.control import ControlMessageQueue
@@ -48,7 +50,8 @@ class ComponentFactory:
     def __init__(self, config: ClientConfig, state: ClientState,
                  video_socket: socket.socket,
                  control_socket: socket.socket = None,
-                 audio_socket: socket.socket = None):
+                 audio_socket: socket.socket = None,
+                 connection_mode: str = "adb"):
         """
         Initialize component factory.
 
@@ -58,12 +61,14 @@ class ComponentFactory:
             video_socket: Video socket connection
             control_socket: Control socket connection (optional)
             audio_socket: Audio socket connection (optional)
+            connection_mode: Connection mode ('adb', 'tcp', 'udp')
         """
         self.config = config
         self.state = state
         self._video_socket = video_socket
         self._control_socket = control_socket
         self._audio_socket = audio_socket
+        self._connection_mode = connection_mode
 
         # Queues for demuxer->decoder communication
         self._video_packet_queue = None
@@ -74,18 +79,42 @@ class ComponentFactory:
         from queue import Queue
 
         try:
-            if USE_STREAMING_DEMUXER:
-                # Use streaming demuxer (NEW - recommended)
+            if self._connection_mode == 'udp':
+                # UDP mode: use specialized UdpVideoDemuxer
+                logger.info("Using UdpVideoDemuxer for UDP network mode")
+
+                # Create FEC decoder if enabled for video
+                fec_decoder = None
+                if self.config.is_video_fec_enabled():
+                    from scrcpy_py_ddlx.core.demuxer.fec import FecDecoder
+                    fec_decoder = FecDecoder()
+                    logger.info(
+                        f"FEC decoder created for video: group_size={self.config.fec_group_size}, "
+                        f"parity_count={self.config.fec_parity_count}"
+                    )
+
+                demuxer, queue = create_video_demuxer_for_mode(
+                    mode='udp',
+                    sock=self._video_socket,
+                    codec_id=self.state.codec_id,
+                    packet_queue_size=1,  # Reduced from 3 to minimize queue latency
+                    control_channel=self._control_socket,  # For PLI requests
+                    fec_decoder=fec_decoder,
+                    pli_enabled=True,
+                    pli_threshold=10,
+                )
+            elif USE_STREAMING_DEMUXER:
+                # ADB/TCP mode: use streaming demuxer (NEW - recommended)
                 logger.info("Using StreamingVideoDemuxer (no fixed buffer)")
                 demuxer, queue = create_streaming_video_demuxer(
                     self._video_socket,
                     self.state.codec_id,
-                    packet_queue_size=3  # Keep queue size for latency control
+                    packet_queue_size=1  # Reduced from 3 to minimize queue latency
                 )
             else:
                 # Use buffer-based demuxer (OLD - for fallback)
                 logger.info("Using buffer-based VideoDemuxer (2MB buffer)")
-                queue = Queue(maxsize=3)
+                queue = Queue(maxsize=1)  # Reduced from 3 to minimize queue latency
                 demuxer = OldVideoDemuxer(
                     self._video_socket,
                     queue,
@@ -94,7 +123,7 @@ class ComponentFactory:
                 )
 
             self._video_packet_queue = queue
-            logger.info("VideoDemuxer initialized")
+            logger.info(f"VideoDemuxer initialized (mode={self._connection_mode})")
             return demuxer
         except Exception as e:
             logger.error(f"VideoDemuxer initialization failed: {e}")
@@ -110,7 +139,25 @@ class ComponentFactory:
                 logger.warning("Audio socket not initialized, skipping AudioDemuxer")
                 return None
 
-            if USE_STREAMING_DEMUXER:
+            if self._connection_mode == 'udp':
+                # UDP mode: use mode-aware factory (wraps with UdpPacketReader internally)
+                logger.info("Using UDP audio demuxer for UDP network mode")
+
+                # Create FEC decoder for audio if enabled
+                audio_fec_decoder = None
+                if self.config.is_audio_fec_enabled():
+                    from scrcpy_py_ddlx.core.demuxer.fec import FecDecoder
+                    audio_fec_decoder = FecDecoder()
+                    logger.info(f"FEC decoder created for audio: group_size={self.config.fec_group_size}")
+
+                demuxer, queue = create_audio_demuxer_for_mode(
+                    mode='udp',
+                    sock=self._audio_socket,
+                    audio_codec=self.config.audio_codec,
+                    packet_queue_size=3,
+                    fec_decoder=audio_fec_decoder
+                )
+            elif USE_STREAMING_DEMUXER:
                 # Use streaming demuxer (NEW - recommended)
                 demuxer, queue = create_streaming_audio_demuxer(
                     self._audio_socket,
@@ -128,7 +175,7 @@ class ComponentFactory:
                 )
 
             self._audio_packet_queue = queue
-            logger.info("AudioDemuxer initialized")
+            logger.info(f"AudioDemuxer initialized (mode={self._connection_mode})")
             return demuxer
         except Exception as e:
             logger.error(f"AudioDemuxer initialization failed: {e}")
@@ -138,14 +185,23 @@ class ComponentFactory:
         """Initialize video decoder (Step 4)."""
         try:
             width, height = self.state.device_size
+
+            # Check if GPU rendering is enabled (NV12 output for GPU YUV conversion)
+            gpu_rendering = getattr(self.config, 'gpu_rendering', True)  # Default: True
+
             decoder = VideoDecoder(
                 width=width,
                 height=height,
                 codec_id=self.state.codec_id,
-                packet_queue=self._video_packet_queue  # Connect to demuxer's queue
+                packet_queue=self._video_packet_queue,  # Connect to demuxer's queue
+                output_nv12=gpu_rendering  # Output NV12 for GPU YUV conversion
             )
             decoder.start()
-            logger.info("VideoDecoder started")
+
+            if gpu_rendering:
+                logger.info("VideoDecoder started (NV12 GPU rendering mode)")
+            else:
+                logger.info("VideoDecoder started (RGB CPU rendering mode)")
             return decoder
         except Exception as e:
             logger.error(f"VideoDecoder initialization failed: {e}")
@@ -302,6 +358,12 @@ class ComponentFactory:
                 )
                 logger.debug("Consume callback connected to DelayBuffer")
 
+                # NOTE: Frame size change callback is set in video_window.set_delay_buffer()
+                # via video_widget.set_frame_size_changed_callback(). We do NOT set it here
+                # to avoid duplicate callbacks from both decoder thread and GUI thread.
+                # The OpenGL widget detection is preferred because window resize must happen
+                # on the GUI thread anyway.
+
             # Show window
             video_window.show()
 
@@ -373,7 +435,8 @@ class ComponentFactory:
             callbacks = ReceiverCallbacks(
                 on_clipboard=clipboard_event_callback,
                 on_uhid_output=None,
-                on_app_list=None  # For list_apps control message
+                on_app_list=None,  # For list_apps control message
+                on_screenshot=None  # For screenshot control message
             )
 
             # Check if control is enabled and socket is available
@@ -381,16 +444,16 @@ class ComponentFactory:
                 logger.info("Control disabled, skipping DeviceReceiver")
                 return None
 
-            # In forward mode, control socket is already connected
-            # In reverse mode, we need to create a listening socket
-            if self.state.tunnel and self.state.tunnel.forward:
-                # Forward mode: use already connected control socket
+            # Network mode (no tunnel) or forward tunnel mode
+            if self.state.tunnel is None or self.state.tunnel.forward:
+                # Use already connected control socket
                 receiver = DeviceMessageReceiver(
                     socket=self._control_socket,
                     callbacks=callbacks
                 )
                 receiver.start()
-                logger.info("DeviceReceiver started (on existing control socket)")
+                mode = "network" if self.state.tunnel is None else "forward tunnel"
+                logger.info(f"DeviceReceiver started ({mode} mode)")
             elif self.state.tunnel and not self.state.tunnel.forward:
                 # Reverse mode: create listening socket and accept connection
                 if self.state.tunnel is None:

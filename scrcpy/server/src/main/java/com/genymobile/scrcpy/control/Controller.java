@@ -13,7 +13,10 @@ import com.genymobile.scrcpy.device.Size;
 import com.genymobile.scrcpy.util.Ln;
 import com.genymobile.scrcpy.util.LogUtils;
 import com.genymobile.scrcpy.video.SurfaceCapture;
+import com.genymobile.scrcpy.video.CaptureReset;
+import com.genymobile.scrcpy.video.SurfaceEncoder;
 import com.genymobile.scrcpy.video.VirtualDisplayListener;
+import com.genymobile.scrcpy.audio.AudioEncoder;
 import com.genymobile.scrcpy.wrappers.ClipboardManager;
 import com.genymobile.scrcpy.wrappers.InputManager;
 import com.genymobile.scrcpy.wrappers.ServiceManager;
@@ -100,6 +103,13 @@ public class Controller implements AsyncProcessor, VirtualDisplayListener {
     // Used for resetting video encoding on RESET_VIDEO message
     private SurfaceCapture surfaceCapture;
 
+    // Used for requesting sync frames (I-frames) on RESET_VIDEO
+    private CaptureReset captureReset;
+
+    // Used for media stream control (network mode)
+    private SurfaceEncoder surfaceEncoder;
+    private AudioEncoder audioEncoder;
+
     public Controller(ControlChannel controlChannel, CleanUp cleanUp, Options options) {
         this.displayId = options.getDisplayId();
         this.controlChannel = controlChannel;
@@ -150,6 +160,18 @@ public class Controller implements AsyncProcessor, VirtualDisplayListener {
 
     public void setSurfaceCapture(SurfaceCapture surfaceCapture) {
         this.surfaceCapture = surfaceCapture;
+    }
+
+    public void setCaptureReset(CaptureReset captureReset) {
+        this.captureReset = captureReset;
+    }
+
+    public void setSurfaceEncoder(SurfaceEncoder surfaceEncoder) {
+        this.surfaceEncoder = surfaceEncoder;
+    }
+
+    public void setAudioEncoder(AudioEncoder audioEncoder) {
+        this.audioEncoder = audioEncoder;
     }
 
     private UhidManager getUhidManager() {
@@ -333,6 +355,27 @@ public class Controller implements AsyncProcessor, VirtualDisplayListener {
                 break;
             case ControlMessage.TYPE_GET_APP_LIST:
                 getAppListAsync();
+                break;
+            case ControlMessage.TYPE_SCREENSHOT:
+                takeScreenshotAsync();
+                break;
+            case ControlMessage.TYPE_REQUEST_VIDEO_FRAME:
+                requestVideoFrame();
+                break;
+            case ControlMessage.TYPE_START_VIDEO:
+                startVideo();
+                break;
+            case ControlMessage.TYPE_STOP_VIDEO:
+                stopVideo();
+                break;
+            case ControlMessage.TYPE_START_AUDIO:
+                startAudio();
+                break;
+            case ControlMessage.TYPE_STOP_AUDIO:
+                stopAudio();
+                break;
+            case ControlMessage.TYPE_PING:
+                handlePing(msg.getTimestamp());
                 break;
             default:
                 // do nothing
@@ -752,6 +795,12 @@ public class Controller implements AsyncProcessor, VirtualDisplayListener {
     }
 
     private void resetVideo() {
+        // Request immediate sync frame (I-frame) for faster recovery
+        if (captureReset != null) {
+            Ln.i("Requesting sync frame (I-frame) for video reset");
+            captureReset.requestSyncFrame();
+        }
+        // Also invalidate the capture for full reset
         if (surfaceCapture != null) {
             Ln.i("Video capture reset");
             surfaceCapture.requestInvalidate();
@@ -771,5 +820,122 @@ public class Controller implements AsyncProcessor, VirtualDisplayListener {
         DeviceMessage msg = DeviceMessage.createAppList(apps);
         sender.send(msg);
         Ln.i("App list sent: " + apps.size() + " apps");
+    }
+
+    private void takeScreenshotAsync() {
+        if (startAppExecutor == null) {
+            startAppExecutor = Executors.newSingleThreadExecutor();
+        }
+        // Taking screenshot may take time, execute asynchronously
+        startAppExecutor.submit(() -> takeScreenshot());
+    }
+
+    /**
+     * Take a screenshot via SurfaceControl API and send it to the client.
+     * This works even when video is in lazy decode mode (decoder paused).
+     */
+    private void takeScreenshot() {
+        try {
+            // Get display info from DisplayManager (compatible with API 21+)
+            DisplayInfo displayInfo = ServiceManager.getDisplayManager().getDisplayInfo(displayId);
+            if (displayInfo == null) {
+                Ln.e("Screenshot failed: display not found");
+                sendEmptyScreenshot();
+                return;
+            }
+            int width = displayInfo.getSize().getWidth();
+            int height = displayInfo.getSize().getHeight();
+
+            // Take screenshot using SurfaceControl
+            android.graphics.Bitmap bitmap = com.genymobile.scrcpy.wrappers.SurfaceControl.screenshot(width, height);
+            if (bitmap == null) {
+                Ln.e("Screenshot failed: SurfaceControl.screenshot returned null");
+                sendEmptyScreenshot();
+                return;
+            }
+
+            // Compress to JPEG
+            java.io.ByteArrayOutputStream baos = new java.io.ByteArrayOutputStream();
+            boolean compressed = bitmap.compress(android.graphics.Bitmap.CompressFormat.JPEG, 85, baos);
+            bitmap.recycle();
+
+            if (!compressed) {
+                Ln.e("Screenshot failed: JPEG compression failed");
+                sendEmptyScreenshot();
+                return;
+            }
+
+            byte[] jpegData = baos.toByteArray();
+            Ln.i("Screenshot taken: " + width + "x" + height + ", size=" + jpegData.length + " bytes");
+
+            // Send to client
+            DeviceMessage msg = DeviceMessage.createScreenshot(jpegData);
+            sender.send(msg);
+
+        } catch (Exception e) {
+            Ln.e("Screenshot failed", e);
+            sendEmptyScreenshot();
+        }
+    }
+
+    private void sendEmptyScreenshot() {
+        DeviceMessage msg = DeviceMessage.createScreenshot(null);
+        sender.send(msg);
+    }
+
+    // Media stream control methods (network mode)
+
+    private void requestVideoFrame() {
+        if (surfaceEncoder != null) {
+            Ln.i("Requesting single video frame");
+            surfaceEncoder.requestSingleFrame();
+        } else {
+            Ln.w("REQUEST_VIDEO_FRAME ignored: no video encoder");
+        }
+    }
+
+    private void startVideo() {
+        if (surfaceEncoder != null) {
+            Ln.i("Starting video stream");
+            surfaceEncoder.setStandby(false);
+        } else {
+            Ln.w("START_VIDEO ignored: no video encoder");
+        }
+    }
+
+    private void stopVideo() {
+        if (surfaceEncoder != null) {
+            Ln.i("Stopping video stream (encoder standby)");
+            surfaceEncoder.setStandby(true);
+        } else {
+            Ln.w("STOP_VIDEO ignored: no video encoder");
+        }
+    }
+
+    private void startAudio() {
+        if (audioEncoder != null) {
+            Ln.i("Starting audio stream");
+            audioEncoder.setStandby(false);
+        } else {
+            Ln.w("START_AUDIO ignored: no audio encoder");
+        }
+    }
+
+    private void stopAudio() {
+        if (audioEncoder != null) {
+            Ln.i("Stopping audio stream (encoder standby)");
+            audioEncoder.setStandby(true);
+        } else {
+            Ln.w("STOP_AUDIO ignored: no audio encoder");
+        }
+    }
+
+    // Heartbeat handling (TCP control channel keepalive)
+
+    private void handlePing(long timestamp) {
+        // Immediately reply with PONG, echoing back the timestamp
+        DeviceMessage pong = DeviceMessage.createPong(timestamp);
+        sender.send(pong);
+        Ln.d("Heartbeat: PING received, PONG sent (timestamp=" + timestamp + ")");
     }
 }

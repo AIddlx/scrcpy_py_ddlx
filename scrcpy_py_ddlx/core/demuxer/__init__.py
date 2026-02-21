@@ -36,6 +36,7 @@ from .base import (
 # Video Demuxers
 # =============================================================================
 from .video import VideoDemuxer, StreamingVideoDemuxer
+from .udp_video import UdpVideoDemuxer, UdpPacketHeader, UdpStats
 
 # =============================================================================
 # Audio Demuxers - Moved to scrcpy_py_ddlx.core.audio.demuxer
@@ -71,7 +72,9 @@ from .factory import (
     create_video_demuxer,
     create_audio_demuxer,
     create_streaming_video_demuxer,
-    create_streaming_audio_demuxer
+    create_streaming_audio_demuxer,
+    create_video_demuxer_for_mode,
+    create_audio_demuxer_for_mode,
 )
 
 # =============================================================================
@@ -95,6 +98,11 @@ __all__ = [
     # Video Demuxers
     'VideoDemuxer',
     'StreamingVideoDemuxer',
+    'UdpVideoDemuxer',
+
+    # UDP Support Classes
+    'UdpPacketHeader',
+    'UdpStats',
 
     # Audio Demuxers (lazy imported for backward compatibility)
     'AudioDemuxer',
@@ -105,4 +113,6 @@ __all__ = [
     'create_audio_demuxer',
     'create_streaming_video_demuxer',
     'create_streaming_audio_demuxer',
+    'create_video_demuxer_for_mode',
+    'create_audio_demuxer_for_mode',
 ]

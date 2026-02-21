@@ -10,6 +10,7 @@ Based on official scrcpy initialization: scrcpy/src/scrcpy.c
 import platform
 import random
 import socket
+import struct
 import logging
 import time
 import threading
@@ -27,10 +28,22 @@ from scrcpy_py_ddlx.core.protocol import (
 from scrcpy_py_ddlx.core.keycode import KeyCode
 from scrcpy_py_ddlx.core.stream import StreamParser
 from scrcpy_py_ddlx.core.control import ControlMessage
+from scrcpy_py_ddlx.core.negotiation import (
+    DeviceCapabilities,
+    ClientConfiguration,
+    VideoCodecId,
+    AudioCodecId,
+    ConfigFlags,
+    EncoderInfo,
+    select_best_video_codec,
+    select_best_audio_codec,
+)
 
 # Import from this package
 from scrcpy_py_ddlx.client.config import ClientConfig, ClientState
 from scrcpy_py_ddlx.client.components import ComponentFactory, USE_STREAMING_DEMUXER
+from scrcpy_py_ddlx.client.connection import ConnectionManager, NetworkConnection
+from scrcpy_py_ddlx.client.udp_wake import wake_device
 
 logger = logging.getLogger(__name__)
 
@@ -91,6 +104,7 @@ class ScrcpyClient:
         self._device_receiver = None
         self._video_packet_queue = None
         self._audio_packet_queue = None
+        self._heartbeat = None  # TCP control channel heartbeat
 
         # Stop event for thread coordination
         self._stop_event = Event()
@@ -101,6 +115,7 @@ class ScrcpyClient:
         self._screenshot_min_interval = (
             0.3  # Minimum 300ms between screenshots (max ~3/sec)
         )
+        self._screenshot_callback = None  # Callback for control message screenshots
 
         # ========== Runtime decode state ==========
         # Track whether video/audio decoding is enabled (for lazy decode mode)
@@ -151,9 +166,15 @@ class ScrcpyClient:
             control_socket = self.state.control_socket
             audio_socket = self.state.audio_socket  # Created during connection
 
+            # Determine connection mode for ComponentFactory
+            connection_mode = self.config.connection_mode  # 'adb', 'tcp', 'network'
+            if connection_mode == "network":
+                connection_mode = "udp"  # Network mode uses UDP
+
             # ========== STEP 2-9: CREATE ALL COMPONENTS ==========
             self._component_factory = ComponentFactory(
-                self.config, self.state, video_socket, control_socket, audio_socket
+                self.config, self.state, video_socket, control_socket, audio_socket,
+                connection_mode=connection_mode
             )
 
             # Create control queue first
@@ -199,6 +220,15 @@ class ScrcpyClient:
                     self._video_decoder, self._control_queue
                 )
 
+                # Connect demuxer's frame size change callback to video_window
+                # This allows demuxer to notify video_window of new dimensions from video header
+                if self._video_demuxer is not None and self._video_window is not None:
+                    if hasattr(self._video_demuxer, 'set_frame_size_changed_callback'):
+                        self._video_demuxer.set_frame_size_changed_callback(
+                            self._video_window._on_frame_size_changed
+                        )
+                        logger.debug("Demuxer frame size callback connected to video_window")
+
             # ========== STEP 8.5: SCREEN (after video window, so callback can reference it) ==========
             if self.config.video:
                 self._screen = self._component_factory.create_screen(
@@ -227,6 +257,10 @@ class ScrcpyClient:
                 else:
                     self._device_receiver = device_receiver_result
 
+                # Wire screenshot callback if already registered
+                if self._screenshot_callback is not None:
+                    self._device_receiver._callbacks.on_screenshot = self._screenshot_callback
+
             # ========== STEP 11: START DEMUXERS (LAST!) ==========
             if self.config.video and not self.start_video_demuxer():
                 self.disconnect()
@@ -254,6 +288,10 @@ class ScrcpyClient:
             self.state.running = True
             logger.info("Client fully initialized and connected")
 
+            # Start heartbeat if control channel is available
+            if self.state.control_socket is not None:
+                self._start_heartbeat()
+
             # Start clipboard sync if enabled
             if self.config.clipboard_autosync:
                 self._start_clipboard_monitor()
@@ -264,6 +302,55 @@ class ScrcpyClient:
             logger.error(f"Connection failed: {e}")
             self.disconnect()
             return False
+
+    def connect_hot(self,
+                    device_ip: str,
+                    discovery_port: int = 27183,
+                    control_port: int = 27184,
+                    video_port: int = 27185,
+                    audio_port: int = 27186,
+                    timeout: Optional[float] = None) -> bool:
+        """
+        Connect to a hot-connection server (wake + connect).
+
+        This method is for connecting to servers running in stay-alive mode.
+        It sends a UDP wake request first, then establishes the connection.
+
+        Args:
+            device_ip: Device IP address
+            discovery_port: UDP discovery port (default 27183)
+            control_port: TCP control port (default 27184)
+            video_port: UDP video port (default 27185)
+            audio_port: UDP audio port (default 27186)
+            timeout: Connection timeout in seconds
+
+        Returns:
+            True if connection successful
+        """
+        from scrcpy_py_ddlx.client.udp_wake import wake_and_wait
+
+        if self.state.connected:
+            logger.warning("Already connected, disconnect first")
+            return False
+
+        # 1. Send UDP wake request
+        logger.info(f"Waking server at {device_ip}:{discovery_port}")
+        success, error = wake_and_wait(device_ip, discovery_port)
+        if not success:
+            logger.error(f"Failed to wake server: {error}")
+            return False
+
+        logger.info("Server woke up, connecting...")
+
+        # 2. Configure for network mode
+        self.config.host = device_ip
+        self.config.connection_mode = "network"
+        self.config.control_port = control_port
+        self.config.video_port = video_port
+        self.config.audio_port = audio_port
+
+        # 3. Connect using existing logic
+        return self.connect(timeout)
 
     def disconnect(self) -> None:
         """
@@ -288,6 +375,11 @@ class ScrcpyClient:
 
         # Stop clipboard monitor
         self._stop_clipboard_monitor()
+
+        # Stop heartbeat
+        if self._heartbeat is not None:
+            self._heartbeat.stop()
+            self._heartbeat = None
 
         # ========== Cleanup in reverse order ==========
 
@@ -358,6 +450,21 @@ class ScrcpyClient:
             except Exception:
                 pass
             self.state.audio_socket = None
+
+        # Close original UDP sockets (network mode)
+        if self.state.video_udp_socket is not None:
+            try:
+                self.state.video_udp_socket.close()
+            except Exception:
+                pass
+            self.state.video_udp_socket = None
+
+        if self.state.audio_udp_socket is not None:
+            try:
+                self.state.audio_udp_socket.close()
+            except Exception:
+                pass
+            self.state.audio_udp_socket = None
 
         if self.state.control_socket is not None:
             try:
@@ -440,6 +547,63 @@ class ScrcpyClient:
                 break
 
         logger.info("Controller loop ended")
+
+    # ===== Heartbeat methods =====
+
+    def _start_heartbeat(self) -> None:
+        """Start the TCP control channel heartbeat."""
+        from scrcpy_py_ddlx.core.heartbeat import HeartbeatManager
+
+        self._heartbeat = HeartbeatManager(
+            ping_sender=self._send_ping,
+            on_timeout=self._on_heartbeat_timeout
+        )
+        self._heartbeat.start()
+        logger.info("TCP control channel heartbeat started")
+
+        # Wire up PONG callback to device receiver
+        if self._device_receiver is not None:
+            self._device_receiver._callbacks.on_pong = self._on_pong_received
+
+    def _send_ping(self, timestamp: int) -> None:
+        """
+        Send a PING message to the server.
+
+        Args:
+            timestamp: Timestamp in microseconds
+        """
+        if self._control_queue is None:
+            return
+
+        msg = ControlMessage(ControlMessageType.PING)
+        msg.set_ping(timestamp)
+        self._control_queue.put(msg)
+        logger.debug(f"PING queued: timestamp={timestamp}")
+
+    def _on_pong_received(self, timestamp: int) -> None:
+        """
+        Called when a PONG message is received from the server.
+
+        Args:
+            timestamp: The timestamp echoed from PING
+        """
+        if self._heartbeat is not None:
+            self._heartbeat.on_pong_received(timestamp)
+
+    def _on_heartbeat_timeout(self) -> None:
+        """Called when heartbeat timeout occurs - connection is dead."""
+        logger.warning("Heartbeat timeout - disconnecting")
+        # Set stop event to trigger graceful shutdown
+        self._stop_event.set()
+        self.state.running = False
+        self.state.connected = False
+
+        # Close window to break Qt event loop
+        if self._video_window is not None:
+            try:
+                self._video_window.close()
+            except Exception:
+                pass
 
     # ===== Lifecycle management methods =====
 
@@ -608,6 +772,51 @@ class ScrcpyClient:
 
     # ===== Server connection methods =====
 
+    def _init_server_network(self) -> bool:
+        """
+        Initialize server connection in network mode.
+
+        Uses TCP for control and UDP for media streams.
+        """
+        try:
+            host = self.config.host
+
+            # Wake up device
+            if not wake_device(host, self.config.discovery_port):
+                logger.warning(f"Failed to wake device at {host}, trying direct connect...")
+
+            # Setup network connection
+            conn = ConnectionManager.setup_network_mode(
+                host=host,
+                control_port=self.config.control_port,
+                video_port=self.config.video_port,
+                audio_port=self.config.audio_port if self.config.audio else 0,
+                send_dummy_byte=True
+            )
+
+            # Store control socket in state
+            self.state.control_socket = conn.control_socket
+            self.state.network_mode = True
+
+            # Store UDP sockets directly (no wrapper)
+            # UdpVideoDemuxer handles UDP packet parsing internally
+            if conn.video_socket:
+                self.state.video_udp_socket = conn.video_socket  # For cleanup
+                self.state.video_socket = conn.video_socket       # Direct socket for demuxer
+                logger.info("Video UDP socket ready for UdpVideoDemuxer")
+
+            if conn.audio_socket:
+                self.state.audio_udp_socket = conn.audio_socket  # For cleanup
+                self.state.audio_socket = conn.audio_socket       # Direct socket for demuxer
+                logger.info("Audio UDP socket ready")
+
+            logger.info(f"Network mode connected to {host}")
+            return True
+
+        except Exception as e:
+            logger.error(f"Network connection failed: {e}")
+            return False
+
     def _init_server(self, timeout: float) -> bool:
         """
         Initialize server connection using ADB (Step 1).
@@ -627,6 +836,14 @@ class ScrcpyClient:
         Returns:
             True if connection successful, False otherwise
         """
+        # Check connection mode
+        if self.config.connection_mode == "network":
+            if not self._init_server_network():
+                return False
+            # Continue to read device metadata (same as ADB tunnel mode)
+            self._read_device_metadata()
+            return True
+
         try:
             # 1-2. Initialize ADB and select device
             # Official scrcpy behavior: Auto-detect any available device
@@ -821,6 +1038,33 @@ class ScrcpyClient:
             if self.config.clipboard_autosync
             else "clipboard_autosync=false"
         )
+
+        # Select video codec and encoder using capability cache
+        video_codec_param = ""
+        video_encoder_param = ""
+        if self.config.codec.lower() == "auto":
+            try:
+                from scrcpy_py_ddlx.client.capability_cache import CapabilityCache
+                cache = CapabilityCache.get_instance()
+                optimal_config = cache.get_optimal_config(device_serial)
+                logger.info(f"Auto-selected codec for ADB tunnel: {optimal_config.codec}")
+                video_codec_param = f"video_codec={optimal_config.codec}"
+                # Also specify the exact hardware encoder if available
+                if optimal_config.encoder_name:
+                    video_encoder_param = f"video_encoder={optimal_config.encoder_name}"
+                    logger.info(f"Using hardware encoder: {optimal_config.encoder_name}")
+            except Exception as e:
+                logger.warning(f"Failed to auto-select codec: {e}, using h264")
+                video_codec_param = "video_codec=h264"
+        else:
+            video_codec_param = f"video_codec={self.config.codec.lower()}"
+
+        # Low latency optimization parameters
+        low_latency_params = f"low_latency={str(self.config.low_latency).lower()}"
+        encoder_priority_params = f"encoder_priority={self.config.encoder_priority}"
+        encoder_buffer_params = f"encoder_buffer={self.config.encoder_buffer}"
+        skip_frames_params = f"skip_frames={str(self.config.skip_frames).lower()}"
+
         server_params = (
             f"scid={scid:08x} "
             f"tunnel_forward=true "
@@ -830,7 +1074,13 @@ class ScrcpyClient:
             f"log_level=info "
             f"video_bit_rate={self.config.bitrate} "
             f"max_fps={self.config.max_fps} "
-            f"{stay_awake_params}"
+            f"{video_codec_param} "
+            f"{video_encoder_param} "
+            f"{stay_awake_params} "
+            f"{low_latency_params} "
+            f"{encoder_priority_params} "
+            f"{encoder_buffer_params} "
+            f"{skip_frames_params}"
         ).strip()
         adb.start_server(
             serial=device_serial,  # Use device_serial (may be TCP/IP)
@@ -1005,6 +1255,12 @@ class ScrcpyClient:
             if self.config.clipboard_autosync
             else "clipboard_autosync=false"
         )
+        # Low latency optimization parameters
+        low_latency_params = f"low_latency={str(self.config.low_latency).lower()}"
+        encoder_priority_params = f"encoder_priority={self.config.encoder_priority}"
+        encoder_buffer_params = f"encoder_buffer={self.config.encoder_buffer}"
+        skip_frames_params = f"skip_frames={str(self.config.skip_frames).lower()}"
+
         server_params = (
             f"scid={scid:08x} "
             f"tunnel_forward=false "
@@ -1013,7 +1269,11 @@ class ScrcpyClient:
             f"{clipboard_params} "
             f"log_level=info "
             f"max_fps={self.config.max_fps} "
-            f"{stay_awake_params}"
+            f"{stay_awake_params} "
+            f"{low_latency_params} "
+            f"{encoder_priority_params} "
+            f"{encoder_buffer_params} "
+            f"{skip_frames_params}"
         ).strip()
         adb.start_server(
             serial=device_serial,  # Use device_serial (may be TCP/IP)
@@ -1142,18 +1402,33 @@ class ScrcpyClient:
         return tunnel
 
     def _read_device_metadata(self):
-        """Read device metadata (name, codec ID, video size) from server."""
-        # IMPORTANT: Use MSG_WAITALL-like behavior to receive complete data
-        # Python's recv() doesn't guarantee receiving all bytes, so we must loop
+        """
+        Read device metadata (name, codec ID, video size) from server.
+
+        In ADB tunnel mode: all data from video_socket (raw bytes)
+        In network mode: device name from control_socket, codec/size from video_socket
+
+        Note: In both modes, codec/size are sent as raw bytes (no scrcpy packet header).
+        Only video frames have scrcpy packet headers.
+        """
+        import struct
+
+        # Determine which socket to read device name from
+        # Network mode: control_socket; ADB tunnel mode: video_socket
+        if self.state.network_mode and self.state.control_socket:
+            name_socket = self.state.control_socket
+            logger.debug("Reading device name from control socket (network mode)...")
+        else:
+            name_socket = self.state.video_socket
+            logger.debug("Reading device name from video socket (ADB tunnel mode)...")
 
         # Read device name (64 bytes) - loop until all received
-        logger.debug("Reading device name (64 bytes)...")
-        self.state.video_socket.settimeout(5.0)  # 5 second timeout for complete read
+        name_socket.settimeout(5.0)  # 5 second timeout for complete read
 
         device_name_bytes = b""
         bytes_needed = 64
         while len(device_name_bytes) < bytes_needed:
-            chunk = self.state.video_socket.recv(bytes_needed - len(device_name_bytes))
+            chunk = name_socket.recv(bytes_needed - len(device_name_bytes))
             if len(chunk) == 0:
                 # Connection closed
                 if len(device_name_bytes) == 0:
@@ -1173,39 +1448,269 @@ class ScrcpyClient:
         )
         logger.info(f"Device name: {self.state.device_name}")
 
+        # Capability negotiation for network mode
+        if self.state.network_mode and self.state.control_socket:
+            capabilities = self._receive_capabilities()
+            if capabilities:
+                self.state.capabilities = capabilities  # Store for later access
+                self._send_client_configuration(capabilities)
+
         if self.config.video:
-            # Initialize stream parser locally
-            stream_parser = StreamParser()
+            if self.state.network_mode:
+                # Network UDP mode: codec/size comes in a UDP packet
+                # Format: [UDP Header: 16B] [Scrcpy Header: 12B] [Config Payload: 12B]
+                self.state.video_socket.settimeout(5.0)
 
-            # Read codec ID (4 bytes) - loop until all received
-            self.state.video_socket.settimeout(5.0)
-            codec_id_bytes = b""
-            bytes_needed = 4
-            while len(codec_id_bytes) < bytes_needed:
-                chunk = self.state.video_socket.recv(bytes_needed - len(codec_id_bytes))
-                if len(chunk) == 0:
-                    raise ConnectionError(
-                        f"Connection closed while reading codec ID (got {len(codec_id_bytes)}/4 bytes)"
-                    )
-                codec_id_bytes += chunk
-            codec_id, _ = stream_parser.parse_codec_id(codec_id_bytes)
-            self.state.codec_id = codec_id
-            logger.info(f"Codec ID: 0x{codec_id:08x}")
+                # Receive first UDP packet
+                packet, addr = self.state.video_socket.recvfrom(65507)
+                logger.debug(f"Received UDP packet: {len(packet)} bytes from {addr}")
 
-            # Read video size (8 bytes: width + height) - loop until all received
-            self.state.video_socket.settimeout(5.0)
-            size_bytes = b""
-            bytes_needed = 8
-            while len(size_bytes) < bytes_needed:
-                chunk = self.state.video_socket.recv(bytes_needed - len(size_bytes))
-                if len(chunk) == 0:
-                    raise ConnectionError(
-                        f"Connection closed while reading video size (got {len(size_bytes)}/8 bytes)"
-                    )
-                size_bytes += chunk
-            width, height, _ = stream_parser.parse_video_size(size_bytes)
-            self.state.device_size = (width, height)
-            logger.info(f"Video size: {width}x{height}")
+                if len(packet) < 24 + 12 + 12:  # UDP header (24B) + scrcpy header (12B) + config payload (12B)
+                    raise ConnectionError(f"UDP packet too small: {len(packet)} bytes")
+
+                # Parse UDP header
+                # UDP Header: [seq: 4B] [timestamp: 8B] [flags: 4B] [send_time_ns: 8B] = 24 bytes
+                udp_seq = struct.unpack('>I', packet[0:4])[0]
+                udp_flags = struct.unpack('>I', packet[12:16])[0]
+                logger.info(f"First UDP packet: seq={udp_seq}, flags={udp_flags:#x}")
+
+                # Parse scrcpy header (starts at offset 24, after new UDP header)
+                header_bytes = packet[24:36]
+                pts_flags, payload_size = struct.unpack('>QI', header_bytes)
+                is_config = bool(pts_flags & (1 << 63))
+
+                logger.debug(f"Video metadata packet: pts_flags={pts_flags:#x}, size={payload_size}, config={is_config}")
+
+                if not is_config:
+                    raise ConnectionError("Expected config packet but got non-config packet")
+
+                # Parse payload (codec_id + width + height = 12 bytes)
+                payload_bytes = packet[36:36+payload_size]
+                if len(payload_bytes) < 12:
+                    raise ConnectionError(f"Config payload too small: {len(payload_bytes)}")
+
+                codec_id = struct.unpack('>I', payload_bytes[0:4])[0]
+                width = struct.unpack('>I', payload_bytes[4:8])[0]
+                height = struct.unpack('>I', payload_bytes[8:12])[0]
+
+                self.state.codec_id = codec_id
+                self.state.device_size = (width, height)
+
+                logger.info(f"Codec ID: 0x{codec_id:08x}")
+                logger.info(f"Video size: {width}x{height}")
+            else:
+                # ADB tunnel mode: raw bytes (no packet header)
+                # Read codec ID (4 bytes)
+                self.state.video_socket.settimeout(5.0)
+                codec_id_bytes = b""
+                bytes_needed = 4
+                while len(codec_id_bytes) < bytes_needed:
+                    chunk = self.state.video_socket.recv(bytes_needed - len(codec_id_bytes))
+                    if len(chunk) == 0:
+                        raise ConnectionError(
+                            f"Connection closed while reading codec ID (got {len(codec_id_bytes)}/4 bytes)"
+                        )
+                    codec_id_bytes += chunk
+
+                codec_id = struct.unpack('>I', codec_id_bytes)[0]
+                self.state.codec_id = codec_id
+                logger.info(f"Codec ID: 0x{codec_id:08x}")
+
+                # Read video size (8 bytes: width + height)
+                size_bytes = b""
+                bytes_needed = 8
+                while len(size_bytes) < bytes_needed:
+                    chunk = self.state.video_socket.recv(bytes_needed - len(size_bytes))
+                    if len(chunk) == 0:
+                        raise ConnectionError(
+                            f"Connection closed while reading video size (got {len(size_bytes)}/8 bytes)"
+                        )
+                    size_bytes += chunk
+
+                width = struct.unpack('>I', size_bytes[0:4])[0]
+                height = struct.unpack('>I', size_bytes[4:8])[0]
+                self.state.device_size = (width, height)
+                logger.info(f"Video size: {width}x{height}")
+
+    def _receive_capabilities(self) -> Optional[DeviceCapabilities]:
+        """
+        Receive device capabilities from server.
+
+        Returns:
+            DeviceCapabilities or None if negotiation not supported
+        """
+        try:
+            self.state.control_socket.settimeout(5.0)
+
+            # Read capabilities from server
+            # Format:
+            # - screen_width: 4 bytes
+            # - screen_height: 4 bytes
+            # - video_encoder_count: 1 byte
+            # - video_encoders: N * 12 bytes
+            # - audio_encoder_count: 1 byte
+            # - audio_encoders: M * 12 bytes
+
+            # Read screen dimensions (8 bytes)
+            screen_data = b""
+            while len(screen_data) < 8:
+                chunk = self.state.control_socket.recv(8 - len(screen_data))
+                if not chunk:
+                    raise ConnectionError("Connection closed while reading screen dimensions")
+                screen_data += chunk
+
+            screen_width, screen_height = struct.unpack('>II', screen_data)
+            logger.debug(f"Screen dimensions: {screen_width}x{screen_height}")
+
+            # Read video encoder count (1 byte)
+            count_byte = self.state.control_socket.recv(1)
+            if not count_byte:
+                raise ConnectionError("Connection closed while reading video encoder count")
+            video_encoder_count = count_byte[0]
+            logger.debug(f"Video encoder count: {video_encoder_count}")
+
+            # Read video encoders (N * 12 bytes)
+            video_encoders_size = video_encoder_count * 12
+            video_encoders_data = b""
+            while len(video_encoders_data) < video_encoders_size:
+                chunk = self.state.control_socket.recv(video_encoders_size - len(video_encoders_data))
+                if not chunk:
+                    raise ConnectionError("Connection closed while reading video encoders")
+                video_encoders_data += chunk
+
+            # Parse video encoders
+            video_encoders = []
+            for i in range(video_encoder_count):
+                offset = i * 12
+                codec_id, flags, priority = struct.unpack('>III', video_encoders_data[offset:offset+12])
+                video_encoders.append(EncoderInfo(codec_id, flags, priority))
+                logger.debug(f"  Video encoder: codec=0x{codec_id:08x}, flags={flags}, priority={priority}")
+
+            # Read audio encoder count (1 byte)
+            count_byte = self.state.control_socket.recv(1)
+            if not count_byte:
+                raise ConnectionError("Connection closed while reading audio encoder count")
+            audio_encoder_count = count_byte[0]
+            logger.debug(f"Audio encoder count: {audio_encoder_count}")
+
+            # Read audio encoders (M * 12 bytes)
+            audio_encoders_size = audio_encoder_count * 12
+            audio_encoders_data = b""
+            while len(audio_encoders_data) < audio_encoders_size:
+                chunk = self.state.control_socket.recv(audio_encoders_size - len(audio_encoders_data))
+                if not chunk:
+                    raise ConnectionError("Connection closed while reading audio encoders")
+                audio_encoders_data += chunk
+
+            # Parse audio encoders
+            audio_encoders = []
+            for i in range(audio_encoder_count):
+                offset = i * 12
+                codec_id, flags, priority = struct.unpack('>III', audio_encoders_data[offset:offset+12])
+                audio_encoders.append(EncoderInfo(codec_id, flags, priority))
+                logger.debug(f"  Audio encoder: codec=0x{codec_id:08x}, flags={flags}, priority={priority}")
+
+            capabilities = DeviceCapabilities(
+                screen_width=screen_width,
+                screen_height=screen_height,
+                video_encoders=video_encoders,
+                audio_encoders=audio_encoders
+            )
+
+            logger.info(f"Device capabilities: screen={screen_width}x{screen_height}, "
+                       f"video_encoders={len(video_encoders)}, audio_encoders={len(audio_encoders)}")
+
+            # Log available codecs
+            video_codecs = [VideoCodecId.to_string(e.codec_id) for e in video_encoders]
+            audio_codecs = [AudioCodecId.to_string(e.codec_id) for e in audio_encoders]
+            logger.info(f"Available video codecs: {video_codecs}")
+            logger.info(f"Available audio codecs: {audio_codecs}")
+
+            return capabilities
+
+        except Exception as e:
+            logger.error(f"Failed to receive capabilities: {e}")
+            return None
+
+    def _send_client_configuration(self, capabilities: DeviceCapabilities) -> bool:
+        """
+        Send client configuration to server based on capabilities.
+
+        Args:
+            capabilities: Device capabilities received from server
+
+        Returns:
+            True if configuration sent successfully
+        """
+        try:
+            # Select best codecs based on capabilities and user config
+            # If user specified a codec, use it if available; otherwise auto-select
+            if self.config.codec.lower() == "auto":
+                video_codec_id = select_best_video_codec(capabilities)
+            else:
+                # Map user codec string to codec ID
+                codec_map = {
+                    "h264": VideoCodecId.H264,
+                    "h265": VideoCodecId.H265,
+                    "hevc": VideoCodecId.H265,
+                    "av1": VideoCodecId.AV1,
+                }
+                video_codec_id = codec_map.get(self.config.codec.lower(), VideoCodecId.H264)
+
+            # Check if selected codec is available
+            available_video_codecs = [e.codec_id for e in capabilities.video_encoders]
+            if video_codec_id not in available_video_codecs:
+                logger.warning(f"Requested codec {VideoCodecId.to_string(video_codec_id)} not available, "
+                             f"falling back to best available")
+                video_codec_id = select_best_video_codec(capabilities)
+
+            # Select audio codec (Opus preferred)
+            audio_codec_id = select_best_audio_codec(capabilities)
+
+            # Build config flags
+            config_flags = 0
+            if self.config.audio:
+                config_flags |= ConfigFlags.AUDIO_ENABLED
+            if self.config.video:
+                config_flags |= ConfigFlags.VIDEO_ENABLED
+            if self.config.bitrate_mode.lower() == "cbr":
+                config_flags |= ConfigFlags.CBR_MODE
+            if self.config.is_video_fec_enabled():
+                config_flags |= ConfigFlags.VIDEO_FEC
+            if self.config.is_audio_fec_enabled():
+                config_flags |= ConfigFlags.AUDIO_FEC
+
+            # Create client configuration
+            client_config = ClientConfiguration(
+                video_codec_id=video_codec_id,
+                audio_codec_id=audio_codec_id,
+                video_bitrate=self.config.bitrate,
+                audio_bitrate=128000,  # 128 Kbps for audio
+                max_fps=self.config.max_fps,
+                config_flags=config_flags,
+                i_frame_interval=self.config.i_frame_interval
+            )
+
+            # Store selected codec IDs for later access
+            self.state.selected_video_codec = video_codec_id
+            self.state.selected_audio_codec = audio_codec_id
+
+            logger.info(f"Sending client config: video={VideoCodecId.to_string(video_codec_id)}, "
+                       f"audio={AudioCodecId.to_string(audio_codec_id)}, "
+                       f"video_bitrate={self.config.bitrate}, max_fps={self.config.max_fps}, "
+                       f"cbr={self.config.bitrate_mode.lower() == 'cbr'}, "
+                       f"i_frame_interval={self.config.i_frame_interval}")
+
+            # Send configuration (28 bytes)
+            config_bytes = client_config.serialize()
+            self.state.control_socket.sendall(config_bytes)
+
+            logger.info("Client configuration sent successfully")
+            return True
+
+        except Exception as e:
+            logger.error(f"Failed to send client configuration: {e}")
+            return False
 
     def _on_clipboard_event(self, text: str, sequence: int) -> None:
         """
@@ -1844,6 +2349,151 @@ class ScrcpyClient:
         msg.set_reset_video()
         self._control_queue.put(msg)
 
+    def request_screenshot(self) -> None:
+        """
+        Request a screenshot via control message.
+
+        This sends a SCREENSHOT control message to the server, which takes
+        a screenshot using SurfaceControl API and sends it back as JPEG data.
+
+        This is useful in lazy decode mode because it doesn't require:
+        - Resuming the video decoder
+        - Waiting for keyframes
+        - Any video stream activity
+
+        The screenshot will be received as a DeviceMessage with type SCREENSHOT.
+        Use register_screenshot_callback() to handle the response.
+
+        Note: Requires server support for SCREENSHOT message (TYPE_SCREENSHOT = 18).
+        """
+        msg = ControlMessage(ControlMessageType.SCREENSHOT)
+        self._control_queue.put(msg)
+        logger.debug("Requested screenshot via control message")
+
+    def register_screenshot_callback(self, callback) -> None:
+        """
+        Register a callback to be called when a screenshot is received.
+
+        Args:
+            callback: A function that takes one argument (jpeg_data: bytes)
+                     Called with None if screenshot failed.
+        """
+        self._screenshot_callback = callback
+
+        # Also wire to device receiver if available
+        if self._device_receiver is not None:
+            self._device_receiver._callbacks.on_screenshot = callback
+            logger.debug("Screenshot callback wired to device receiver")
+
+    def request_screenshot_async(self, callback=None) -> None:
+        """
+        Request a screenshot via control message with async callback.
+
+        This is the recommended way to take screenshots in lazy decode mode
+        because it doesn't require:
+        - Resuming the video decoder
+        - Waiting for keyframes
+        - Any video stream activity
+
+        Args:
+            callback: Optional callback function(jpeg_data: bytes or None)
+                     If not provided, uses the registered callback.
+
+        Example:
+            >>> def on_screenshot(jpeg_data):
+            ...     if jpeg_data:
+            ...         with open('screenshot.jpg', 'wb') as f:
+            ...             f.write(jpeg_data)
+            >>> client.request_screenshot_async(on_screenshot)
+        """
+        if callback:
+            self.register_screenshot_callback(callback)
+
+        self.request_screenshot()
+
+    # ========== Media stream control (network mode) ==========
+
+    def request_video_frame(self) -> None:
+        """
+        Request a single video frame from the server (network mode only).
+
+        This sends a REQUEST_VIDEO_FRAME control message to the server,
+        which should respond with one video frame. Useful for:
+        - Taking screenshots when video is in standby mode
+        - Getting a frame without starting continuous streaming
+
+        Note: Requires server support for REQUEST_VIDEO_FRAME message.
+        """
+        if not self.state.network_mode:
+            logger.warning("request_video_frame() only works in network mode")
+            return
+
+        msg = ControlMessage(ControlMessageType.REQUEST_VIDEO_FRAME)
+        self._control_queue.put(msg)
+        logger.debug("Requested single video frame")
+
+    def start_video_stream(self) -> None:
+        """
+        Start video stream (network mode only).
+
+        This sends a START_VIDEO control message to the server,
+        which activates the video encoder if it was in standby mode.
+        """
+        if not self.state.network_mode:
+            logger.warning("start_video_stream() only works in network mode")
+            return
+
+        msg = ControlMessage(ControlMessageType.START_VIDEO)
+        self._control_queue.put(msg)
+        logger.info("Requested video stream start")
+
+    def stop_video_stream(self) -> None:
+        """
+        Stop video stream, put encoder in standby (network mode only).
+
+        This sends a STOP_VIDEO control message to the server,
+        which puts the video encoder in standby mode (still initialized
+        but not outputting frames). This saves bandwidth while keeping
+        the encoder ready for quick restart.
+        """
+        if not self.state.network_mode:
+            logger.warning("stop_video_stream() only works in network mode")
+            return
+
+        msg = ControlMessage(ControlMessageType.STOP_VIDEO)
+        self._control_queue.put(msg)
+        logger.info("Requested video stream stop (standby)")
+
+    def start_audio_stream(self) -> None:
+        """
+        Start audio stream (network mode only).
+
+        This sends a START_AUDIO control message to the server,
+        which activates the audio encoder if it was in standby mode.
+        """
+        if not self.state.network_mode:
+            logger.warning("start_audio_stream() only works in network mode")
+            return
+
+        msg = ControlMessage(ControlMessageType.START_AUDIO)
+        self._control_queue.put(msg)
+        logger.info("Requested audio stream start")
+
+    def stop_audio_stream(self) -> None:
+        """
+        Stop audio stream, put encoder in standby (network mode only).
+
+        This sends a STOP_AUDIO control message to the server,
+        which puts the audio encoder in standby mode.
+        """
+        if not self.state.network_mode:
+            logger.warning("stop_audio_stream() only works in network mode")
+            return
+
+        msg = ControlMessage(ControlMessageType.STOP_AUDIO)
+        self._control_queue.put(msg)
+        logger.info("Requested audio stream stop (standby)")
+
     def get_clipboard(self, copy_key: int = CopyKey.COPY) -> None:
         """Request clipboard content from device."""
         msg = ControlMessage(ControlMessageType.GET_CLIPBOARD)
@@ -1928,7 +2578,7 @@ class ScrcpyClient:
 
     # ========== Screenshot methods ==========
 
-    def _save_frame_async(self, frame: "np.ndarray", filename: str) -> None:
+    def _save_frame_async(self, frame: "np.ndarray", filename: str, quality: int = 80) -> None:
         """
         Save a frame to a file asynchronously (non-blocking).
 
@@ -1937,6 +2587,7 @@ class ScrcpyClient:
         Args:
             frame: RGB numpy array from video decoder (VideoDecoder returns RGB)
             filename: Output filename
+            quality: JPEG quality (1-100), only used for .jpg/.jpeg files
         """
         import threading
         import time
@@ -1957,9 +2608,8 @@ class ScrcpyClient:
                 if filename.lower().endswith(".jpg") or filename.lower().endswith(
                     ".jpeg"
                 ):
-                    # JPEG is much faster than PNG!
-                    # Quality 95 is high quality but faster than 100
-                    cv2.imwrite(filename, frame_bgr, [cv2.IMWRITE_JPEG_QUALITY, 95])
+                    # JPEG format with configurable quality
+                    cv2.imwrite(filename, frame_bgr, [cv2.IMWRITE_JPEG_QUALITY, quality])
                 else:
                     # Default to PNG for quality
                     cv2.imwrite(filename, frame_bgr)
@@ -1983,7 +2633,7 @@ class ScrcpyClient:
         thread.start()
 
     def screenshot(
-        self, filename: Optional[str] = None, timeout: float = 1.0
+        self, filename: Optional[str] = None, timeout: float = 1.0, quality: int = 80
     ) -> Optional["np.ndarray"]:
         """
         Capture current frame from the video stream (fast, no server communication).
@@ -2006,6 +2656,7 @@ class ScrcpyClient:
                       Saving happens asynchronously, so this call returns immediately.
                       Use .jpg extension for faster encoding (recommended).
             timeout: DEPRECATED (kept for compatibility), not used in non-blocking mode
+            quality: JPEG quality (1-100), only used for .jpg/.jpeg files. Default: 95
 
         Returns:
             numpy array (BGR format) with shape (height, width, 3), or None if no frame available
@@ -2021,6 +2672,9 @@ class ScrcpyClient:
             >>>
             >>> # Use JPEG for faster encoding (recommended)
             >>> client.screenshot("screenshot.jpg")
+            >>>
+            >>> # Use lower quality for smaller file size
+            >>> client.screenshot("screenshot.jpg", quality=70)
         """
         import time
 
@@ -2031,11 +2685,24 @@ class ScrcpyClient:
         # ========== LAZY DECODE: Auto-resume if paused ==========
         was_paused = not self._video_enabled
         effective_lazy = self.config.lazy_decode and not self.config.show_window
+        frame = None  # Initialize frame variable
+
         if was_paused and effective_lazy:
             logger.info("Screenshot: auto-resuming video for capture")
             self.enable_video()
-            # Wait a bit for frames to arrive
-            time.sleep(0.2)
+            # Request keyframe for proper decoding after resume
+            self.reset_video()
+            # Wait for keyframe to arrive (with timeout)
+            wait_start = time.time()
+            max_wait = 2.0  # Maximum wait time for keyframe
+            while time.time() - wait_start < max_wait:
+                frame = self._video_decoder.get_frame_nowait()
+                if frame is not None:
+                    logger.info(f"Screenshot: got frame after {time.time() - wait_start:.2f}s")
+                    break
+                time.sleep(0.05)
+            else:
+                logger.warning("Screenshot: timeout waiting for frame after resume")
 
         # Rate limiting: check if enough time has passed since last screenshot
         current_time = time.time()
@@ -2046,19 +2713,26 @@ class ScrcpyClient:
             logger.debug(
                 f"Screenshot rate limited: {time_since_last * 1000:.0f}ms since last"
             )
-            frame = self._video_decoder.get_frame_nowait()
+            if frame is None:
+                frame = self._video_decoder.get_frame_nowait()
             if frame is not None and filename:
                 logger.debug(f"Screenshot '{filename}' skipped due to rate limit")
+            # Auto-pause before returning (if in lazy mode)
+            if was_paused and effective_lazy:
+                logger.info("Screenshot: auto-pausing video (lazy mode)")
+                self.disable_video()
             return frame
 
         # Update last screenshot time
         self._screenshot_last_time = current_time
 
-        # Use get_frame_nowait() to avoid blocking the Qt event loop!
-        frame = self._video_decoder.get_frame_nowait()
+        # Get frame if we don't already have one from lazy resume
+        if frame is None:
+            frame = self._video_decoder.get_frame_nowait()
+
         if frame is not None and filename:
             # Save asynchronously in background thread (non-blocking!)
-            self._save_frame_async(frame, filename)
+            self._save_frame_async(frame, filename, quality)
 
         # ========== LAZY DECODE: Auto-pause after capture ==========
         if was_paused and effective_lazy:
@@ -2066,6 +2740,121 @@ class ScrcpyClient:
             self.disable_video()
 
         return frame
+
+    def screenshot_network_standalone(
+        self, filename: Optional[str] = None, timeout: float = 10.0
+    ) -> Optional["np.ndarray"]:
+        """
+        Take a screenshot in network mode by temporarily enabling video.
+
+        This method creates a temporary UDP video connection, captures one frame,
+        then cleans up. Used when connected with video=False in network mode.
+
+        Args:
+            filename: Save path (if provided)
+            timeout: Maximum wait time for first frame (seconds)
+
+        Returns:
+            numpy array (BGR format) with shape (height, width, 3), or None if failed
+        """
+        import socket
+        import time
+
+        if not self.state.connected:
+            logger.warning("Not connected, cannot take network screenshot")
+            return None
+
+        if self.state.network_mode is False:
+            logger.warning("Not in network mode, use screenshot_standalone instead")
+            return None
+
+        logger.info("Establishing temporary UDP video connection for screenshot...")
+
+        temp_socket = None
+        temp_decoder = None
+        temp_demuxer = None
+
+        try:
+            host = self.config.host
+            video_port = self.config.video_port
+
+            # Create UDP socket
+            temp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            temp_socket.settimeout(timeout)
+
+            # Bind to any available port
+            temp_socket.bind(("0.0.0.0", 0))
+            local_port = temp_socket.getsockname()[1]
+            logger.info(f"Temporary UDP video socket bound to port {local_port}")
+
+            # Send discovery/wake packet to server to start video stream
+            from scrcpy_py_ddlx.client.udp_wake import WAKE_REQUEST, DISCOVERY_PORT
+            try:
+                wake_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                wake_sock.settimeout(2.0)
+                wake_sock.sendto(WAKE_REQUEST, (host, DISCOVERY_PORT))
+                wake_sock.close()
+                logger.info(f"Sent wake request to {host}:{DISCOVERY_PORT}")
+            except Exception as e:
+                logger.debug(f"Wake request failed (server may already be streaming): {e}")
+
+            # Wait for server to start streaming
+            time.sleep(0.5)
+
+            # Create temporary video demuxer
+            from scrcpy_py_ddlx.core.demuxer.udp_video import UdpVideoDemuxer
+            from scrcpy_py_ddlx.client.udp_packet_reader import UdpPacketReader
+            from queue import Queue
+
+            packet_queue = Queue(maxsize=10)
+            reader = UdpPacketReader(temp_socket, packet_queue, video_port)
+
+            temp_demuxer = UdpVideoDemuxer(packet_queue)
+            temp_demuxer.start()
+
+            # Start reader thread
+            import threading
+            reader_thread = threading.Thread(target=reader.read_loop, daemon=True)
+            reader_thread.start()
+
+            # Wait for first frame
+            logger.info("Waiting for video frame...")
+            frame = None
+            start_time = time.time()
+
+            while time.time() - start_time < timeout:
+                if temp_demuxer.has_frame():
+                    frame = temp_demuxer.get_frame()
+                    if frame is not None:
+                        break
+                time.sleep(0.1)
+
+            if frame is not None:
+                logger.info(f"Captured frame: {frame.shape}")
+                if filename:
+                    self._save_frame_async(frame, filename)
+            else:
+                logger.warning("No frame received within timeout")
+
+            return frame
+
+        except Exception as e:
+            logger.error(f"Network screenshot failed: {e}")
+            return None
+
+        finally:
+            # Cleanup
+            if temp_demuxer:
+                try:
+                    temp_demuxer.stop()
+                except Exception:
+                    pass
+            if temp_socket:
+                try:
+                    temp_socket.close()
+                except Exception:
+                    pass
+            logger.info("Temporary video connection cleaned up")
 
     def screenshot_device(
         self, filename: Optional[str] = None, timeout: float = 5.0
@@ -2218,7 +3007,16 @@ class ScrcpyClient:
             logger.info(f"Forward tunnel created: tcp:{local_port} -> {socket_name}")
 
             # Start server in background
-            server_params = f"scid={scid:08x} tunnel_forward=true audio=false control=true log_level=info video_bit_rate={self.config.bitrate} max_fps={self.config.max_fps}"
+            # Note: For screenshots, use h264 as it's most reliable
+            # Low latency settings for faster screenshot
+            server_params = (
+                f"scid={scid:08x} tunnel_forward=true audio=false control=true "
+                f"log_level=info video_bit_rate={self.config.bitrate} "
+                f"max_fps={self.config.max_fps} video_codec=h264 "
+                f"low_latency={str(self.config.low_latency).lower()} "
+                f"encoder_priority={self.config.encoder_priority} "
+                f"encoder_buffer={self.config.encoder_buffer}"
+            )
             adb.start_server(
                 serial=device_serial,
                 client_version="3.3.4",
@@ -2857,16 +3655,16 @@ class ScrcpyClient:
                         logger.error("VIDEO CONNECTION LOST!")
                         logger.error("VideoDemuxer thread has exited unexpectedly.")
                         logger.error("The video socket was closed by the server.")
-                        logger.error(
-                            "Control connection may still be active (touch/keyboard work)."
-                        )
-                        logger.error(
-                            "The video will freeze, but you can still control the device."
-                        )
-                        logger.error("Close the window to exit.")
                         logger.error("=" * 60)
-                        # Mark as disconnected but DON'T quit - let user decide when to close
+                        # Mark as disconnected
                         self.state.connected = False
+                        # Auto-close window and exit
+                        logger.info("Auto-closing window due to server disconnect...")
+                        if self._video_window is not None:
+                            self._video_window.close()
+                        QCoreApplication.quit()
+                        check_timer.stop()
+                        return
                     return
 
             # Log visibility status for debugging

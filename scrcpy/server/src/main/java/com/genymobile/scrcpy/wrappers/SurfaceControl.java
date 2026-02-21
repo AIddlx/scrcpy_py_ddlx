@@ -188,4 +188,22 @@ public final class SurfaceControl {
             throw new AssertionError(e);
         }
     }
+
+    /**
+     * Take a screenshot of the display.
+     *
+     * @param width  The desired width of the screenshot
+     * @param height The desired height of the screenshot
+     * @return A Bitmap of the screenshot, or null on failure
+     */
+    public static android.graphics.Bitmap screenshot(int width, int height) {
+        try {
+            // Use reflection to call SurfaceControl.screenshot(width, height)
+            Method method = CLASS.getMethod("screenshot", int.class, int.class);
+            return (android.graphics.Bitmap) method.invoke(null, width, height);
+        } catch (Exception e) {
+            Ln.e("Could not take screenshot", e);
+            return null;
+        }
+    }
 }

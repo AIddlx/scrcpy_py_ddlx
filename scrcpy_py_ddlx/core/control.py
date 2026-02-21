@@ -280,6 +280,15 @@ class ControlMessage:
         """
         self._data["id"] = id
 
+    def set_ping(self, timestamp: int):
+        """
+        Set heartbeat PING parameters.
+
+        Args:
+            timestamp: Timestamp to echo back (microseconds since epoch)
+        """
+        self._data["timestamp"] = timestamp
+
     def serialize(self) -> bytes:
         """
         Serialize control message to bytes.
@@ -438,10 +447,20 @@ class ControlMessage:
             ControlMessageType.RESET_VIDEO,
             ControlMessageType.SCREENSHOT,
             ControlMessageType.GET_APP_LIST,  # Empty message: only type byte
+            # Media stream control (network mode) - all empty messages
+            ControlMessageType.REQUEST_VIDEO_FRAME,
+            ControlMessageType.START_VIDEO,
+            ControlMessageType.STOP_VIDEO,
+            ControlMessageType.START_AUDIO,
+            ControlMessageType.STOP_AUDIO,
         ]:
             # Empty messages: only type byte, no additional data
             buf.append(self.type)
 
+        elif self.type == ControlMessageType.PING:
+            buf.append(self.type)
+            timestamp = self._data.get("timestamp", 0)
+            buf.extend(struct.pack(">Q", timestamp))
 
         else:
             logger.warning(f"Unknown message type: {self.type}")

@@ -1,0 +1,267 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:orientation="vertical"
+    android:background="#F5F5F5">
+
+    <!-- Header -->
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="vertical"
+        android:background="#2196F3"
+        android:padding="20dp">
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="Scrcpy 服务器管理"
+            android:textColor="#FFFFFF"
+            android:textSize="22sp"
+            android:textStyle="bold"/>
+
+        <TextView
+            android:id="@+id/tvStatusSummary"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:text="状态：检测中..."
+            android:textColor="#BBDEFB"
+            android:textSize="14sp"/>
+    </LinearLayout>
+
+    <!-- Status Card -->
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="vertical"
+        android:layout_margin="16dp"
+        android:background="#FFFFFF"
+        android:padding="16dp"
+        android:elevation="2dp">
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="服务器状态"
+            android:textColor="#333333"
+            android:textSize="16sp"
+            android:textStyle="bold"/>
+
+        <View
+            android:layout_width="match_parent"
+            android:layout_height="1dp"
+            android:background="#E0E0E0"
+            android:layout_marginTop="8dp"
+            android:layout_marginBottom="12dp"/>
+
+        <TextView
+            android:id="@+id/tvServerStatus"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="状态：检测中..."
+            android:textSize="15sp"
+            android:textColor="#666666"/>
+
+        <TextView
+            android:id="@+id/tvServerPid"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:text="PID：--"
+            android:textSize="15sp"
+            android:textColor="#666666"/>
+
+        <TextView
+            android:id="@+id/tvServerPorts"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:text="端口：控制 27184 / 视频 27185 / 音频 27186"
+            android:textSize="15sp"
+            android:textColor="#666666"/>
+
+        <TextView
+            android:id="@+id/tvServerMode"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:text="模式：--"
+            android:textSize="15sp"
+            android:textColor="#666666"/>
+
+        <TextView
+            android:id="@+id/tvDeviceName"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:text="设备：--"
+            android:textSize="15sp"
+            android:textColor="#666666"/>
+
+        <TextView
+            android:id="@+id/tvDeviceIp"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:text="IP：--"
+            android:textSize="15sp"
+            android:textColor="#666666"/>
+    </LinearLayout>
+
+    <!-- Action Buttons -->
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="horizontal"
+        android:layout_marginLeft="16dp"
+        android:layout_marginRight="16dp"
+        android:layout_marginBottom="16dp">
+
+        <Button
+            android:id="@+id/btnRefresh"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:layout_marginRight="8dp"
+            android:text="刷新状态"
+            android:backgroundTint="#2196F3"
+            android:textColor="#FFFFFF"/>
+
+        <Button
+            android:id="@+id/btnTerminate"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:layout_marginLeft="8dp"
+            android:text="终止服务器"
+            android:backgroundTint="#F44336"
+            android:textColor="#FFFFFF"/>
+    </LinearLayout>
+
+    <!-- Log Section -->
+    <LinearLayout
+        android:id="@+id/logSection"
+        android:layout_width="match_parent"
+        android:layout_height="0dp"
+        android:layout_weight="1"
+        android:orientation="vertical"
+        android:layout_marginLeft="16dp"
+        android:layout_marginRight="16dp"
+        android:layout_marginBottom="16dp"
+        android:background="#FFFFFF"
+        android:elevation="2dp">
+
+        <!-- Log Header -->
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="horizontal"
+            android:layout_margin="12dp"
+            android:gravity="center_vertical">
+
+            <TextView
+                android:id="@+id/tvLogTitle"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:text="服务器日志"
+                android:textColor="#333333"
+                android:textSize="14sp"
+                android:textStyle="bold"/>
+
+            <!-- Log Level Filter -->
+            <TextView
+                android:id="@+id/btnFilterAll"
+                android:layout_width="wrap_content"
+                android:layout_height="28dp"
+                android:paddingLeft="10dp"
+                android:paddingRight="10dp"
+                android:gravity="center"
+                android:text="全部"
+                android:textSize="11sp"
+                android:textColor="#FFFFFF"
+                android:background="#2196F3"
+                android:clickable="true"
+                android:layout_marginRight="4dp"/>
+
+            <TextView
+                android:id="@+id/btnFilterInfo"
+                android:layout_width="wrap_content"
+                android:layout_height="28dp"
+                android:paddingLeft="10dp"
+                android:paddingRight="10dp"
+                android:gravity="center"
+                android:text="INFO"
+                android:textSize="11sp"
+                android:textColor="#666666"
+                android:background="#E0E0E0"
+                android:clickable="true"
+                android:layout_marginRight="4dp"/>
+
+            <TextView
+                android:id="@+id/btnFilterWarn"
+                android:layout_width="wrap_content"
+                android:layout_height="28dp"
+                android:paddingLeft="10dp"
+                android:paddingRight="10dp"
+                android:gravity="center"
+                android:text="WARN"
+                android:textSize="11sp"
+                android:textColor="#666666"
+                android:background="#E0E0E0"
+                android:clickable="true"
+                android:layout_marginRight="4dp"/>
+
+            <TextView
+                android:id="@+id/btnFilterError"
+                android:layout_width="wrap_content"
+                android:layout_height="28dp"
+                android:paddingLeft="10dp"
+                android:paddingRight="10dp"
+                android:gravity="center"
+                android:text="ERROR"
+                android:textSize="11sp"
+                android:textColor="#666666"
+                android:background="#E0E0E0"
+                android:clickable="true"
+                android:layout_marginRight="8dp"/>
+
+            <TextView
+                android:id="@+id/btnToggleLog"
+                android:layout_width="wrap_content"
+                android:layout_height="28dp"
+                android:paddingLeft="8dp"
+                android:paddingRight="8dp"
+                android:gravity="center"
+                android:text="▲"
+                android:textSize="14sp"
+                android:textColor="#666666"
+                android:background="#E0E0E0"
+                android:clickable="true"/>
+        </LinearLayout>
+
+        <!-- Log Content -->
+        <ScrollView
+            android:id="@+id/logScroll"
+            android:layout_width="match_parent"
+            android:layout_height="match_parent"
+            android:layout_marginLeft="12dp"
+            android:layout_marginRight="12dp"
+            android:layout_marginBottom="12dp"
+            android:background="#FAFAFA">
+
+            <TextView
+                android:id="@+id/tvLog"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:padding="8dp"
+                android:text="点击刷新按钮查看日志..."
+                android:textSize="12sp"
+                android:textColor="#666666"
+                android:fontFamily="monospace"/>
+        </ScrollView>
+    </LinearLayout>
+
+</LinearLayout>

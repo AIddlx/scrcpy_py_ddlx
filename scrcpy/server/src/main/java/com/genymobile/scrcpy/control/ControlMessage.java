@@ -25,7 +25,16 @@ public final class ControlMessage {
     public static final int TYPE_OPEN_HARD_KEYBOARD_SETTINGS = 15;
     public static final int TYPE_START_APP = 16;
     public static final int TYPE_RESET_VIDEO = 17;
+    public static final int TYPE_SCREENSHOT = 18;
     public static final int TYPE_GET_APP_LIST = 19;
+    // Media stream control (network mode)
+    public static final int TYPE_REQUEST_VIDEO_FRAME = 20;  // Request single video frame
+    public static final int TYPE_START_VIDEO = 21;          // Start video stream
+    public static final int TYPE_STOP_VIDEO = 22;           // Stop video stream (encoder standby)
+    public static final int TYPE_START_AUDIO = 23;          // Start audio stream
+    public static final int TYPE_STOP_AUDIO = 24;           // Stop audio stream (encoder standby)
+    // Heartbeat (TCP control channel keepalive)
+    public static final int TYPE_PING = 25;                 // Heartbeat request (client -> server)
 
     public static final long SEQUENCE_INVALID = 0;
 
@@ -54,6 +63,7 @@ public final class ControlMessage {
     private boolean on;
     private int vendorId;
     private int productId;
+    private long timestamp;  // For PING message
 
     private ControlMessage() {
     }
@@ -173,6 +183,13 @@ public final class ControlMessage {
         return msg;
     }
 
+    public static ControlMessage createPing(long timestamp) {
+        ControlMessage msg = new ControlMessage();
+        msg.type = TYPE_PING;
+        msg.timestamp = timestamp;
+        return msg;
+    }
+
     public int getType() {
         return type;
     }
@@ -255,5 +272,9 @@ public final class ControlMessage {
 
     public int getProductId() {
         return productId;
+    }
+
+    public long getTimestamp() {
+        return timestamp;
     }
 }

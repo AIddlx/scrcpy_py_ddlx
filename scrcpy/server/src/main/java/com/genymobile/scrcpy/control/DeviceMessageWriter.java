@@ -14,6 +14,7 @@ public class DeviceMessageWriter {
 
     private static final int MESSAGE_MAX_SIZE = 1 << 18; // 256k
     public static final int CLIPBOARD_TEXT_MAX_LENGTH = MESSAGE_MAX_SIZE - 5; // type: 1 byte; length: 4 bytes
+    public static final int SCREENSHOT_MAX_SIZE = MESSAGE_MAX_SIZE - 5; // type: 1 byte; length: 4 bytes
 
     private final DataOutputStream dos;
 
@@ -55,6 +56,19 @@ public class DeviceMessageWriter {
                     dos.writeShort(pkgBytes.length);
                     dos.write(pkgBytes);
                 }
+                break;
+            case DeviceMessage.TYPE_SCREENSHOT:
+                byte[] screenshotData = msg.getData();
+                if (screenshotData != null && screenshotData.length <= SCREENSHOT_MAX_SIZE) {
+                    dos.writeInt(screenshotData.length);
+                    dos.write(screenshotData);
+                } else {
+                    // Send empty data to indicate failure
+                    dos.writeInt(0);
+                }
+                break;
+            case DeviceMessage.TYPE_PONG:
+                dos.writeLong(msg.getTimestamp());
                 break;
             default:
                 throw new ControlProtocolException("Unknown event type: " + type);

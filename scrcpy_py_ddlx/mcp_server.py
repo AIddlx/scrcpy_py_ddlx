@@ -370,6 +370,30 @@ class ScrcpyMCPServer:
                 "description": "Get the current recording duration in seconds",
                 "parameters": {"type": "object", "properties": {}},
             },
+            # ==================== Video Recording ====================
+            # DISABLED: 带音频的视频录制功能未成功实现
+            # 详见: docs/development/known_issues/video_recording_with_audio.md
+            # "record_video": {
+            #     "description": "Record video with audio to MP4 file (DISABLED)",
+            #     "parameters": {
+            #         "type": "object",
+            #         "properties": {
+            #             "filename": {
+            #                 "type": "string",
+            #                 "description": "Output filename (.mp4)",
+            #             },
+            #             "duration": {
+            #                 "type": "number",
+            #                 "description": "Recording duration in seconds",
+            #             },
+            #             "fps": {
+            #                 "type": "integer",
+            #                 "description": "Video frame rate (default 30)",
+            #             },
+            #         },
+            #         "required": ["filename", "duration"],
+            #     },
+            # },
             # ==================== Advanced Screenshots ====================
             "screenshot_device": {
                 "description": "Take a screenshot from the device server (full process)",
@@ -485,7 +509,7 @@ class ScrcpyMCPServer:
                 "device_name": self._client.state.device_name,
             }
 
-        # Preserve lazy_decode from default_config, override other settings
+        # Preserve settings from default_config, override specific settings
         config = ClientConfig(
             show_window=False,
             control=True,
@@ -494,6 +518,26 @@ class ScrcpyMCPServer:
             tcpip=tcpip,
             tcpip_auto_disconnect=False,
             stay_awake=stay_awake,
+            # Inherit network mode settings from default_config
+            connection_mode=self._default_config.connection_mode,
+            host=self._default_config.host,
+            port=self._default_config.port,
+            control_port=self._default_config.control_port,
+            video_port=self._default_config.video_port,
+            audio_port=self._default_config.audio_port,
+            discovery_port=self._default_config.discovery_port,
+            # Inherit media settings (CRITICAL: these were missing!)
+            bitrate=self._default_config.bitrate,
+            max_fps=self._default_config.max_fps,
+            codec=self._default_config.codec,
+            bitrate_mode=self._default_config.bitrate_mode,
+            i_frame_interval=self._default_config.i_frame_interval,
+            # Inherit FEC settings
+            fec_enabled=self._default_config.fec_enabled,
+            video_fec_enabled=self._default_config.video_fec_enabled,
+            audio_fec_enabled=self._default_config.audio_fec_enabled,
+            fec_group_size=self._default_config.fec_group_size,
+            fec_parity_count=self._default_config.fec_parity_count,
         )
 
         try:
@@ -510,6 +554,8 @@ class ScrcpyMCPServer:
                 "device_name": self._client.state.device_name,
                 "device_size": list(self._client.state.device_size),
                 "codec_id": hex(self._client.state.codec_id),
+                "connection_mode": config.connection_mode,
+                "host": config.host,
                 "tcpip_connected": self._client.state.tcpip_connected,
                 "tcpip_address": (
                     f"{self._client.state.tcpip_ip}:{self._client.state.tcpip_port}"
@@ -564,13 +610,14 @@ class ScrcpyMCPServer:
     # ==================== Screenshot ====================
 
     def screenshot(
-        self, filename: Optional[str] = None, return_base64: bool = False
+        self, filename: Optional[str] = None, return_base64: bool = False, quality: int = 80
     ) -> Dict[str, Any]:
         """Capture a screenshot
 
         Args:
-            filename: Optional filename to save (PNG format)
+            filename: Optional filename to save (format determined by extension)
             return_base64: Return image as base64 data URL
+            quality: JPEG quality (1-100), only used for .jpg/.jpeg files
 
         Returns:
             Dictionary with screenshot result
@@ -581,7 +628,7 @@ class ScrcpyMCPServer:
         try:
             import numpy as np
 
-            frame = self._client.screenshot(filename)
+            frame = self._client.screenshot(filename, quality=quality)
 
             result = {
                 "success": True,
@@ -1239,14 +1286,22 @@ class ScrcpyMCPServer:
     # ==================== Audio Recording ====================
 
     def record_audio(
-        self, filename: str, duration: float, format: Optional[str] = None
+        self, filename: str, duration: float, format: Optional[str] = None,
+        passthrough: bool = False, auto_convert_to: Optional[str] = None
     ) -> Dict[str, Any]:
         """Record audio to file
 
+        Three recording modes:
+        1. passthrough=True -> Direct OPUS to OGG (best quality, no re-encoding)
+        2. auto_convert_to=opus/mp3 -> Decode and re-encode
+        3. auto_convert_to=None, passthrough=False -> Decode to WAV (PCM)
+
         Args:
-            filename: Output filename (extension determines format: .wav, .opus, .mp3)
+            filename: Output filename
             duration: Recording duration in seconds
-            format: Output format ('wav', 'opus', 'mp3'). If None, uses filename extension
+            format: Output format ('auto', 'wav', 'opus', 'mp3')
+            passthrough: If True, save raw OPUS packets directly (no decoding)
+            auto_convert_to: Target format for re-encoding ('opus', 'mp3')
 
         Returns:
             Dictionary with recording result
@@ -1254,23 +1309,22 @@ class ScrcpyMCPServer:
         if self._client is None or not self._client.state.connected:
             return {"success": False, "error": "Not connected"}
         try:
-            # Determine format from filename or parameter
-            if format is None:
-                if filename.endswith(".opus"):
-                    format = "opus"
-                elif filename.endswith(".mp3"):
-                    format = "mp3"
-                else:
-                    format = "wav"
+            # Determine recording mode
+            if passthrough:
+                recording_mode = "passthrough"
+                # For passthrough, output to .ogg container
+                if not filename.lower().endswith('.ogg'):
+                    from pathlib import Path
+                    filename = str(Path(filename).with_suffix('.ogg'))
+            elif auto_convert_to:
+                recording_mode = "transcode"
+            else:
+                recording_mode = "wav"
 
-            # Map format to auto_convert_to value
-            format_map = {
-                "wav": None,
-                "opus": "opus",
-                "mp3": "mp3",
-            }
-
-            auto_convert = format_map.get(format)
+            self._logger.info(f"Audio recording mode: {recording_mode}")
+            self._logger.info(f"  filename: {filename}")
+            self._logger.info(f"  duration: {duration}s")
+            self._logger.info(f"  auto_convert_to: {auto_convert_to}")
 
             # 检查音频解码器状态
             self._logger.info(f"Audio state check:")
@@ -1285,12 +1339,21 @@ class ScrcpyMCPServer:
             # 检查 frame_sink 状态
             frame_sink = self._client._audio_decoder._frame_sink
             self._logger.info(f"  frame_sink type: {type(frame_sink).__name__ if frame_sink else 'None'}")
-            self._logger.info(f"  frame_sink: {frame_sink}")
+
+            # Passthrough mode: directly save raw OPUS packets
+            if passthrough:
+                # TODO: Implement true passthrough recording
+                # For now, fall back to transcode mode with opus
+                self._logger.info("Passthrough mode: using transcode with opus (passthrough not yet implemented)")
+                auto_convert_to = "opus"
+                if not filename.lower().endswith('.opus'):
+                    from pathlib import Path
+                    filename = str(Path(filename).with_suffix('.opus'))
 
             success = self._client.start_audio_recording(
                 filename,
                 max_duration=duration,
-                auto_convert_to=auto_convert,
+                auto_convert_to=auto_convert_to,
             )
 
             if not success:
@@ -1304,11 +1367,30 @@ class ScrcpyMCPServer:
                 final_filename = self._client.stop_audio_recording()
                 # Wait for file to be fully written
                 time.sleep(1.0)
+
+                # Determine actual format from filename
+                actual_format = "wav"
+                if final_filename:
+                    if final_filename.endswith('.opus'):
+                        actual_format = "opus"
+                    elif final_filename.endswith('.mp3'):
+                        actual_format = "mp3"
+                    elif final_filename.endswith('.ogg'):
+                        actual_format = "ogg"
+                elif filename:
+                    if filename.endswith('.opus'):
+                        actual_format = "opus"
+                    elif filename.endswith('.mp3'):
+                        actual_format = "mp3"
+                    elif filename.endswith('.ogg'):
+                        actual_format = "ogg"
+
                 return {
                     "success": True,
                     "filename": final_filename or filename,
                     "duration": duration,
-                    "format": format,
+                    "format": actual_format,
+                    "mode": recording_mode,
                 }
 
             return {"success": False, "error": "Failed to start recording"}
@@ -1351,6 +1433,37 @@ class ScrcpyMCPServer:
         except Exception as e:
             self._logger.error(f"Get recording duration error: {e}")
             return {"success": False, "error": str(e), "duration": 0.0}
+
+    # ==================== Video Recording ====================
+    # DISABLED: 带音频的视频录制功能未成功实现
+    # 详见: docs/development/known_issues/video_recording_with_audio.md
+
+    def record_video(
+        self, filename: str, duration: float, fps: int = 30
+    ) -> Dict[str, Any]:
+        """Record video with audio to file - DISABLED
+
+        此功能暂时禁用，因为 H.265 Annex B 格式与 MKV/MP4 容器不兼容。
+        详见: docs/development/known_issues/video_recording_with_audio.md
+
+        替代方案:
+        - 使用 record_audio() 录制音频
+        - 使用 screenshot() 截取静态画面
+        """
+        return {
+            "success": False,
+            "error": "视频录制功能暂时禁用。H.265 Annex B 格式与 MKV/MP4 容器不兼容。",
+            "details": "详见: docs/development/known_issues/video_recording_with_audio.md",
+            "alternatives": [
+                "使用 record_audio() 录制音频",
+                "使用 screenshot() 截取静态画面",
+            ]
+        }
+
+    def _record_video_impl(
+        self, filename: str, duration: float, fps: int = 30
+    ) -> Dict[str, Any]:
+        """Original record_video implementation - kept for future reference"""
 
     # ==================== Advanced Screenshots ====================
 

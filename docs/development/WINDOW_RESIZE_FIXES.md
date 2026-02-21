@@ -13,6 +13,9 @@
 | [WINDOW_RESIZE_FIXES.md](WINDOW_RESIZE_FIXES.md) | 本索引 + 主窗口修复（#1-#8） |
 | [WINDOW_RESIZE_FIXES_PREVIEW.md](WINDOW_RESIZE_FIXES_PREVIEW.md) | 预览窗口 + CPU 优化修复（#9-#19） |
 | [CPU_OPTIMIZATION_RESEARCH.md](CPU_OPTIMIZATION_RESEARCH.md) | CPU 优化调查报告（QOpenGLWidget 问题） |
+| [REFACTOR_SAFETY_GUIDE.md](REFACTOR_SAFETY_GUIDE.md) | **重构安全保障指南** |
+| [INTERFACE_CONTRACTS.md](INTERFACE_CONTRACTS.md) | **接口契约定义** |
+| [changelog/](changelog/) | **变更日志目录** |
 
 ---
 

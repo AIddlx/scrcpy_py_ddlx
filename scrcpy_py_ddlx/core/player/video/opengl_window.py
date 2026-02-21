@@ -275,9 +275,12 @@ def create_opengl_video_renderer_class():
         def render(self) -> None:
             """Render the video frame using OpenGL."""
             self._paint_count = getattr(self, '_paint_count', 0) + 1
+            if self._paint_count <= 5:
+                logger.info(f"[OPENGL_WINDOW] render() called #{self._paint_count}")
 
             # Ensure OpenGL is initialized (may not be called automatically with createWindowContainer)
             if self._texture_id is None:
+                logger.info("[OPENGL_WINDOW] Texture not initialized, calling initialize()")
                 self.initialize()
 
             with _profile_time('glClear'):
@@ -523,7 +526,24 @@ def create_opengl_video_renderer_class():
 
         def _on_update_timer(self) -> None:
             """Called by QTimer to trigger repaint."""
-            self.update()
+            self._timer_count = getattr(self, '_timer_count', 0) + 1
+
+            # Check if window is exposed before rendering
+            if not self.isExposed():
+                if self._timer_count <= 5:
+                    logger.debug(f"[OPENGL_WINDOW] Timer tick #{self._timer_count}, exposed=False, skipping")
+                return
+
+            if self._timer_count <= 5:
+                logger.debug(f"[OPENGL_WINDOW] Timer tick #{self._timer_count}, exposed=True, calling render() directly")
+
+            # For QOpenGLWindow embedded in createWindowContainer, we may need to call render() directly
+            # The normal update() -> render() flow doesn't work as expected
+            try:
+                self.render()
+            except Exception as e:
+                if self._timer_count <= 10:
+                    logger.error(f"[OPENGL_WINDOW] render() error: {e}")
 
         # ========================================================================
         # Public Interface (must match OpenGLVideoWidget interface)

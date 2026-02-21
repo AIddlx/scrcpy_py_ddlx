@@ -10,12 +10,13 @@ from typing import Optional, Tuple, Union, TYPE_CHECKING
 import numpy as np
 
 try:
-    from PySide6.QtWidgets import QApplication, QMainWindow
+    from PySide6.QtWidgets import QApplication, QMainWindow, QWidget
     from PySide6.QtCore import QCoreApplication, QTimer, QMetaObject, Qt, Q_ARG
     from PySide6.QtGui import QScreen
 except ImportError:
     QApplication = None
     QMainWindow = None
+    QWidget = None
     QCoreApplication = None
     QTimer = None
     QMetaObject = None
@@ -24,6 +25,14 @@ except ImportError:
 
 from scrcpy_py_ddlx.core.player.video.video_widget import VideoWidget
 from scrcpy_py_ddlx.core.player.video.opengl_widget import OpenGLVideoWidget
+
+# Import the new QOpenGLWindow-based renderer
+try:
+    from scrcpy_py_ddlx.core.player.video.opengl_window import OpenGLVideoRenderer
+    OPENGL_RENDERER_AVAILABLE = True
+except ImportError:
+    OpenGLVideoRenderer = None
+    OPENGL_RENDERER_AVAILABLE = False
 
 if TYPE_CHECKING:
     from scrcpy_py_ddlx.core.control import ControlMessageQueue
@@ -462,7 +471,10 @@ class VideoWindow(QMainWindow if QMainWindow else object):
 
 class OpenGLVideoWindow(QMainWindow if QMainWindow else object):
     """
-    Main video window using OpenGL widget for GPU-accelerated rendering.
+    Main video window using OpenGL for GPU-accelerated rendering.
+
+    Uses QOpenGLWindow (via OpenGLVideoRenderer) which has significantly
+    lower CPU usage than QOpenGLWidget on Windows.
     """
 
     def __init__(self, parent=None):
@@ -472,7 +484,18 @@ class OpenGLVideoWindow(QMainWindow if QMainWindow else object):
 
         super().__init__(parent)
 
-        self._video_widget = OpenGLVideoWidget()
+        # Use QOpenGLWindow-based renderer for better performance
+        if OPENGL_RENDERER_AVAILABLE and OpenGLVideoRenderer is not None:
+            self._opengl_renderer = OpenGLVideoRenderer()
+            # QOpenGLWindow is a QWindow, need to embed it in a QWidget
+            self._video_widget = QWidget.createWindowContainer(self._opengl_renderer)
+            logger.info("[OPENGL_WINDOW] Using QOpenGLWindow-based renderer (low CPU mode)")
+        else:
+            # Fallback to QOpenGLWidget if renderer not available
+            self._opengl_renderer = None
+            self._video_widget = OpenGLVideoWidget()
+            logger.info("[OPENGL_WINDOW] Using QOpenGLWidget fallback")
+
         self.setCentralWidget(self._video_widget)
 
         # Window setup
@@ -500,7 +523,11 @@ class OpenGLVideoWindow(QMainWindow if QMainWindow else object):
         """Set device information."""
         self._device_name = name
         self._device_size = (width, height)
-        self._video_widget.set_device_size(width, height)
+        # Use the renderer directly for QOpenGLWindow mode
+        if self._opengl_renderer:
+            self._opengl_renderer.set_device_size(width, height)
+        else:
+            self._video_widget.set_device_size(width, height)
         self.setWindowTitle(f"scrcpy-py-ddlx (OpenGL) - {name} ({width}x{height})")
 
         # Calculate window size
@@ -532,15 +559,24 @@ class OpenGLVideoWindow(QMainWindow if QMainWindow else object):
 
     def update_frame(self, frame: np.ndarray) -> None:
         """Update the displayed frame."""
-        self._video_widget.update_frame(frame)
+        if self._opengl_renderer:
+            self._opengl_renderer.update_frame(frame)
+        else:
+            self._video_widget.update_frame(frame)
 
     def set_control_queue(self, queue: "ControlMessageQueue") -> None:
         """Set the control message queue."""
-        self._video_widget.set_control_queue(queue)
+        if self._opengl_renderer:
+            self._opengl_renderer.set_control_queue(queue)
+        else:
+            self._video_widget.set_control_queue(queue)
 
     def set_consume_callback(self, callback: Optional[callable]) -> None:
         """Set the consume callback to notify when frame has been rendered."""
-        self._video_widget.set_consume_callback(callback)
+        if self._opengl_renderer:
+            self._opengl_renderer.set_consume_callback(callback)
+        else:
+            self._video_widget.set_consume_callback(callback)
 
     def set_delay_buffer(self, delay_buffer: 'DelayBuffer') -> None:
         """
@@ -549,9 +585,12 @@ class OpenGLVideoWindow(QMainWindow if QMainWindow else object):
         Args:
             delay_buffer: The DelayBuffer from VideoDecoder
         """
-        self._video_widget.set_delay_buffer(delay_buffer)
-        # Set up frame size change callback for device rotation
-        self._video_widget.set_frame_size_changed_callback(self._on_frame_size_changed)
+        if self._opengl_renderer:
+            self._opengl_renderer.set_delay_buffer(delay_buffer)
+            self._opengl_renderer.set_frame_size_changed_callback(self._on_frame_size_changed)
+        else:
+            self._video_widget.set_delay_buffer(delay_buffer)
+            self._video_widget.set_frame_size_changed_callback(self._on_frame_size_changed)
 
     def _on_frame_size_changed(self, width: int, height: int) -> None:
         """
@@ -618,7 +657,10 @@ class OpenGLVideoWindow(QMainWindow if QMainWindow else object):
 
         # Update device size
         self._device_size = (width, height)
-        self._video_widget.set_device_size(width, height)
+        if self._opengl_renderer:
+            self._opengl_renderer.set_device_size(width, height)
+        else:
+            self._video_widget.set_device_size(width, height)
         self.setWindowTitle(f"scrcpy-py-ddlx (OpenGL) - {self._device_name} ({width}x{height})")
 
         # Calculate window size using user's preferred scale
@@ -682,8 +724,15 @@ class OpenGLVideoWindow(QMainWindow if QMainWindow else object):
         self.resize(window_width, window_height)
 
     @property
-    def video_widget(self) -> OpenGLVideoWidget:
-        """Get the video widget."""
+    def video_widget(self):
+        """
+        Get the video widget or renderer.
+
+        Returns the OpenGLVideoRenderer if using QOpenGLWindow mode,
+        otherwise returns the OpenGLVideoWidget.
+        """
+        if self._opengl_renderer:
+            return self._opengl_renderer
         return self._video_widget
 
     def show(self) -> None:

@@ -459,6 +459,11 @@ def create_opengl_video_renderer_class():
                     glTexImage2D(GL_TEXTURE_2D, 0, GL_LUMINANCE, y_tex_width, height, 0,
                                 GL_LUMINANCE, GL_UNSIGNED_BYTE,
                                 y_plane.ctypes.data_as(c_void_p))
+                    # Set texture parameters (CRITICAL - must be set after glTexImage2D)
+                    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR)
+                    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR)
+                    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE)
+                    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE)
                     self._nv12_y_tex_width = y_tex_width
                     self._nv12_y_tex_height = height
                 else:
@@ -473,6 +478,11 @@ def create_opengl_video_renderer_class():
                     glTexImage2D(GL_TEXTURE_2D, 0, GL_LUMINANCE, uv_tex_width, uv_height, 0,
                                 GL_LUMINANCE, GL_UNSIGNED_BYTE,
                                 u_plane.ctypes.data_as(c_void_p))
+                    # Set texture parameters
+                    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR)
+                    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR)
+                    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE)
+                    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE)
                 else:
                     glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, uv_tex_width, uv_height,
                                    GL_LUMINANCE, GL_UNSIGNED_BYTE,
@@ -485,6 +495,11 @@ def create_opengl_video_renderer_class():
                     glTexImage2D(GL_TEXTURE_2D, 0, GL_LUMINANCE, uv_tex_width, uv_height, 0,
                                 GL_LUMINANCE, GL_UNSIGNED_BYTE,
                                 v_plane.ctypes.data_as(c_void_p))
+                    # Set texture parameters
+                    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR)
+                    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR)
+                    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE)
+                    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE)
                     self._nv12_uv_tex_width = uv_tex_width
                     self._nv12_uv_tex_height = uv_height
                 else:
@@ -535,15 +550,24 @@ def create_opengl_video_renderer_class():
                 return
 
             if self._timer_count <= 5:
-                logger.debug(f"[OPENGL_WINDOW] Timer tick #{self._timer_count}, exposed=True, calling render() directly")
+                logger.debug(f"[OPENGL_WINDOW] Timer tick #{self._timer_count}, exposed=True, calling render()")
 
-            # For QOpenGLWindow embedded in createWindowContainer, we may need to call render() directly
-            # The normal update() -> render() flow doesn't work as expected
+            # For QOpenGLWindow embedded in createWindowContainer, we need to:
+            # 1. Make the OpenGL context current
+            # 2. Call render()
+            # 3. Swap buffers (if not automatic)
             try:
+                # Make context current - CRITICAL for OpenGL operations
+                self.makeCurrent()
                 self.render()
+                # For QOpenGLWindow, we may need to swap buffers manually
+                self.context().swapBuffers(self.context().surface()) if self.context() else None
             except Exception as e:
                 if self._timer_count <= 10:
                     logger.error(f"[OPENGL_WINDOW] render() error: {e}")
+            finally:
+                # Release context
+                self.doneCurrent()
 
         # ========================================================================
         # Public Interface (must match OpenGLVideoWidget interface)

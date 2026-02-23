@@ -196,6 +196,16 @@ class StreamingVideoDemuxer(StreamingDemuxerBase):
         self._codec_id = codec_id
         self._config_data: Optional[bytes] = None  # Buffer for config merging
         self._screenshot_queue: Optional[Queue] = None  # Queue for screenshot requests
+        self._frame_size_changed_callback: Optional[Callable[[int, int], None]] = None  # For rotation
+
+    def set_frame_size_changed_callback(self, callback: Callable[[int, int], None]) -> None:
+        """
+        Set callback for frame size changes (screen rotation).
+
+        Args:
+            callback: Function(width, height) called when frame size changes
+        """
+        self._frame_size_changed_callback = callback
 
     def set_screenshot_queue(self, queue: Queue) -> None:
         """
@@ -208,6 +218,13 @@ class StreamingVideoDemuxer(StreamingDemuxerBase):
             queue: Queue to receive screenshot VideoPacket objects
         """
         self._screenshot_queue = queue
+
+    # Known codec IDs for rotation detection
+    _KNOWN_CODEC_IDS = {
+        0x68323634: 'H264',  # 'h264'
+        0x68323635: 'H265',  # 'h265'
+        0x61763031: 'AV1',   # 'av01'
+    }
 
     def _recv_packet(self) -> Optional[VideoPacket]:
         """
@@ -233,6 +250,52 @@ class StreamingVideoDemuxer(StreamingDemuxerBase):
             is_config = bool(pts_flags & (1 << 63))
             is_key_frame = bool(pts_flags & (1 << 62))
             pts = pts_flags & 0x3FFFFFFFFFFFFFFF
+
+            # Step 2.5: Detect codec header sent during rotation (ADB mode)
+            # When server rotates, it sends: codec_id(4) + width(4) + height(4) = 12 bytes
+            # If we parse this as pts_flags(8) + payload_size(4), we get garbage values
+            # Check ANY time, not just when payload_size is invalid
+            potential_codec_id = (pts_flags >> 32) & 0xFFFFFFFF
+
+            # Check for known codec IDs (with or without high bits set)
+            # When parsed as pts_flags, the high bits (62, 63) might be set incorrectly
+            # So we check the lower 30 bits of the potential codec_id
+            potential_codec_id_lower = potential_codec_id & 0x3FFFFFFF  # Mask off bits 30-31
+            known_codec_ids_lower = {cid & 0x3FFFFFFF: name for cid, name in self._KNOWN_CODEC_IDS.items()}
+
+            if potential_codec_id_lower in known_codec_ids_lower:
+                # This could be a codec header from rotation!
+                # Re-parse as: codec_id(4) + width(4) + height(4)
+                codec_id = potential_codec_id
+                width = (pts_flags >> 0) & 0xFFFFFFFF
+                height = payload_size
+
+                # Validate dimensions (reasonable screen sizes)
+                if 100 <= width <= 4096 and 100 <= height <= 4096:
+                    # Additional check: if this were a real video packet, pts would be much smaller
+                    # Real pts values are typically < 10^15, but when parsing codec header as pts,
+                    # the value is extremely large (codec_id shifted into high bits)
+                    if pts > 10**15:  # Suspiciously large PTS indicates codec header
+                        codec_name = known_codec_ids_lower[potential_codec_id_lower]
+                        logger.warning(
+                            f"[ROTATION-ADB] Detected codec header during rotation: "
+                            f"codec=0x{codec_id:08x} ({codec_name}), "
+                            f"size={width}x{height}"
+                        )
+                        # Update codec_id and notify callback
+                        if self._codec_id != codec_id:
+                            logger.info(f"[ROTATION-ADB] Codec changed: 0x{self._codec_id:08x} -> 0x{codec_id:08x}")
+                            self._codec_id = codec_id
+
+                        # Notify frame size change callback
+                        if self._frame_size_changed_callback:
+                            try:
+                                self._frame_size_changed_callback(width, height)
+                            except Exception as e:
+                                logger.warning(f"[ROTATION-ADB] Callback error: {e}")
+
+                        # Return None to skip this "packet" (it's actually a header)
+                        return None
 
             # Step 3: Validate payload size
             if payload_size > self.MAX_PACKET_SIZE:

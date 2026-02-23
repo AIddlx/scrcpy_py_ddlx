@@ -1131,6 +1131,105 @@ def _on_frame_size_changed(self, width: int, height: int) -> None:
 
 ---
 
+## 2026-02-23 修复: ADB 模式屏幕旋转时数据流错误
+
+### 问题描述
+
+**症状**:
+- ADB 隧道模式下，屏幕旋转时客户端崩溃
+- 错误日志：`Payload size 3684230449 exceeds maximum 16777216`
+- 异常的 PTS 值：`2896437111613819232`
+
+**根本原因**:
+
+ADB 模式下旋转时，服务端重新发送了 12 字节的 codec header：
+```
+codec_id(4字节) + width(4字节) + height(4字节) = 12字节
+```
+
+但 `StreamingVideoDemuxer` 把这 12 字节当成了视频包 header 来解析：
+```
+pts_flags(8字节) + payload_size(4字节) = 12字节
+```
+
+导致：
+- `codec_id` 被解析为 `pts_flags` 的高 4 字节
+- `width` 被解析为 `pts_flags` 的低 4 字节
+- `height` 被解析为 `payload_size`
+
+### 分析
+
+以 H.265 + 2400x1080 分辨率为例：
+
+```
+服务端发送的 codec header:
+  codec_id = 0x68323635 ('h265')
+  width    = 2400 (0x00000960)
+  height   = 1080 (0x00000438)
+
+被错误解析为视频包 header:
+  pts_flags  = 0x6832363500000960 (异常大的 PTS)
+  payload_size = 1080 (正常范围内!)
+
+问题：payload_size 在正常范围内，但 PTS 异常
+```
+
+### 解决方案
+
+在 `StreamingVideoDemuxer._recv_packet()` 中添加 codec header 检测：
+
+**文件**: `scrcpy_py_ddlx/core/demuxer/video.py`
+
+```python
+# 已知的 codec ID（低 30 位，忽略高位）
+_KNOWN_CODEC_IDS = {
+    0x68323634: 'H264',  # 'h264'
+    0x68323635: 'H265',  # 'h265'
+    0x61763031: 'AV1',   # 'av01'
+}
+
+def _recv_packet(self):
+    # 解析 header
+    pts_flags, payload_size = struct.unpack('>QI', header_data)
+
+    # 检测 codec header（旋转时服务端重新发送）
+    potential_codec_id = (pts_flags >> 32) & 0xFFFFFFFF
+    potential_codec_id_lower = potential_codec_id & 0x3FFFFFFF  # 忽略高位
+
+    if potential_codec_id_lower in known_codec_ids_lower:
+        width = pts_flags & 0xFFFFFFFF
+        height = payload_size
+
+        # 验证尺寸 + PTS 异常大
+        if 100 <= width <= 4096 and 100 <= height <= 4096 and pts > 10**15:
+            # 这是 codec header，不是视频包！
+            # 通知回调，跳过这个"包"
+            if self._frame_size_changed_callback:
+                self._frame_size_changed_callback(width, height)
+            return None
+```
+
+### 关键点
+
+1. **使用低 30 位比较**: 因为 `0x68323635` 被解析后高位可能被错误设置，需要忽略
+2. **PTS 异常大检测**: 正常 PTS < 10^15，codec header 解析出的 "PTS" > 10^15
+3. **尺寸范围验证**: 100-4096 像素的合理范围
+
+### 修改文件
+
+| 文件 | 修改 |
+|------|------|
+| `video.py` (StreamingVideoDemuxer) | 添加 codec header 检测逻辑 |
+| `video.py` | 添加 `set_frame_size_changed_callback()` 方法 |
+
+### 测试结果
+
+- ✅ 网络模式 (UDP) 旋转：正常工作
+- ✅ ADB 隧道模式旋转：正常工作
+- ✅ 两个不同手机测试通过
+
+---
+
 ## 参考资料
 
 - [PROTOCOL_SPEC.md](./PROTOCOL_SPEC.md) - 完整协议规范

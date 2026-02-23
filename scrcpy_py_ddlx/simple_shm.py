@@ -42,7 +42,7 @@ class SimpleSHMWriter:
     FORMAT_RGB24 = 0  # RGB24 format (H, W, 3) - channels=3
     FORMAT_NV12 = 1   # NV12 format (YUV420 semi-planar) - Y + UV planes
 
-    def __init__(self, max_width: int = 1920, max_height: int = 4096, channels: int = 3):
+    def __init__(self, max_width: int = 1920, max_height: int = 4096, channels: int = 3, notify_callback=None):
         """
         Create simple shared memory buffer.
 
@@ -50,10 +50,12 @@ class SimpleSHMWriter:
             max_width: Maximum frame width
             max_height: Maximum frame height
             channels: Number of color channels (for RGB mode)
+            notify_callback: Optional callback to call after writing frame (for event-driven mode)
         """
         self.max_width = max_width
         self.max_height = max_height
         self.channels = channels
+        self._notify_callback = notify_callback
 
         # Calculate max frame size for both RGB and NV12 formats
         # RGB24: w * h * 3
@@ -143,6 +145,10 @@ class SimpleSHMWriter:
             shm_write_delay_ms = (now - udp_recv_time) * 1000 if udp_recv_time > 0 else 0
             logger.info(f"[SHM_WRITE] counter={new_counter}, format=RGB24, pts={pts}, UDP={udp_time_str}, NOW={now_str}, delay={shm_write_delay_ms:.0f}ms")
 
+        # Notify listener (event-driven mode)
+        if self._notify_callback:
+            self._notify_callback()
+
         return True
 
     def write_nv12_frame(self, nv12_data: bytes, width: int, height: int, pts: int = 0, capture_time: float = 0.0, udp_recv_time: float = 0.0) -> bool:
@@ -209,6 +215,10 @@ class SimpleSHMWriter:
             now_str = dt.datetime.fromtimestamp(now).strftime('%H:%M:%S.%f')[:-3]
             shm_write_delay_ms = (now - udp_recv_time) * 1000 if udp_recv_time > 0 else 0
             logger.info(f"[SHM_WRITE] counter={new_counter}, format=NV12, size={width}x{height}, UDP={udp_time_str}, NOW={now_str}, delay={shm_write_delay_ms:.0f}ms")
+
+        # Notify listener (event-driven mode)
+        if self._notify_callback:
+            self._notify_callback()
 
         return True
 

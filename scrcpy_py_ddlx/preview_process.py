@@ -23,11 +23,253 @@ import logging
 import time
 import sys
 import ctypes
-from typing import Optional, Tuple
+import socket
+import platform
+from typing import Optional, Tuple, Callable
 from pathlib import Path
 from collections import deque
 
 logger = logging.getLogger(__name__)
+
+
+# =============================================================================
+# 跨进程事件通知器 (Cross-Process Event Notifiers)
+# =============================================================================
+
+class FrameNotifierBase:
+    """跨进程帧通知器基类。"""
+
+    def notify(self) -> None:
+        """发送帧就绪通知。"""
+        raise NotImplementedError
+
+    def get_child_handle(self):
+        """获取传递给子进程的句柄。"""
+        raise NotImplementedError
+
+    def close(self) -> None:
+        """清理资源。"""
+        pass
+
+
+class LocalSocketNotifier(FrameNotifierBase):
+    """
+    使用 QLocalServer/QLocalSocket 的跨进程通知器（跨平台）。
+
+    原理：
+    - 父进程创建 QLocalServer 监听
+    - 子进程创建 QLocalSocket 连接
+    - 父进程写入 SHM 后，通过 socket 发送通知
+    - 子进程收到 readyRead 信号，读取 SHM
+
+    性能：Windows 命名管道 / Linux Unix socket
+    """
+
+    def __init__(self):
+        from PySide6.QtNetwork import QLocalServer
+        from PySide6.QtCore import QCoreApplication
+
+        # 确保 QCoreApplication 存在（用于 QLocalServer）
+        app = QCoreApplication.instance()
+        self._owns_app = app is None
+        if app is None:
+            app = QCoreApplication([])
+
+        # 创建唯一的服务器名称
+        import os
+        self._server_name = f"scrcpy_preview_{os.getpid()}_{int(time.time()*1000)}"
+
+        # 移除旧的服务器（如果存在）
+        QLocalServer.removeServer(self._server_name)
+
+        # 创建服务器
+        self._server = QLocalServer()
+        self._server.setSocketOptions(QLocalServer.UserAccessOption)
+
+        if not self._server.listen(self._server_name):
+            raise RuntimeError(f"QLocalServer listen failed: {self._server.errorString()}")
+
+        self._client_socket = None
+
+        logger.info(f"[NOTIFIER] LocalSocket notifier created: {self._server_name}")
+
+    def accept_connection(self, timeout_ms: int = 5000) -> bool:
+        """等待子进程连接（阻塞调用）。"""
+        if self._server.waitForNewConnection(timeout_ms):
+            self._client_socket = self._server.nextPendingConnection()
+            logger.info(f"[NOTIFIER] Client connected: {self._client_socket is not None}")
+            return self._client_socket is not None
+        else:
+            logger.warning(f"[NOTIFIER] waitForNewConnection timeout")
+            return False
+
+    _notify_count = 0
+
+    def notify(self) -> None:
+        """发送帧就绪通知。"""
+        LocalSocketNotifier._notify_count += 1
+        if self._client_socket is None:
+            logger.warning(f"[NOTIFIER] #{LocalSocketNotifier._notify_count} No client socket")
+            return
+        try:
+            written = self._client_socket.write(b'1')
+            self._client_socket.flush()
+            # 等待数据写入完成（关键：因为没有事件循环）
+            if written > 0:
+                self._client_socket.waitForBytesWritten(100)
+            if LocalSocketNotifier._notify_count <= 5:
+                logger.info(f"[NOTIFIER] #{LocalSocketNotifier._notify_count} sent, written={written}")
+        except Exception as e:
+            logger.warning(f"[NOTIFIER] #{LocalSocketNotifier._notify_count} failed: {e}")
+
+    def get_child_handle(self) -> str:
+        """返回服务器名称（子进程用名称连接）。"""
+        return self._server_name
+
+    def close(self) -> None:
+        """关闭服务器和 socket。"""
+        try:
+            if self._client_socket:
+                self._client_socket.disconnectFromServer()
+        except:
+            pass
+        try:
+            self._server.close()
+            from PySide6.QtNetwork import QLocalServer
+            QLocalServer.removeServer(self._server_name)
+        except:
+            pass
+
+
+class SocketPairNotifier(FrameNotifierBase):
+    """
+    使用 socketpair 的跨进程通知器 (Linux/macOS)。
+
+    原理：
+    - 父进程写入 SHM 后，发送 1 字节通知
+    - 子进程使用 QSocketNotifier 监听，收到通知后读取 SHM
+
+    注意：在 Windows 上 QSocketNotifier 可能不工作，建议使用 LocalSocketNotifier
+    """
+
+    def __init__(self):
+        # 创建 socket pair
+        # Windows 使用 AF_INET (TCP loopback)，Unix 使用 AF_UNIX
+        if platform.system() == "Windows":
+            self._parent_sock, self._child_sock = socket.socketpair(
+                socket.AF_INET, socket.SOCK_STREAM
+            )
+        else:
+            self._parent_sock, self._child_sock = socket.socketpair(
+                socket.AF_UNIX, socket.SOCK_STREAM
+            )
+
+        # 设置非阻塞（避免 send 阻塞）
+        self._parent_sock.setblocking(False)
+        self._child_sock.setblocking(False)
+
+        logger.info("[NOTIFIER] SocketPair notifier created")
+
+    def notify(self) -> None:
+        """发送帧就绪通知（非阻塞）。"""
+        try:
+            self._parent_sock.send(b'1')
+        except BlockingIOError:
+            # 缓冲区满，子进程还在处理上一帧
+            pass
+        except Exception as e:
+            logger.warning(f"[NOTIFIER] Notify failed: {e}")
+
+    def get_child_handle(self):
+        """返回子进程 socket（multiprocessing 会自动处理传递）。"""
+        return self._child_sock
+
+    def get_child_fileno(self) -> int:
+        """返回子进程 socket 的文件描述符。"""
+        return self._child_sock.fileno()
+
+    def close(self) -> None:
+        """关闭 socket。"""
+        try:
+            self._parent_sock.close()
+            self._child_sock.close()
+        except:
+            pass
+
+
+class Win32EventNotifier(FrameNotifierBase):
+    """
+    使用 Win32 Event 的跨进程通知器 (Windows only)。
+
+    原理：
+    - 创建命名 Event
+    - 父进程写入 SHM 后，SetEvent()
+    - 子进程使用 QWinEventNotifier 监听，收到通知后读取 SHM
+
+    性能：延迟 ~0.3μs（比 socketpair 快约 30 倍）
+    """
+
+    def __init__(self):
+        if platform.system() != "Windows":
+            raise RuntimeError("Win32EventNotifier only works on Windows")
+
+        try:
+            import win32event
+            import win32api
+
+            # 创建唯一命名的 Event
+            # 使用进程 ID 确保唯一性
+            self._event_name = f"Global\\ScrcpyFrameReady_{win32api.GetCurrentProcessId()}_{int(time.time()*1000)}"
+
+            # 创建手动重置 Event
+            self._event = win32event.CreateEvent(None, False, False, self._event_name)
+            self._event_handle = int(self._event)
+
+            logger.info(f"[NOTIFIER] Win32 Event notifier created: {self._event_name}")
+
+        except ImportError:
+            raise RuntimeError("pywin32 required for Win32EventNotifier. Install with: pip install pywin32")
+
+    def notify(self) -> None:
+        """发送帧就绪通知。"""
+        try:
+            import win32event
+            win32event.SetEvent(self._event)
+        except Exception as e:
+            logger.warning(f"[NOTIFIER] SetEvent failed: {e}")
+
+    def get_child_handle(self) -> str:
+        """返回 Event 名称（子进程用名称打开）。"""
+        return self._event_name
+
+    def get_event_handle(self) -> int:
+        """返回 Event 句柄。"""
+        return self._event_handle
+
+    def close(self) -> None:
+        """关闭 Event 句柄。"""
+        try:
+            import win32api
+            win32api.CloseHandle(self._event)
+        except:
+            pass
+
+
+def create_frame_notifier() -> FrameNotifierBase:
+    """
+    创建平台最优的帧通知器。
+
+    - Windows: LocalSocketNotifier (Named Pipes, Qt 事件驱动)
+    - Linux/macOS: SocketPairNotifier (Unix socket, QSocketNotifier)
+    """
+    if platform.system() == "Windows":
+        try:
+            return LocalSocketNotifier()
+        except Exception as e:
+            logger.warning(f"[NOTIFIER] LocalSocketNotifier unavailable, falling back to socketpair: {e}")
+            return SocketPairNotifier()
+    else:
+        return SocketPairNotifier()
 
 
 class PreviewLatencyTracker:
@@ -114,7 +356,8 @@ def preview_window_process(frame_queue: mp.Queue,
                             height: int,
                             stop_event: mp.Event,
                             shared_mem_info: Optional[dict] = None,
-                            ready_event: Optional[mp.Event] = None):
+                            ready_event: Optional[mp.Event] = None,
+                            notifier_handle = None):
     """
     Preview window process main function.
 
@@ -132,6 +375,7 @@ def preview_window_process(frame_queue: mp.Queue,
         stop_event: Event to signal process to stop
         shared_mem_info: Shared memory info dict for low-latency frame transfer
         ready_event: Event to signal when preview window is ready
+        notifier_handle: Handle for event-driven notifications (socket or event name)
     """
     # Configure logging for this process - write to separate file
     from datetime import datetime
@@ -261,6 +505,12 @@ def preview_window_process(frame_queue: mp.Queue,
                 self._nv12_vbo = None
                 self._nv12_initialized = False
 
+                # PBO (Pixel Buffer Object) for async texture upload
+                self._pbo_y_ids = None  # Double buffer for Y plane
+                self._pbo_uv_ids = None  # Double buffer for UV plane
+                self._pbo_index = 0  # Current PBO index (0 or 1)
+                self._pbo_size = (0, 0)  # Track PBO allocated size
+
                 # Touch tracking for swipe
                 self._touch_start = None
                 self._touch_current = None
@@ -385,6 +635,8 @@ def preview_window_process(frame_queue: mp.Queue,
 
             def initializeGL(self):
                 """Initialize OpenGL resources."""
+                from OpenGL.GL import glGenBuffers, glBindBuffer, glBufferData, GL_ARRAY_BUFFER, GL_STATIC_DRAW
+
                 # CRITICAL: Set pixel unpack alignment to 1 byte
                 # This fixes texture corruption when width is not multiple of 4
                 glPixelStorei(GL_UNPACK_ALIGNMENT, 1)
@@ -412,6 +664,16 @@ def preview_window_process(frame_queue: mp.Queue,
                 glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE)
                 glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE)
 
+                # Initialize PBOs for async texture upload (double buffering)
+                try:
+                    self._pbo_y_ids = glGenBuffers(2)
+                    self._pbo_uv_ids = glGenBuffers(2)
+                    logger.info("PBO (Pixel Buffer Object) initialized for async texture upload")
+                except Exception as e:
+                    logger.warning(f"PBO not available: {e}, using sync texture upload")
+                    self._pbo_y_ids = None
+                    self._pbo_uv_ids = None
+
                 glClearColor(0.0, 0.0, 0.0, 1.0)
 
                 # Initialize NV12 shader
@@ -428,13 +690,17 @@ def preview_window_process(frame_queue: mp.Queue,
                 glViewport(0, 0, w, h)
 
             def _paint_nv12_gpu(self, nv12_data: np.ndarray, w: int, h: int):
-                """Render NV12 frame using GPU shader - OPTIMIZED 2-texture approach."""
+                """Render NV12 frame using GPU shader with PBO async texture upload."""
                 from OpenGL.GL import (
                     glActiveTexture, GL_TEXTURE0, GL_TEXTURE1,
-                    glBindTexture, glTexImage2D, GL_TEXTURE_2D, GL_UNSIGNED_BYTE,
+                    glBindTexture, glTexImage2D, glTexSubImage2D, GL_TEXTURE_2D, GL_UNSIGNED_BYTE,
                     glGetError, GL_NO_ERROR, GL_LUMINANCE, GL_LUMINANCE_ALPHA,
-                    glPixelStorei, GL_UNPACK_ALIGNMENT
+                    glPixelStorei, GL_UNPACK_ALIGNMENT,
+                    glBindBuffer, glBufferData, glMapBufferRange, glUnmapBuffer,
+                    GL_PIXEL_UNPACK_BUFFER, GL_STREAM_DRAW,
+                    GL_MAP_WRITE_BIT, GL_MAP_INVALIDATE_BUFFER_BIT, GL_MAP_UNSYNCHRONIZED_BIT
                 )
+                from ctypes import c_void_p, c_char, cast, POINTER
 
                 # CRITICAL: Set pixel unpack alignment to 1 byte for NV12 textures
                 glPixelStorei(GL_UNPACK_ALIGNMENT, 1)
@@ -449,29 +715,111 @@ def preview_window_process(frame_queue: mp.Queue,
                 glLoadIdentity()
 
                 y_size = w * h
-                expected_size = int(y_size * 1.5)
+                uv_size = (w // 2) * (h // 2) * 2
+                expected_size = y_size + uv_size
 
                 if len(nv12_data) < expected_size:
                     logger.error(f"NV12 data too small: {len(nv12_data)} < {expected_size}")
                     return False
 
-                # Extract Y plane (no copy needed - direct slice)
+                # Extract Y and UV planes (direct view, no copy)
                 y_plane = nv12_data[:y_size]
-
-                # Extract UV plane as-is (interleaved U/V) - NO CPU SEPARATION!
-                # Reshape to (h/2, w/2, 2) for GL_LUMINANCE_ALPHA format
                 uv_plane = nv12_data[y_size:expected_size]
-                uv_reshaped = np.frombuffer(uv_plane, dtype=np.uint8).reshape(h // 2, w // 2, 2)
 
-                # Upload Y texture (GL_LUMINANCE)
-                glActiveTexture(GL_TEXTURE0)
-                glBindTexture(GL_TEXTURE_2D, self._y_texture_id)
-                glTexImage2D(GL_TEXTURE_2D, 0, GL_LUMINANCE, w, h, 0, GL_LUMINANCE, GL_UNSIGNED_BYTE, y_plane.tobytes())
+                # Check if PBO is available and size matches
+                use_pbo = self._pbo_y_ids is not None
+                size_changed = not hasattr(self, '_nv12_tex_size') or self._nv12_tex_size != (w, h)
+                first_frame = not hasattr(self, '_pbo_has_data') or not self._pbo_has_data
 
-                # Upload UV texture (GL_LUMINANCE_ALPHA - interleaved U/V)
-                glActiveTexture(GL_TEXTURE1)
-                glBindTexture(GL_TEXTURE_2D, self._uv_texture_id)
-                glTexImage2D(GL_TEXTURE_2D, 0, GL_LUMINANCE_ALPHA, w // 2, h // 2, 0, GL_LUMINANCE_ALPHA, GL_UNSIGNED_BYTE, uv_reshaped.tobytes())
+                if size_changed:
+                    self._nv12_tex_size = (w, h)
+
+                    # Allocate texture memory
+                    glActiveTexture(GL_TEXTURE0)
+                    glBindTexture(GL_TEXTURE_2D, self._y_texture_id)
+                    glTexImage2D(GL_TEXTURE_2D, 0, GL_LUMINANCE, w, h, 0, GL_LUMINANCE, GL_UNSIGNED_BYTE, None)
+
+                    glActiveTexture(GL_TEXTURE1)
+                    glBindTexture(GL_TEXTURE_2D, self._uv_texture_id)
+                    glTexImage2D(GL_TEXTURE_2D, 0, GL_LUMINANCE_ALPHA, w // 2, h // 2, 0, GL_LUMINANCE_ALPHA, GL_UNSIGNED_BYTE, None)
+
+                    # Allocate PBO memory if available
+                    if use_pbo:
+                        for i in range(2):
+                            glBindBuffer(GL_PIXEL_UNPACK_BUFFER, self._pbo_y_ids[i])
+                            glBufferData(GL_PIXEL_UNPACK_BUFFER, y_size, None, GL_STREAM_DRAW)
+                            glBindBuffer(GL_PIXEL_UNPACK_BUFFER, self._pbo_uv_ids[i])
+                            glBufferData(GL_PIXEL_UNPACK_BUFFER, uv_size, None, GL_STREAM_DRAW)
+                        glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0)
+                        self._pbo_has_data = False  # Reset on size change
+                        logger.info(f"PBO allocated: Y={y_size}B, UV={uv_size}B")
+
+                if use_pbo:
+                    import ctypes
+                    idx = self._pbo_index
+                    next_idx = 1 - idx
+
+                    if first_frame:
+                        # First frame: write data to PBO first, then upload
+                        glBindBuffer(GL_PIXEL_UNPACK_BUFFER, self._pbo_y_ids[idx])
+                        ptr = glMapBufferRange(GL_PIXEL_UNPACK_BUFFER, 0, y_size,
+                                              GL_MAP_WRITE_BIT | GL_MAP_INVALIDATE_BUFFER_BIT)
+                        if ptr:
+                            ctypes.memmove(ptr, y_plane.ctypes.data_as(c_void_p), y_size)
+                            glUnmapBuffer(GL_PIXEL_UNPACK_BUFFER)
+
+                        glBindBuffer(GL_PIXEL_UNPACK_BUFFER, self._pbo_uv_ids[idx])
+                        ptr = glMapBufferRange(GL_PIXEL_UNPACK_BUFFER, 0, uv_size,
+                                              GL_MAP_WRITE_BIT | GL_MAP_INVALIDATE_BUFFER_BIT)
+                        if ptr:
+                            ctypes.memmove(ptr, uv_plane.ctypes.data_as(c_void_p), uv_size)
+                            glUnmapBuffer(GL_PIXEL_UNPACK_BUFFER)
+
+                        self._pbo_has_data = True
+
+                    # --- Upload Y texture from PBO (GPU DMA, no CPU wait) ---
+                    glBindBuffer(GL_PIXEL_UNPACK_BUFFER, self._pbo_y_ids[idx])
+                    glActiveTexture(GL_TEXTURE0)
+                    glBindTexture(GL_TEXTURE_2D, self._y_texture_id)
+                    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, w, h, GL_LUMINANCE, GL_UNSIGNED_BYTE, None)
+
+                    # --- Upload UV texture from PBO (GPU DMA, no CPU wait) ---
+                    glBindBuffer(GL_PIXEL_UNPACK_BUFFER, self._pbo_uv_ids[idx])
+                    glActiveTexture(GL_TEXTURE1)
+                    glBindTexture(GL_TEXTURE_2D, self._uv_texture_id)
+                    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, w // 2, h // 2, GL_LUMINANCE_ALPHA, GL_UNSIGNED_BYTE, None)
+
+                    # --- Write next frame data to PBO (CPU) ---
+                    glBindBuffer(GL_PIXEL_UNPACK_BUFFER, self._pbo_y_ids[next_idx])
+                    ptr = glMapBufferRange(GL_PIXEL_UNPACK_BUFFER, 0, y_size,
+                                          GL_MAP_WRITE_BIT | GL_MAP_INVALIDATE_BUFFER_BIT | GL_MAP_UNSYNCHRONIZED_BIT)
+                    if ptr:
+                        ctypes.memmove(ptr, y_plane.ctypes.data_as(c_void_p), y_size)
+                        glUnmapBuffer(GL_PIXEL_UNPACK_BUFFER)
+
+                    glBindBuffer(GL_PIXEL_UNPACK_BUFFER, self._pbo_uv_ids[next_idx])
+                    ptr = glMapBufferRange(GL_PIXEL_UNPACK_BUFFER, 0, uv_size,
+                                          GL_MAP_WRITE_BIT | GL_MAP_INVALIDATE_BUFFER_BIT | GL_MAP_UNSYNCHRONIZED_BIT)
+                    if ptr:
+                        ctypes.memmove(ptr, uv_plane.ctypes.data_as(c_void_p), uv_size)
+                        glUnmapBuffer(GL_PIXEL_UNPACK_BUFFER)
+
+                    glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0)
+
+                    # Swap PBO index for next frame
+                    self._pbo_index = next_idx
+                else:
+                    # Fallback: Direct texture upload (no PBO)
+                    y_ptr = y_plane.ctypes.data_as(c_void_p)
+                    uv_ptr = uv_plane.ctypes.data_as(c_void_p)
+
+                    glActiveTexture(GL_TEXTURE0)
+                    glBindTexture(GL_TEXTURE_2D, self._y_texture_id)
+                    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, w, h, GL_LUMINANCE, GL_UNSIGNED_BYTE, y_ptr)
+
+                    glActiveTexture(GL_TEXTURE1)
+                    glBindTexture(GL_TEXTURE_2D, self._uv_texture_id)
+                    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, w // 2, h // 2, GL_LUMINANCE_ALPHA, GL_UNSIGNED_BYTE, uv_ptr)
 
                 # Use shader program
                 self._nv12_shader.bind()
@@ -921,7 +1269,7 @@ def preview_window_process(frame_queue: mp.Queue,
     class PreviewWindow(QMainWindow):
         """Main window for preview."""
 
-        def __init__(self):
+        def __init__(self, notifier_handle=None):
             super().__init__()
             self._base_title = f"scrcpy-py-ddlx - {device_name}"
             self.setWindowTitle(self._base_title)
@@ -946,14 +1294,154 @@ def preview_window_process(frame_queue: mp.Queue,
             # Center window on screen
             self._center_on_screen()
 
-            # Frame update timer - match device frame rate for optimal CPU usage
-            # 16ms ≈ 60fps: matches typical device frame rate
-            self._timer = QTimer()
-            self._timer.timeout.connect(self._update_frame)
-            self._timer.start(16)  # 16ms interval (~60fps, matches device)
+            # Event-driven or polling mode
+            self._notifier_handle = notifier_handle
+            self._socket_notifier = None
+            self._win_event_notifier = None
+            self._notify_socket = None
+
+            if notifier_handle is not None:
+                # Event-driven mode
+                self._setup_event_notifier(notifier_handle)
+                logger.info("[PREVIEW] Event-driven mode enabled")
+
+                # Fallback timer for safety (in case events are missed)
+                self._timer = QTimer()
+                self._timer.timeout.connect(self._update_frame)
+                self._timer.start(100)  # 100ms fallback
+            else:
+                # Polling mode (original behavior)
+                self._timer = QTimer()
+                self._timer.timeout.connect(self._update_frame)
+                self._timer.start(16)  # 16ms interval (~60fps)
+                logger.info("[PREVIEW] Polling mode (16ms timer)")
 
             self._frame_count = 0
             self._last_true_e2e = 0  # Track last TRUE_E2E for title display
+
+        def _setup_event_notifier(self, handle):
+            """Set up event notifier based on handle type."""
+            if hasattr(handle, 'fileno'):
+                # Socket-based notifier (Linux/macOS socketpair)
+                self._setup_socket_notifier(handle)
+            elif isinstance(handle, str):
+                # String handle - could be QLocalServer name or Win32 Event name
+                if handle.startswith("scrcpy_preview_"):
+                    # QLocalServer name (LocalSocketNotifier)
+                    self._setup_local_socket_notifier(handle)
+                elif platform.system() == "Windows":
+                    # Win32 Event name (fallback)
+                    self._setup_win32_notifier(handle)
+                else:
+                    logger.warning(f"[PREVIEW] Unknown string handle: {handle}")
+            elif isinstance(handle, int):
+                # File descriptor (from socket.fileno())
+                self._setup_socket_from_fd(handle)
+            else:
+                logger.warning(f"[PREVIEW] Unknown notifier handle type: {type(handle)}")
+
+        def _setup_local_socket_notifier(self, server_name: str):
+            """Set up QLocalSocket for LocalSocketNotifier."""
+            from PySide6.QtNetwork import QLocalSocket
+
+            self._local_socket = QLocalSocket()
+            self._local_socket.connectToServer(server_name)
+
+            if self._local_socket.waitForConnected(5000):
+                self._local_socket.readyRead.connect(self._on_local_socket_ready_read)
+                logger.info(f"[PREVIEW] QLocalSocket connected to: {server_name}")
+            else:
+                logger.warning(f"[PREVIEW] QLocalSocket connection failed: {self._local_socket.errorString()}")
+
+        def _on_local_socket_ready_read(self):
+            """Handle QLocalSocket readyRead signal."""
+            # Read and discard notification data
+            try:
+                self._local_socket.readAll()
+            except:
+                pass
+            # Process frame
+            self._update_frame()
+
+        def _setup_socket_notifier(self, sock):
+            """Set up QSocketNotifier for socket-based notifications."""
+            from PySide6.QtCore import QSocketNotifier
+
+            self._notify_socket = sock
+            self._socket_notifier = QSocketNotifier(
+                sock.fileno(),
+                QSocketNotifier.Type.Read
+            )
+            self._socket_notifier.activated.connect(self._on_socket_notify)
+            self._socket_notifier.setEnabled(True)
+            logger.info(f"[PREVIEW] QSocketNotifier enabled on fd={sock.fileno()}")
+
+        def _setup_socket_from_fd(self, fd: int):
+            """Set up QSocketNotifier from file descriptor."""
+            from PySide6.QtCore import QSocketNotifier
+
+            self._socket_notifier = QSocketNotifier(
+                fd,
+                QSocketNotifier.Type.Read
+            )
+            self._socket_notifier.activated.connect(self._on_fd_notify)
+            self._socket_notifier.setEnabled(True)
+            logger.info(f"[PREVIEW] QSocketNotifier enabled on fd={fd}")
+
+        def _setup_win32_notifier(self, event_name: str):
+            """Set up QWinEventNotifier for Win32 Event notifications."""
+            try:
+                import win32event
+                from PySide6.QtCore import QWinEventNotifier
+
+                # Open the named event
+                self._win_event = win32event.OpenEvent(
+                    win32event.EVENT_MODIFY_STATE | win32event.SYNCHRONIZE,
+                    False,
+                    event_name
+                )
+
+                # PyHANDLE.handle is already an int, use it directly
+                self._win_event_notifier = QWinEventNotifier(self._win_event.handle)
+                self._win_event_notifier.activated.connect(self._on_win32_notify)
+                self._win_event_notifier.setEnabled(True)
+                logger.info(f"[PREVIEW] QWinEventNotifier enabled: {event_name}")
+
+            except ImportError:
+                logger.warning("[PREVIEW] pywin32 not available, falling back to polling")
+            except Exception as e:
+                logger.warning(f"[PREVIEW] QWinEventNotifier setup failed: {e}")
+
+        def _on_socket_notify(self, fd):
+            """Handle socket notification (Linux/macOS)."""
+            # Read and discard notification byte(s)
+            try:
+                self._notify_socket.recv(1024)
+            except BlockingIOError:
+                pass
+            except Exception as e:
+                logger.debug(f"[PREVIEW] Socket recv error: {e}")
+
+            # Process frame
+            self._update_frame()
+
+        def _on_fd_notify(self, fd):
+            """Handle fd notification (Windows socket)."""
+            # Create a temporary socket to read notification
+            try:
+                temp_sock = socket.fromfd(fd, socket.AF_INET, socket.SOCK_STREAM)
+                temp_sock.recv(1024)
+            except:
+                pass
+
+            # Process frame
+            self._update_frame()
+
+        def _on_win32_notify(self, handle):
+            """Handle Win32 Event notification."""
+            # The event is auto-reset, no need to call ResetEvent
+            # Process frame
+            self._update_frame()
 
         def _center_on_screen(self):
             """Center the window on the primary screen."""
@@ -1210,7 +1698,8 @@ def preview_window_process(frame_queue: mp.Queue,
         app = QApplication([])
 
     # Create and show window
-    window = PreviewWindow()
+    # Create and show window (with notifier handle for event-driven mode)
+    window = PreviewWindow(notifier_handle=notifier_handle)
     window.show()
 
     render_mode = "OpenGL (GPU)" if OPENGL_AVAILABLE else "CPU"
@@ -1277,13 +1766,15 @@ class PreviewManager:
         manager.stop()
     """
 
-    def __init__(self, max_queue_size: int = 2, use_shared_memory: bool = True):
+    def __init__(self, max_queue_size: int = 2, use_shared_memory: bool = True,
+                 event_driven: bool = True):
         """
         Initialize preview manager.
 
         Args:
             max_queue_size: Maximum frames in queue (fallback for non-shared-mem mode)
             use_shared_memory: Use shared memory for low-latency frame transfer
+            event_driven: Use event-driven rendering (recommended, lower CPU)
         """
         self._process: Optional[mp.Process] = None
         self._frame_queue: Optional[mp.Queue] = None
@@ -1297,6 +1788,11 @@ class PreviewManager:
         self._is_running = False
         self._device_name = ""
         self._device_size = (0, 0)
+
+        # Event-driven rendering
+        self._event_driven = event_driven
+        self._notifier: Optional[FrameNotifierBase] = None
+        self._notifier_handle = None  # Handle passed to child process
 
     @property
     def is_running(self) -> bool:
@@ -1350,6 +1846,24 @@ class PreviewManager:
             # Fallback frame queue (not used in shared memory mode)
             self._frame_queue = mp.Queue(maxsize=self._max_queue_size)
 
+            # Create event-driven notifier (if enabled)
+            self._notifier = None
+            self._notifier_handle = None
+            if self._event_driven and self._use_shared_memory:
+                try:
+                    self._notifier = create_frame_notifier()
+                    self._notifier_handle = self._notifier.get_child_handle()
+                    notifier_type = type(self._notifier).__name__
+                    logger.info(f"[PREVIEW] Event-driven mode enabled: {notifier_type}")
+                    # Set notify callback on SHM writer
+                    if self._shared_mem_buffer and self._notifier:
+                        self._shared_mem_buffer._notify_callback = self._notifier.notify
+                        logger.info("[PREVIEW] Notify callback set on SHM writer")
+                except Exception as e:
+                    logger.warning(f"[PREVIEW] Failed to create notifier, falling back to polling: {e}")
+                    self._notifier = None
+                    self._notifier_handle = None
+
             # Start process
             self._process = mp.Process(
                 target=preview_window_process,
@@ -1361,17 +1875,27 @@ class PreviewManager:
                     height,
                     self._stop_event,
                     self._shared_mem_info,  # Pass shared memory info
-                    self._ready_event  # Pass ready event
+                    self._ready_event,  # Pass ready event
+                    self._notifier_handle  # Pass notifier handle (socket or event name)
                 ),
                 daemon=True
             )
             self._process.start()
 
+            # For LocalSocketNotifier, wait for child process to connect
+            if isinstance(self._notifier, LocalSocketNotifier):
+                logger.info("[PREVIEW] Waiting for child process to connect...")
+                if not self._notifier.accept_connection(timeout_ms=5000):
+                    logger.warning("[PREVIEW] Child process connection failed, falling back to polling")
+                else:
+                    logger.info("[PREVIEW] Child process connected via QLocalSocket")
+
             self._is_running = True
             self._device_name = device_name
             self._device_size = (width, height)
 
-            logger.info(f"Preview process started: {device_name} (shared_mem={self._use_shared_memory})")
+            mode = "event-driven" if self._notifier else "polling"
+            logger.info(f"Preview process started: {device_name} (shared_mem={self._use_shared_memory}, mode={mode})")
             return True
 
         except Exception as e:
@@ -1426,7 +1950,12 @@ class PreviewManager:
         try:
             # Use shared memory for low-latency transfer
             if self._shared_mem_buffer is not None:
-                return self._shared_mem_buffer.write_frame(frame, pts, capture_time, udp_recv_time)
+                success = self._shared_mem_buffer.write_frame(frame, pts, capture_time, udp_recv_time)
+                logger.debug(f"[PREVIEW] write_frame success={success}, notifier={self._notifier is not None}")
+                if success and self._notifier:
+                    # Notify preview process (event-driven mode)
+                    self._notifier.notify()
+                return success
             else:
                 # Fallback to queue (slower)
                 if self._frame_queue.full():

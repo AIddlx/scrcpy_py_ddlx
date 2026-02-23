@@ -2574,6 +2574,229 @@ routes = [
 ]
 
 
+# Auto-connect settings (set by command line args)
+_auto_connect = False
+_auto_preview = False
+_network_device = None
+_network_push_device = None  # --network-push mode
+_enable_video = True
+
+
+async def on_startup():
+    """Auto-connect to device on server startup (if configured)."""
+    import asyncio
+    import time
+
+    if not _auto_connect and not _network_device and not _network_push_device:
+        return
+
+    # Wait a bit for server to be fully ready
+    await asyncio.sleep(0.5)
+
+    logger.info("=" * 50)
+    logger.info("[AUTO_CONNECT] Starting auto-connect sequence...")
+    logger.info("=" * 50)
+
+    try:
+        if _network_push_device:
+            # Network mode with USB push: Push server via USB first, then connect by IP
+            device_ip = _network_push_device
+            logger.info(f"[AUTO_CONNECT] Network+Push mode: will push via USB then connect to {device_ip}")
+            print(f"\n[AUTO_CONNECT] Network+Push mode: {device_ip}")
+
+            # Step 1: Detect USB device
+            logger.info("[AUTO_CONNECT] Step 1: Detecting USB device...")
+            print("[AUTO_CONNECT] Step 1: Detecting USB device...")
+            list_result = await _execute_tool("list_devices", {})
+            devices = list_result.get("devices", [])
+
+            if not devices:
+                logger.error("[AUTO_CONNECT] No USB devices found! Connect device via USB first.")
+                print("[AUTO_CONNECT] No USB devices found! Connect device via USB first.")
+                return
+
+            device = devices[0]
+            device_id = device.get("id") or device.get("serial")
+            device_name = device.get("name", device_id)
+            logger.info(f"[AUTO_CONNECT] Found USB device: {device_name} ({device_id})")
+            print(f"[AUTO_CONNECT] Found USB device: {device_name}")
+
+            # Step 2: Push server via USB with auto_connect
+            logger.info("[AUTO_CONNECT] Step 2: Pushing server via USB...")
+            print("[AUTO_CONNECT] Step 2: Pushing server via USB...")
+            push_params = {
+                "device_id": device_id,
+                "video": _enable_video,
+                "audio": DEFAULT_AUDIO_ENABLED,
+                "auto_connect": False,  # We'll connect manually via network
+                "persistent": True,  # Use persistent mode for hot-reconnect
+            }
+            push_result = await _execute_tool("push_server", push_params)
+
+            if not push_result.get("success"):
+                logger.error(f"[AUTO_CONNECT] Push failed: {push_result.get('error')}")
+                print(f"[AUTO_CONNECT] Push failed: {push_result.get('error')}")
+                return
+
+            logger.info("[AUTO_CONNECT] Server pushed successfully!")
+            print("[AUTO_CONNECT] Server pushed successfully!")
+
+            # Step 3: Wait a bit for server to start
+            await asyncio.sleep(1.0)
+
+            # Step 4: Connect via network
+            logger.info(f"[AUTO_CONNECT] Step 3: Connecting via network to {device_ip}...")
+            print(f"[AUTO_CONNECT] Step 3: Connecting via network to {device_ip}...")
+            connect_params = {
+                "connection_mode": "network",
+                "device_id": device_ip,
+                "video": _enable_video,
+                "audio": DEFAULT_AUDIO_ENABLED,
+            }
+            result = await _execute_tool("connect", connect_params)
+
+            if result.get("success"):
+                logger.info(f"[AUTO_CONNECT] Connected successfully!")
+                print(f"[AUTO_CONNECT] Connected to {device_ip} via network!")
+
+                # Auto-start preview
+                await asyncio.sleep(0.5)
+                logger.info("[AUTO_CONNECT] Starting preview window...")
+                print("[AUTO_CONNECT] Starting preview window...")
+                preview_result = await _execute_tool("start_preview", {})
+                if preview_result.get("success"):
+                    logger.info("[AUTO_CONNECT] Preview window started!")
+                    print("[AUTO_CONNECT] Preview window started!")
+                else:
+                    logger.warning(f"[AUTO_CONNECT] Preview failed: {preview_result.get('error')}")
+                    print(f"[AUTO_CONNECT] Preview failed: {preview_result.get('error')}")
+            else:
+                logger.error(f"[AUTO_CONNECT] Connection failed: {result.get('error')}")
+                print(f"[AUTO_CONNECT] Connection failed: {result.get('error')}")
+
+        elif _network_device:
+            # Network mode: Connect to device by IP
+            logger.info(f"[AUTO_CONNECT] Network mode: connecting to {_network_device}")
+            print(f"\n[AUTO_CONNECT] Network mode: connecting to {_network_device}...")
+
+            # Parse connection params
+            params = {
+                "connection_mode": "network",
+                "device_id": _network_device,
+                "video": _enable_video,
+                "audio": DEFAULT_AUDIO_ENABLED,
+            }
+
+            # Call connect tool
+            result = await _execute_tool("connect", params)
+
+            if result.get("success"):
+                logger.info(f"[AUTO_CONNECT] Connected successfully!")
+                print(f"[AUTO_CONNECT] Connected to {_network_device}!")
+
+                # Auto-start preview if requested
+                if _auto_preview or _network_device:  # --network implies preview
+                    await asyncio.sleep(0.5)  # Wait for connection to stabilize
+                    logger.info("[AUTO_CONNECT] Starting preview window...")
+                    print("[AUTO_CONNECT] Starting preview window...")
+                    preview_result = await _execute_tool("start_preview", {})
+                    if preview_result.get("success"):
+                        logger.info("[AUTO_CONNECT] Preview window started!")
+                        print("[AUTO_CONNECT] Preview window started!")
+                    else:
+                        logger.warning(f"[AUTO_CONNECT] Preview failed: {preview_result.get('error')}")
+                        print(f"[AUTO_CONNECT] Preview failed: {preview_result.get('error')}")
+            else:
+                logger.error(f"[AUTO_CONNECT] Connection failed: {result.get('error')}")
+                print(f"[AUTO_CONNECT] Connection failed: {result.get('error')}")
+
+        elif _auto_connect:
+            # USB mode: Auto-connect to first available device
+            logger.info("[AUTO_CONNECT] USB mode: detecting devices...")
+            print("\n[AUTO_CONNECT] Detecting USB devices...")
+
+            # First, list devices
+            list_result = await _execute_tool("list_devices", {})
+            devices = list_result.get("devices", [])
+
+            if not devices:
+                logger.error("[AUTO_CONNECT] No devices found!")
+                print("[AUTO_CONNECT] No devices found!")
+                return
+
+            # Get first device
+            device = devices[0]
+            device_id = device.get("id") or device.get("serial")
+            device_name = device.get("name", device_id)
+
+            logger.info(f"[AUTO_CONNECT] Found device: {device_name} ({device_id})")
+            print(f"[AUTO_CONNECT] Found device: {device_name}")
+
+            # Connect
+            params = {
+                "connection_mode": "adb_tunnel",
+                "device_id": device_id,
+                "video": _enable_video,
+                "audio": DEFAULT_AUDIO_ENABLED,
+            }
+
+            result = await _execute_tool("connect", params)
+
+            if result.get("success"):
+                logger.info(f"[AUTO_CONNECT] Connected successfully!")
+                print(f"[AUTO_CONNECT] Connected to {device_name}!")
+
+                # Auto-start preview if requested
+                if _auto_preview:
+                    await asyncio.sleep(0.5)  # Wait for connection to stabilize
+                    logger.info("[AUTO_CONNECT] Starting preview window...")
+                    print("[AUTO_CONNECT] Starting preview window...")
+                    preview_result = await _execute_tool("start_preview", {})
+                    if preview_result.get("success"):
+                        logger.info("[AUTO_CONNECT] Preview window started!")
+                        print("[AUTO_CONNECT] Preview window started!")
+                    else:
+                        logger.warning(f"[AUTO_CONNECT] Preview failed: {preview_result.get('error')}")
+                        print(f"[AUTO_CONNECT] Preview failed: {preview_result.get('error')}")
+            else:
+                logger.error(f"[AUTO_CONNECT] Connection failed: {result.get('error')}")
+                print(f"[AUTO_CONNECT] Connection failed: {result.get('error')}")
+
+    except Exception as e:
+        logger.exception(f"[AUTO_CONNECT] Error: {e}")
+        print(f"[AUTO_CONNECT] Error: {e}")
+
+    logger.info("=" * 50)
+
+
+async def _execute_tool(tool_name: str, params: dict) -> dict:
+    """Execute a tool internally (without HTTP)."""
+    global handler
+
+    try:
+        # Use the global handler instance
+        if handler is None:
+            return {"success": False, "error": "Handler not initialized"}
+
+        # Execute the tool using the handler's call_tool method
+        result = handler.call_tool(tool_name, params)
+
+        # Parse result - it's in MCP format {"content": [{"type": "text", "text": "..."}]}
+        if result and "content" in result:
+            for item in result["content"]:
+                if item.get("type") == "text":
+                    text = item.get("text", "{}")
+                    try:
+                        return json.loads(text)
+                    except json.JSONDecodeError:
+                        return {"success": False, "error": f"Invalid JSON response: {text[:100]}"}
+
+        return {"success": False, "error": "No valid response from tool"}
+    except Exception as e:
+        logger.error(f"[AUTO_CONNECT] Tool execution error: {e}")
+        return {"success": False, "error": str(e)}
+
+
 def on_shutdown():
     """Cleanup on server shutdown."""
     import threading
@@ -2650,7 +2873,12 @@ def on_shutdown():
     os._exit(0)
 
 
-app = Starlette(debug=False, routes=routes, on_shutdown=[on_shutdown])
+app = Starlette(
+    debug=False,
+    routes=routes,
+    on_startup=[on_startup],
+    on_shutdown=[on_shutdown]
+)
 
 
 def main():
@@ -2680,11 +2908,64 @@ def main():
         default="127.0.0.1",
         help="Server host (default: 127.0.0.1)"
     )
+    parser.add_argument(
+        "--connect", "-c",
+        action="store_true",
+        default=False,
+        help="Auto-connect to first available device on startup"
+    )
+    parser.add_argument(
+        "--preview",
+        action="store_true",
+        default=False,
+        help="Auto-start preview window after connection (requires --connect)"
+    )
+    parser.add_argument(
+        "--network",
+        type=str,
+        default=None,
+        help="Network mode: connect to device by IP (e.g., --network 192.168.1.100). Requires server already running on device. Implies --preview"
+    )
+    parser.add_argument(
+        "--network-push",
+        type=str,
+        default=None,
+        dest="network_push",
+        help="Network mode with USB push: push server via USB first, then connect by IP. Use this for first-time setup. Implies --preview"
+    )
+    parser.add_argument(
+        "--video",
+        action="store_true",
+        default=True,
+        help="Enable video streaming (default: True)"
+    )
     args = parser.parse_args()
 
     # 保存默认音频配置到全局变量
     global DEFAULT_AUDIO_ENABLED
     DEFAULT_AUDIO_ENABLED = args.audio
+
+    # 设置自动连接参数
+    global _auto_connect, _auto_preview, _network_device, _network_push_device, _enable_video
+    _enable_video = args.video
+
+    if args.network_push:
+        # --network-push: 先通过 USB 推送服务器，然后通过网络连接
+        _network_push_device = args.network_push
+        _auto_connect = False  # 不使用普通 USB 连接
+        _auto_preview = True
+        logger.info(f"[AUTO_CONNECT] Network-push mode enabled: will push via USB, then connect to {args.network_push}")
+    elif args.network:
+        # --network 暗示 --connect 和 --preview
+        _network_device = args.network
+        _auto_connect = False  # 不需要 USB 模式
+        _auto_preview = True
+        logger.info(f"[AUTO_CONNECT] Network mode enabled: {args.network}")
+    elif args.connect:
+        _auto_connect = True
+        _auto_preview = args.preview
+        if args.preview:
+            logger.info("[AUTO_CONNECT] Auto-connect with preview enabled")
 
     port = args.port
     host = args.host
@@ -2704,6 +2985,12 @@ def main():
     print(f"[端点] http://{host}:{port}/mcp")
     print(f"[健康检查] http://{host}:{port}/health")
     print(f"[默认音频] {'[ON] 启用' if DEFAULT_AUDIO_ENABLED else '[OFF] 禁用'}")
+    # 显示自动连接状态
+    if _network_device:
+        print(f"[自动连接] 网络 -> {_network_device} + 预览窗口")
+    elif _auto_connect:
+        mode = "USB + 预览" if _auto_preview else "USB"
+        print(f"[自动连接] {mode} (检测首个设备)")
     print("")
     print("[Claude Code 配置]")
     print('{')

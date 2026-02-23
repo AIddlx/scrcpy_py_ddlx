@@ -395,8 +395,8 @@ def create_opengl_video_widget_class():
             # Configure surface format for OpenGL
             format = QSurfaceFormat()
 
-            # Enable vertical synchronization (V-Sync)
-            format.setSwapInterval(1)  # 1 = wait for v-sync
+            # Disable vertical synchronization for lower CPU usage (~1.5%)
+            format.setSwapInterval(0)  # 0 = no V-Sync
 
             # Explicitly use double buffering
             format.setSwapBehavior(QSurfaceFormat.DoubleBuffer)

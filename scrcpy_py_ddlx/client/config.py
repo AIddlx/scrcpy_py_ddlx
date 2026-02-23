@@ -141,6 +141,31 @@ class ClientConfig:
     # When encoder has multiple frames buffered, only send the newest one
     skip_frames: bool = True
 
+    # Multi-process decoder architecture
+    # Run video decoder in separate process to avoid GIL contention
+    # Can reduce latency from ~330ms to ~150ms when using hardware decoder
+    multiprocess: bool = False
+
+    # Simulated packet loss rate (0.0-1.0) for testing FEC and queue behavior
+    # Only used in UDP mode. Set to 0.05 for 5% packet loss simulation.
+    drop_rate: float = 0.0
+
+    # Content detection settings (visual corruption detection)
+    # Detects corrupted frames by analyzing UV plane statistics
+    # WARNING: Experimental feature, may cause false positives in dynamic scenes
+    # Default: DISABLED - enable with --content-check if needed
+    content_check_enabled: bool = False  # Enable/disable content detection (default: OFF)
+    content_check_interval: int = 5  # Check every N frames
+    content_extreme_threshold: float = 0.15  # Extreme value ratio (0.15 = 15%)
+    content_shift_threshold: int = 30  # UV mean shift threshold
+    content_variance_min: int = 50  # Minimum UV variance
+
+    # Packet queue size for video decoder
+    # - 1: Lowest latency, but packet loss causes mosaic (no buffer)
+    # - 2: Low latency, still fragile to packet loss
+    # - 3: Balanced, absorbs occasional packet loss (recommended)
+    packet_queue_size: int = 3
+
     def resolve_codec(self, device_serial: Optional[str] = None) -> str:
         """
         Resolve codec string, auto-detecting if set to "auto".

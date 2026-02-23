@@ -14,6 +14,7 @@ this demuxer processes complete UDP packets directly.
 """
 
 import logging
+import random
 import socket
 import struct
 import threading
@@ -151,6 +152,7 @@ class UdpVideoDemuxer:
         pli_threshold: int = DEFAULT_PLI_THRESHOLD,
         pli_cooldown: float = DEFAULT_PLI_COOLDOWN,
         stats_callback: Optional[Callable[[UdpStats], None]] = None,
+        drop_rate: float = 0.0,
     ):
         """
         Initialize UDP video demuxer.
@@ -165,6 +167,7 @@ class UdpVideoDemuxer:
             pli_threshold: Consecutive packet losses before PLI
             pli_cooldown: Minimum seconds between PLI requests
             stats_callback: Optional callback for statistics updates
+            drop_rate: Simulated packet loss rate (0.0-1.0) for testing
         """
         self._socket = udp_socket
         self._socket.settimeout(self.SOCKET_TIMEOUT)  # Default timeout for disconnect detection
@@ -173,6 +176,7 @@ class UdpVideoDemuxer:
         self._control_channel = control_channel
         self._fec_decoder = fec_decoder
         self._stats_callback = stats_callback
+        self._drop_rate = drop_rate
 
         # PLI configuration
         self._pli_enabled = pli_enabled
@@ -315,6 +319,13 @@ class UdpVideoDemuxer:
 
                     if len(packet) == 0:
                         continue
+
+                    # SIMULATE PACKET LOSS for testing
+                    if self._drop_rate > 0 and random.random() < self._drop_rate:
+                        self._simulated_drops = getattr(self, '_simulated_drops', 0) + 1
+                        if self._simulated_drops <= 5 or self._simulated_drops % 50 == 0:
+                            logger.info(f"[SIMULATE_DROP] Dropped packet #{self._simulated_drops} (rate={self._drop_rate:.1%})")
+                        continue  # Skip processing this packet
 
                     # Check data gap (time since last packet)
                     now = time.time()
@@ -529,6 +540,25 @@ class UdpVideoDemuxer:
                 video_packet.send_time_ns = udp_header.send_time_ns
                 self._queue_packet(video_packet)
 
+            # CRITICAL: Register with FEC decoder if this was a FEC fragment
+            # Check if we have FEC metadata for this timestamp
+            fec_meta = getattr(self, '_fec_fragment_metadata', {}).get(udp_header.timestamp)
+            if fec_meta and self._fec_decoder is not None and fec_meta['total_data'] > 0:
+                self._fec_decoder.add_data_packet(
+                    group_id=fec_meta['group_id'],
+                    packet_idx=fec_meta['packet_idx'],
+                    total_data=fec_meta['total_data'],
+                    total_parity=fec_meta['total_parity'],
+                    data=reassembled,  # Use reassembled data (complete scrcpy packet)
+                    original_size=fec_meta['original_size'] if fec_meta['original_size'] > 0 else len(reassembled),
+                )
+                logger.debug(
+                    f"[FEC-FRAG-REGISTER] Registered reassembled fragment: group={fec_meta['group_id']}, "
+                    f"idx={fec_meta['packet_idx']}/{fec_meta['total_data']}"
+                )
+                # Clean up metadata
+                del self._fec_fragment_metadata[udp_header.timestamp]
+
     def _handle_fec_data(self, udp_header: UdpPacketHeader, payload: bytes) -> None:
         """
         Handle FEC data packet.
@@ -579,6 +609,25 @@ class UdpVideoDemuxer:
             # Pass device send time for full E2E latency tracking
             video_packet.send_time_ns = udp_header.send_time_ns
             self._queue_packet(video_packet)
+
+            # CRITICAL FIX: Register data packet with FEC decoder
+            # Without this, FEC decoder doesn't know which packets were received,
+            # making recovery impossible when packets are lost.
+            if self._fec_decoder is not None and total_frames > 0:
+                # Register with complete FEC header including scrcpy data
+                # The data includes the 12-byte scrcpy header for proper recovery
+                self._fec_decoder.add_data_packet(
+                    group_id=group_id,
+                    packet_idx=frame_idx,
+                    total_data=total_frames,
+                    total_parity=total_parity,
+                    data=scrcpy_data,
+                    original_size=original_size if original_size > 0 else len(scrcpy_data),
+                )
+                logger.debug(
+                    f"[FEC-REGISTER] Registered data packet: group={group_id}, "
+                    f"idx={frame_idx}/{total_frames}"
+                )
 
     def _handle_fec_parity_fragment(self, udp_header: UdpPacketHeader, payload: bytes) -> None:
         """
@@ -699,12 +748,7 @@ class UdpVideoDemuxer:
 
         Format: [frag_idx: 4B] [FEC Header: 7B] [Data: NB]
 
-        For simplicity, fragments bypass FEC protection and go directly to
-        fragment reassembly. This is because:
-        1. Fragment reassembly uses timestamp-based grouping
-        2. FEC group completion would require complex timestamp tracking
-        3. Large keyframes are already fragmented, so losing one fragment
-           would require a new keyframe anyway
+        When the frame is reassembled, it will be registered with the FEC decoder.
         """
         if len(payload) < 11:  # 4 (frag_idx) + 7 (FEC header)
             logger.warning(f"FEC fragment too short: {len(payload)} bytes")
@@ -713,20 +757,32 @@ class UdpVideoDemuxer:
         # Parse fragment index
         frag_idx = struct.unpack('>I', payload[0:4])[0]
 
-        # Parse FEC header (7 bytes) - mainly for logging
+        # Parse FEC header (7 bytes)
         group_id = struct.unpack('>H', payload[4:6])[0]
         packet_idx = payload[6]
         total_data = payload[7]
         total_parity = payload[8]
-        # original_size at payload[9:11]
+        original_size = struct.unpack('>H', payload[9:11])[0]
         fragment_data = payload[11:]
 
         logger.debug(
             f"FEC fragment: group={group_id}, idx={packet_idx}/{total_data}, "
-            f"frag_idx={frag_idx}, payload={len(fragment_data)} bytes (bypassing FEC)"
+            f"frag_idx={frag_idx}, payload={len(fragment_data)} bytes"
         )
 
-        # Bypass FEC and go directly to fragment reassembly
+        # Store FEC metadata for this frame (keyed by timestamp)
+        # Will be used when reassembly is complete
+        if not hasattr(self, '_fec_fragment_metadata'):
+            self._fec_fragment_metadata: Dict[int, dict] = {}
+
+        self._fec_fragment_metadata[udp_header.timestamp] = {
+            'group_id': group_id,
+            'packet_idx': packet_idx,
+            'total_data': total_data,
+            'total_parity': total_parity,
+            'original_size': original_size,
+        }
+
         # Reconstruct fragment payload: [frag_idx] + [data without FEC header]
         reconstructed = struct.pack('>I', frag_idx) + fragment_data
 
@@ -1147,6 +1203,15 @@ class UdpVideoDemuxer:
                 codec_id, width, height = self._parse_video_header(packet.data)
                 logger.info(f"[VIDEO_HEADER] codec=0x{codec_id:08x}, size={width}x{height}")
 
+                # Check if this is a resolution change (screen rotation)
+                old_size = getattr(self, '_last_video_size', None)
+                if old_size is not None and old_size != (width, height):
+                    logger.info(f"[VIDEO_HEADER] Resolution changed: {old_size} -> {width}x{height}")
+                    # Clear buffers on resolution change (screen rotation)
+                    self._clear_buffers_on_config_change()
+
+                self._last_video_size = (width, height)
+
                 # Notify frame size change callback if dimensions changed
                 if self._frame_size_changed_callback:
                     try:
@@ -1163,6 +1228,11 @@ class UdpVideoDemuxer:
             self._config_data = packet.data
             if old_config is not None and old_config != packet.data:
                 logger.info(f"[CONFIG_MERGE] Config changed: old={len(old_config)} bytes, new={len(packet.data)} bytes")
+
+                # CRITICAL: Clear old buffers on config change (screen rotation)
+                # Old data is invalid for new resolution/orientation
+                self._clear_buffers_on_config_change()
+
             logger.debug(f"[CONFIG_MERGE] Stored config: {len(packet.data)} bytes")
             return packet  # Return CONFIG packet so decoder can set extradata
 
@@ -1253,6 +1323,45 @@ class UdpVideoDemuxer:
             # In order - reduce consecutive drops
             self._consecutive_drops = max(0, self._consecutive_drops - 1)
 
+    def _clear_buffers_on_config_change(self) -> None:
+        """
+        Clear all buffers when config changes (screen rotation).
+
+        Called when SPS/PPS config changes, indicating a new video configuration.
+        All old data is invalid for the new resolution/orientation.
+        """
+        logger.info("[ROTATION] Clearing buffers for config change (screen rotation)")
+
+        # Clear fragment buffers (incomplete frame reassembly)
+        if hasattr(self, '_fragment_buffers'):
+            count = len(self._fragment_buffers)
+            self._fragment_buffers.clear()
+            if count > 0:
+                logger.info(f"[ROTATION] Cleared {count} fragment buffers")
+
+        # Clear FEC fragment metadata
+        if hasattr(self, '_fec_fragment_metadata'):
+            count = len(self._fec_fragment_metadata)
+            self._fec_fragment_metadata.clear()
+            if count > 0:
+                logger.info(f"[ROTATION] Cleared {count} FEC fragment metadata")
+
+        # Clear parity fragment buffers
+        if hasattr(self, '_parity_fragment_buffers'):
+            count = len(self._parity_fragment_buffers)
+            self._parity_fragment_buffers.clear()
+            if count > 0:
+                logger.info(f"[ROTATION] Cleared {count} parity fragment buffers")
+
+        # Clear FEC decoder groups (old groups are invalid)
+        if self._fec_decoder is not None:
+            old_stats = self._fec_decoder.clear()
+            logger.info(f"[ROTATION] Reset FEC decoder (was: completed={old_stats.get('groups_completed', 0)}, "
+                        f"recovered={old_stats.get('groups_recovered', 0)})")
+
+        # Reset pending keyframe tracking
+        self._pending_keyframe_ts = None
+
     def _send_pli(self) -> None:
         """Send PLI (Picture Loss Indication) request."""
         if not self._control_channel:
@@ -1319,6 +1428,22 @@ class UdpVideoDemuxer:
     def _queue_packet(self, packet: VideoPacket) -> None:
         """Put packet in queue for decoder."""
         try:
+            # PRIORITY: Config packets should never be dropped
+            # If queue is full and this is a config packet, clear old packets first
+            if packet.header.is_config:
+                qsize = self._packet_queue.qsize()
+                if qsize >= self._packet_queue.maxsize - 1:
+                    # Queue nearly full, clear old packets to make room for config
+                    logger.warning(f"[CONFIG-PRIORITY] Queue full ({qsize}), clearing for config packet")
+                    cleared = 0
+                    while not self._packet_queue.empty() and cleared < qsize:
+                        try:
+                            self._packet_queue.get_nowait()
+                            cleared += 1
+                        except:
+                            break
+                    logger.info(f"[CONFIG-PRIORITY] Cleared {cleared} packets for config")
+
             # DEBUG: Check PTS order (only for non-config packets)
             if not packet.header.is_config:
                 current_pts = packet.header.pts

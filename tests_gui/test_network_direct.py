@@ -137,6 +137,20 @@ Server Lifecycle Modes:
     fec_group.add_argument('--fec-m', dest='fec_parity_count', type=int, default=1,
                            help='FEC parity packets per group (default: 1)')
 
+    # Content detection settings (EXPERIMENTAL - disabled by default)
+    content_group = parser.add_argument_group('Content Detection (EXPERIMENTAL)')
+    content_group.add_argument('--content-check', dest='content_check_enabled',
+                               action='store_true', default=False,
+                               help='Enable visual corruption detection (EXPERIMENTAL, default: OFF)')
+    content_group.add_argument('--content-interval', dest='content_check_interval', type=int, default=5,
+                               help='Check every N frames (default: 5)')
+    content_group.add_argument('--content-extreme', dest='content_extreme_threshold', type=float, default=0.15,
+                               help='Extreme value ratio threshold 0.0-1.0 (default: 0.15 = 15%%)')
+    content_group.add_argument('--content-shift', dest='content_shift_threshold', type=int, default=30,
+                               help='UV mean shift threshold (default: 30)')
+    content_group.add_argument('--content-variance', dest='content_variance_min', type=int, default=50,
+                               help='Minimum UV variance (default: 50)')
+
     # Server lifecycle
     srv_group = parser.add_argument_group('Server Lifecycle')
     srv_group.add_argument('--reuse', dest='reuse_server', action='store_true',
@@ -194,6 +208,13 @@ Server Lifecycle Modes:
     latency_group.add_argument('--no-skip-frames', dest='skip_frames', action='store_false',
                                help='Disable frame skipping (send all frames)')
 
+    # Multi-process mode for GIL avoidance
+    latency_group.add_argument('--multiprocess', dest='multiprocess', action='store_true',
+                               help='Use multi-process decoder to avoid GIL contention. '
+                                    'Runs decoder in separate process, can reduce latency from ~330ms to ~150ms.')
+    latency_group.add_argument('--no-multiprocess', dest='multiprocess', action='store_false',
+                               help='Use single-process decoder (default)')
+
     # Debug settings
     dbg_group = parser.add_argument_group('Debug Settings')
     dbg_group.add_argument('-v', '--verbose', action='store_true',
@@ -202,6 +223,10 @@ Server Lifecycle Modes:
                            help='Quiet mode (warnings only)')
     dbg_group.add_argument('--show-details', dest='show_details', action='store_true',
                            help='Show detailed encoder info after connection')
+    dbg_group.add_argument('--drop-rate', dest='drop_rate', type=float, default=0.0,
+                           help='Simulate packet loss (0.0-1.0, e.g., 0.05 for 5%% drop rate)')
+    dbg_group.add_argument('--queue-size', dest='packet_queue_size', type=int, default=3,
+                           help='Packet queue size (1=lowest latency, 3=most stable, default: 3)')
 
     # Audio settings
     audio_group = parser.add_argument_group('Audio Settings')
@@ -222,7 +247,8 @@ Server Lifecycle Modes:
         low_latency=False,
         encoder_priority=1,
         encoder_buffer=0,
-        skip_frames=True
+        skip_frames=True,
+        multiprocess=False
     )
 
     return parser.parse_args()
@@ -715,6 +741,22 @@ def main():
         encoder_buffer=args.encoder_buffer,
         skip_frames=args.skip_frames,
 
+        # Multi-process decoder (GIL avoidance)
+        multiprocess=args.multiprocess,
+
+        # Simulated packet loss for testing
+        drop_rate=args.drop_rate,
+
+        # Packet queue size
+        packet_queue_size=args.packet_queue_size,
+
+        # Content detection (visual corruption detection)
+        content_check_enabled=args.content_check_enabled,
+        content_check_interval=args.content_check_interval,
+        content_extreme_threshold=args.content_extreme_threshold,
+        content_shift_threshold=args.content_shift_threshold,
+        content_variance_min=args.content_variance_min,
+
         # Audio settings
         audio=args.audio_enabled,  # Enable audio if requested
 
@@ -731,6 +773,15 @@ def main():
     print(f"[INFO] Host: {config.host}")
     print(f"[INFO] Control port: {config.control_port}")
     print(f"[INFO] Video port: {config.video_port}")
+    print(f"[INFO] Packet queue size: {config.packet_queue_size}")
+    if config.content_check_enabled:
+        print(f"[INFO] Content detection: interval={config.content_check_interval}, "
+              f"extreme={config.content_extreme_threshold:.0%}, shift={config.content_shift_threshold}, "
+              f"variance={config.content_variance_min}")
+    else:
+        print("[INFO] Content detection: DISABLED")
+    if config.drop_rate > 0:
+        print(f"[INFO] Simulated packet loss: {config.drop_rate:.1%}")
 
     # Create client
     client = ScrcpyClient(config)

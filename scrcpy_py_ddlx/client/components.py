@@ -97,11 +97,12 @@ class ComponentFactory:
                     mode='udp',
                     sock=self._video_socket,
                     codec_id=self.state.codec_id,
-                    packet_queue_size=1,  # Reduced from 3 to minimize queue latency
+                    packet_queue_size=getattr(self.config, 'packet_queue_size', 3),
                     control_channel=self._control_socket,  # For PLI requests
                     fec_decoder=fec_decoder,
                     pli_enabled=True,
                     pli_threshold=10,
+                    drop_rate=getattr(self.config, 'drop_rate', 0.0),  # Simulated packet loss
                 )
             elif USE_STREAMING_DEMUXER:
                 # ADB/TCP mode: use streaming demuxer (NEW - recommended)
@@ -196,6 +197,35 @@ class ComponentFactory:
                 packet_queue=self._video_packet_queue,  # Connect to demuxer's queue
                 output_nv12=gpu_rendering  # Output NV12 for GPU YUV conversion
             )
+
+            # Configure content detection from config
+            decoder.configure_content_detection(
+                enabled=getattr(self.config, 'content_check_enabled', True),
+                interval=getattr(self.config, 'content_check_interval', 5),
+                extreme_threshold=getattr(self.config, 'content_extreme_threshold', 0.15),
+                shift_threshold=getattr(self.config, 'content_shift_threshold', 30),
+                variance_min=getattr(self.config, 'content_variance_min', 50)
+            )
+
+            # Set up decode error callback to trigger PLI
+            if self._control_socket:
+                def on_decode_error(error_type: str, details: str):
+                    """Send PLI when decoder detects errors."""
+                    import struct
+                    import time
+                    from scrcpy_py_ddlx.core.protocol import ControlMessageType
+
+                    try:
+                        # Send RESET_VIDEO control message (type 17 = 0x11)
+                        msg = struct.pack('>B', ControlMessageType.RESET_VIDEO)
+                        self._control_socket.sendall(msg)
+                        logger.info(f"[DECODER-PLI] Sent PLI due to {error_type}: {details}")
+                    except Exception as e:
+                        logger.error(f"Failed to send decoder-triggered PLI: {e}")
+
+                decoder.set_on_decode_error_callback(on_decode_error)
+                logger.debug("Decoder error callback connected to PLI")
+
             decoder.start()
 
             if gpu_rendering:

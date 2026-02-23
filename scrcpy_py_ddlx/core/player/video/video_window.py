@@ -11,7 +11,7 @@ import numpy as np
 
 try:
     from PySide6.QtWidgets import QApplication, QMainWindow, QWidget
-    from PySide6.QtCore import QCoreApplication, QTimer, QMetaObject, Qt, Q_ARG
+    from PySide6.QtCore import QCoreApplication, QTimer, QMetaObject, Qt, Q_ARG, Slot
     from PySide6.QtGui import QScreen
 except ImportError:
     QApplication = None
@@ -22,6 +22,7 @@ except ImportError:
     QMetaObject = None
     Qt = None
     QScreen = None
+    Slot = lambda *args: lambda f: f  # Fallback: identity decorator
 
 from scrcpy_py_ddlx.core.player.video.video_widget import VideoWidget
 from scrcpy_py_ddlx.core.player.video.opengl_widget import OpenGLVideoWidget
@@ -190,22 +191,49 @@ class VideoWindow(QMainWindow if QMainWindow else object):
 
         self._last_resize_size = new_size
 
-        # Check if we're on the main thread by trying to access Qt properties
-        # If we are, call directly; otherwise use QTimer
+        # Use QMetaObject.invokeMethod for thread-safe GUI updates
+        # This is more reliable than QTimer.singleShot for cross-thread calls
         try:
-            # This will raise an exception if not on main thread
-            _ = self.isVisible()
-            # We're on main thread, call directly
+            from PySide6.QtCore import QThread, QCoreApplication, QMetaObject, Qt, Q_ARG
+
+            app = QCoreApplication.instance()
+            if app is not None:
+                gui_thread = app.thread()
+                current_thread = QThread.currentThread()
+
+                if gui_thread != current_thread:
+                    # Not on GUI thread - use invokeMethod to execute on GUI thread
+                    logger.debug(f"[ROTATION] Not on GUI thread, using invokeMethod")
+                    # Store the values as attributes to avoid lambda issues
+                    self._pending_resize_width = width
+                    self._pending_resize_height = height
+                    # Use invokeMethod with Qt.QueuedConnection to ensure GUI thread execution
+                    QMetaObject.invokeMethod(
+                        self,
+                        "_do_pending_resize",
+                        Qt.ConnectionType.QueuedConnection
+                    )
+                    return
+
+            # We're on GUI thread (or no app instance), call directly
             logger.info(f"[ROTATION] Calling _do_frame_size_changed directly")
             self._do_frame_size_changed(width, height)
         except Exception as e:
-            # Not on main thread, use QTimer to schedule on main thread
-            logger.debug(f"[ROTATION] Not on main thread ({e}), using QTimer")
-            if QTimer is not None:
-                # Use a closure to capture the values
-                def do_resize():
-                    self._do_frame_size_changed(width, height)
-                QTimer.singleShot(0, do_resize)
+            # Fallback: try direct call
+            logger.warning(f"[ROTATION] Thread detection error ({e}), calling directly")
+            try:
+                self._do_frame_size_changed(width, height)
+            except Exception as e2:
+                logger.error(f"[ROTATION] Direct call failed: {e2}")
+
+    @Slot()
+    def _do_pending_resize(self) -> None:
+        """Execute pending resize from invokeMethod call."""
+        if hasattr(self, '_pending_resize_width') and hasattr(self, '_pending_resize_height'):
+            width = self._pending_resize_width
+            height = self._pending_resize_height
+            logger.info(f"[ROTATION] _do_pending_resize executing: {width}x{height}")
+            self._do_frame_size_changed(width, height)
 
     def _do_frame_size_changed(self, width: int, height: int) -> None:
         """
@@ -592,6 +620,33 @@ class OpenGLVideoWindow(QMainWindow if QMainWindow else object):
             self._video_widget.set_delay_buffer(delay_buffer)
             self._video_widget.set_frame_size_changed_callback(self._on_frame_size_changed)
 
+    def set_shm_source(self, shm_name: str, shm_size: int,
+                       max_width: int = 4096, max_height: int = 4096) -> None:
+        """
+        Set shared memory source for multi-process frame reading.
+
+        When set, the renderer will read frames from SHM instead of DelayBuffer.
+        This enables multi-process architecture where the decoder runs in a
+        separate process.
+
+        Args:
+            shm_name: Name of shared memory
+            shm_size: Size of shared memory
+            max_width: Maximum frame width
+            max_height: Maximum frame height
+        """
+        if self._opengl_renderer:
+            self._opengl_renderer.set_shm_source(
+                shm_name=shm_name,
+                shm_size=shm_size,
+                max_width=max_width,
+                max_height=max_height
+            )
+            self._opengl_renderer.set_frame_size_changed_callback(self._on_frame_size_changed)
+            logger.info(f"[OPENGL_WINDOW] SHM source set: {shm_name}")
+        else:
+            logger.warning("[OPENGL_WINDOW] SHM source not supported in QOpenGLWidget fallback mode")
+
     def _on_frame_size_changed(self, width: int, height: int) -> None:
         """
         Handle frame size change (device rotation).
@@ -616,22 +671,49 @@ class OpenGLVideoWindow(QMainWindow if QMainWindow else object):
 
         self._last_resize_size = new_size
 
-        # Check if we're on the main thread by trying to access Qt properties
-        # If we are, call directly; otherwise use QTimer
+        # Use QMetaObject.invokeMethod for thread-safe GUI updates
+        # This is more reliable than QTimer.singleShot for cross-thread calls
         try:
-            # This will raise an exception if not on main thread
-            _ = self.isVisible()
-            # We're on main thread, call directly
+            from PySide6.QtCore import QThread, QCoreApplication, QMetaObject, Qt, Q_ARG
+
+            app = QCoreApplication.instance()
+            if app is not None:
+                gui_thread = app.thread()
+                current_thread = QThread.currentThread()
+
+                if gui_thread != current_thread:
+                    # Not on GUI thread - use invokeMethod to execute on GUI thread
+                    logger.debug(f"[ROTATION] Not on GUI thread, using invokeMethod")
+                    # Store the values as attributes to avoid lambda issues
+                    self._pending_resize_width = width
+                    self._pending_resize_height = height
+                    # Use invokeMethod with Qt.QueuedConnection to ensure GUI thread execution
+                    QMetaObject.invokeMethod(
+                        self,
+                        "_do_pending_resize",
+                        Qt.ConnectionType.QueuedConnection
+                    )
+                    return
+
+            # We're on GUI thread (or no app instance), call directly
             logger.info(f"[ROTATION] Calling _do_frame_size_changed directly")
             self._do_frame_size_changed(width, height)
         except Exception as e:
-            # Not on main thread, use QTimer to schedule on main thread
-            logger.debug(f"[ROTATION] Not on main thread ({e}), using QTimer")
-            if QTimer is not None:
-                # Use a closure to capture the values
-                def do_resize():
-                    self._do_frame_size_changed(width, height)
-                QTimer.singleShot(0, do_resize)
+            # Fallback: try direct call
+            logger.warning(f"[ROTATION] Thread detection error ({e}), calling directly")
+            try:
+                self._do_frame_size_changed(width, height)
+            except Exception as e2:
+                logger.error(f"[ROTATION] Direct call failed: {e2}")
+
+    @Slot()
+    def _do_pending_resize(self) -> None:
+        """Execute pending resize from invokeMethod call."""
+        if hasattr(self, '_pending_resize_width') and hasattr(self, '_pending_resize_height'):
+            width = self._pending_resize_width
+            height = self._pending_resize_height
+            logger.info(f"[ROTATION] _do_pending_resize executing: {width}x{height}")
+            self._do_frame_size_changed(width, height)
 
     def _do_frame_size_changed(self, width: int, height: int) -> None:
         """

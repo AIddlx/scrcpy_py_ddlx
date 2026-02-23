@@ -7,7 +7,7 @@ as long as the number of lost packets does not exceed the number of
 available parity packets.
 
 FEC Group Structure:
-    Data Packets:   [D0] [D1] [D2] [D3] ... [DK-1]
+    Data Packets:   [D0] [D1] [D2] [D3] ... [DK-1]  (0-based indices)
     Parity Packets: [P0] [P1] ... [PM-1]
 
     Recovery: If N packets are lost and M >= N parity packets are available,
@@ -43,7 +43,10 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class FecGroupBuffer:
-    """Buffer for a single FEC group being received."""
+    """Buffer for a single FEC group being received.
+
+    Uses 0-based indexing: packet indices are 0 to K-1 for K data packets.
+    """
     group_id: int
     total_data_packets: int  # K
     total_parity_packets: int  # M
@@ -61,11 +64,13 @@ class FecGroupBuffer:
 
     @property
     def is_complete(self) -> bool:
-        """Check if all data packets are received."""
-        # If total_data_packets is 0, we don't know the expected count yet
+        """Check if all data packets are received (0-based: 0 to K-1)."""
         if self.total_data_packets == 0:
             return False
-        return len(self.data_packets) == self.total_data_packets
+        K = self.total_data_packets
+        # Server sends idx=0,1,2,...,K-1 (K packets total)
+        # Check if we have all packets from 0 to K-1
+        return all(i in self.data_packets for i in range(K))
 
     @property
     def missing_count(self) -> int:
@@ -84,7 +89,7 @@ class FecGroupBuffer:
         return len(self.parity_packets) >= self.missing_count and self.missing_count > 0
 
     def get_missing_indices(self) -> Set[int]:
-        """Get indices of missing data packets."""
+        """Get indices of missing data packets (0-based: 0 to K-1)."""
         return set(range(self.total_data_packets)) - set(self.data_packets.keys())
 
 
@@ -289,6 +294,21 @@ class FecDecoder:
         """Get decoder statistics."""
         return dict(self._stats)
 
+    def clear(self) -> dict:
+        """
+        Clear all groups and return stats before clearing.
+
+        Called when video configuration changes (e.g., screen rotation),
+        all old FEC groups are invalid for new resolution.
+        """
+        stats = dict(self._stats)
+        count = len(self._groups)
+        self._groups.clear()
+        self._recent_failures = 0
+        if count > 0:
+            logger.info(f"FEC decoder cleared: {count} groups discarded")
+        return stats
+
     def get_and_reset_failed_count(self) -> int:
         """
         Get and reset the count of recently failed groups.
@@ -340,15 +360,17 @@ class FecDecoder:
             )
             return None
 
-        # Get packet size (use first received packet as reference)
+        # Get packet size - use PARITY size as it's calculated from max frame size
+        # This ensures recovered packets have enough space for the largest frame
         packet_size = None
-        for pkt in group.data_packets.values():
-            packet_size = len(pkt)
-            break
+        if group.parity_packets:
+            # Use parity packet size (it's the XOR of all frames, so it's the max size)
+            first_parity_idx = min(group.parity_packets.keys())
+            packet_size = len(group.parity_packets[first_parity_idx])
 
         if packet_size is None:
-            # No data packets received, try parity
-            for pkt in group.parity_packets.values():
+            # Fallback: no parity, use first data packet
+            for pkt in group.data_packets.values():
                 packet_size = len(pkt)
                 break
 
@@ -456,7 +478,7 @@ class FecDecoder:
             target[i] ^= source[i]
 
     def _get_ordered_data(self, group: FecGroupBuffer) -> List[bytes]:
-        """Get data packets in order."""
+        """Get data packets in order (0-based: 0 to K-1)."""
         return [group.data_packets[i] for i in range(group.total_data_packets)]
 
     def _cleanup_group(self, group_id: int) -> None:

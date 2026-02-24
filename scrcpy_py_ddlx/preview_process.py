@@ -421,10 +421,10 @@ def preview_window_process(frame_queue: mp.Queue,
             shared_mem_reader = None
 
     try:
-        from PySide6.QtWidgets import QApplication, QMainWindow
+        from PySide6.QtWidgets import QApplication, QMainWindow, QWidget, QVBoxLayout
         from PySide6.QtCore import Qt, QTimer
         from PySide6.QtGui import QKeyEvent, QMouseEvent, QSurfaceFormat
-        from PySide6.QtOpenGLWidgets import QOpenGLWidget
+        from PySide6.QtOpenGL import QOpenGLWindow
     except ImportError as e:
         logger.error(f"PySide6 not available: {e}")
         return
@@ -453,8 +453,13 @@ def preview_window_process(frame_queue: mp.Queue,
 
     if OPENGL_AVAILABLE:
         # OpenGL-based preview widget with NV12 GPU rendering support
-        class OpenGLPreviewWidget(QOpenGLWidget):
-            """OpenGL widget to display video frames with GPU acceleration."""
+        # Using QOpenGLWindow for lower CPU usage (~0.5% vs ~6.6% for QOpenGLWidget on Windows)
+        class OpenGLPreviewWidget(QOpenGLWindow):
+            """OpenGL window to display video frames with GPU acceleration.
+
+            Note: QOpenGLWindow is a QWindow, not a QWidget. Use
+            QWidget.createWindowContainer() to embed it in a widget hierarchy.
+            """
 
             # NV12 YUV shader sources - using 2 textures (Y + UV) for better performance
             # This avoids CPU-based U/V separation
@@ -498,7 +503,9 @@ def preview_window_process(frame_queue: mp.Queue,
                 self._uv_texture_id = None  # For NV12 UV plane
                 self._texture_width = 0
                 self._texture_height = 0
-                self.setMinimumSize(200, 200)
+                # QOpenGLWindow uses QSize for setMinimumSize
+                from PySide6.QtCore import QSize
+                self.setMinimumSize(QSize(200, 200))
 
                 # Shader program for NV12 (using Qt's QOpenGLShaderProgram)
                 self._nv12_shader = None
@@ -525,14 +532,8 @@ def preview_window_process(frame_queue: mp.Queue,
                 fmt.setSamples(0)  # No multisampling for performance
                 self.setFormat(fmt)
 
-                # CRITICAL: Use NoPartialUpdate to avoid buffering delays
-                try:
-                    self.setUpdateBehavior(QOpenGLWidget.UpdateBehavior.NoPartialUpdate)
-                except AttributeError:
-                    pass
-
-                self.setFocusPolicy(Qt.StrongFocus)
-                self.setMouseTracking(True)
+                # Note: QOpenGLWindow (QWindow) doesn't have setFocusPolicy or setMouseTracking
+                # Focus and mouse tracking are handled by the container widget
 
                 # Performance tracking
                 self._paint_count = 0
@@ -687,7 +688,11 @@ def preview_window_process(frame_queue: mp.Queue,
 
             def resizeGL(self, w: int, h: int):
                 """Handle window resize."""
-                glViewport(0, 0, w, h)
+                try:
+                    glViewport(0, 0, w, h)
+                except Exception as e:
+                    # Ignore OpenGL errors during resize (context may not be current)
+                    pass
 
             def _paint_nv12_gpu(self, nv12_data: np.ndarray, w: int, h: int):
                 """Render NV12 frame using GPU shader with PBO async texture upload."""
@@ -1036,8 +1041,9 @@ def preview_window_process(frame_queue: mp.Queue,
                         # Send touch DOWN event immediately
                         try:
                             control_queue.put(('touch_down', device_x, device_y), timeout=0.1)
-                        except:
-                            pass
+                            logger.debug(f"[TOUCH] Down at ({device_x}, {device_y})")
+                        except Exception as e:
+                            logger.warning(f"[TOUCH] Failed to send touch_down: {e}")
 
             def mouseMoveEvent(self, event: QMouseEvent):
                 """Handle mouse move - send touch move for real-time tracking."""
@@ -1055,8 +1061,8 @@ def preview_window_process(frame_queue: mp.Queue,
                         # Send touch MOVE event for real-time tracking
                         try:
                             control_queue.put(('touch_move', device_x, device_y), timeout=0.05)
-                        except:
-                            pass
+                        except Exception as e:
+                            logger.warning(f"[TOUCH] Failed to send touch_move: {e}")
 
             def mouseReleaseEvent(self, event: QMouseEvent):
                 """Handle mouse release - send touch up."""
@@ -1065,8 +1071,9 @@ def preview_window_process(frame_queue: mp.Queue,
                         # Always send touch UP event
                         x, y = self._touch_current if self._touch_current else self._touch_start
                         control_queue.put(('touch_up', x, y), timeout=0.1)
-                    except:
-                        pass
+                        logger.debug(f"[TOUCH] Up at ({x}, {y})")
+                    except Exception as e:
+                        logger.warning(f"[TOUCH] Failed to send touch_up: {e}")
                     finally:
                         self._touch_start = None
                         self._touch_current = None
@@ -1087,8 +1094,9 @@ def preview_window_process(frame_queue: mp.Queue,
                 if action:
                     try:
                         control_queue.put(('key', action), timeout=0.1)
-                    except:
-                        pass
+                        logger.debug(f"[KEY] {action}")
+                    except Exception as e:
+                        logger.warning(f"[KEY] Failed to send key: {e}")
 
             def wheelEvent(self, event):
                 """Handle mouse wheel for scroll."""
@@ -1101,8 +1109,8 @@ def preview_window_process(frame_queue: mp.Queue,
                         vscroll = -delta * 0.5
                         try:
                             control_queue.put(('scroll', device_x, device_y, 0.0, vscroll), timeout=0.1)
-                        except:
-                            pass
+                        except Exception as e:
+                            logger.warning(f"[TOUCH] Failed to send scroll: {e}")
 
         PreviewWidget = OpenGLPreviewWidget
     else:
@@ -1266,6 +1274,146 @@ def preview_window_process(frame_queue: mp.Queue,
         logger.warning("Using CPU rendering for preview")
         logger.warning("CPU mode: NOT recommended for >2Mbps or >30fps due to GIL contention causing delays")
 
+    class GLWindowContainer(QWidget):
+        """
+        Custom container widget for QOpenGLWindow that handles mouse/keyboard events.
+
+        When QOpenGLWindow is embedded via createWindowContainer(), mouse events
+        are received by the container widget, not the QOpenGLWindow itself.
+        This class handles events directly and sends control messages to the device.
+        """
+
+        def __init__(self, gl_window, main_window, parent=None):
+            super().__init__(parent)
+            self._gl_window = gl_window
+            self._main_window = main_window
+            self.setMouseTracking(True)  # Enable mouse move events
+
+            # Touch tracking
+            self._touch_start = None
+            self._touch_current = None
+            self._is_swiping = False
+
+            # Create the actual container for the GL window
+            self._container = QWidget.createWindowContainer(gl_window, self)
+            # Don't let the internal container grab keyboard focus
+            self._container.setFocusPolicy(Qt.NoFocus)
+            layout = QVBoxLayout(self)
+            layout.setContentsMargins(0, 0, 0, 0)
+            layout.addWidget(self._container)
+
+        def _get_device_coords(self, x, y):
+            """Convert widget coordinates to device coordinates."""
+            w, h = self._gl_window._device_size
+            if w == 0 or h == 0:
+                logger.warning(f"[COORD] Invalid device size: {w}x{h}")
+                return None, None
+            widget_w = self.width()
+            widget_h = self.height()
+            scale = min(widget_w / w, widget_h / h)
+            img_w = int(w * scale)
+            img_h = int(h * scale)
+            offset_x = (widget_w - img_w) // 2
+            offset_y = (widget_h - img_h) // 2
+
+            # Debug log for coordinate conversion
+            logger.debug(f"[COORD] widget=({widget_w}x{widget_h}), device=({w}x{h}), scale={scale:.3f}")
+            logger.debug(f"[COORD] img=({img_w}x{img_h}), offset=({offset_x},{offset_y}), click=({x},{y})")
+
+            if offset_x <= x <= offset_x + img_w and offset_y <= y <= offset_y + img_h:
+                device_x = int((x - offset_x) / scale)
+                device_y = int((y - offset_y) / scale)
+                logger.debug(f"[COORD] Device coords: ({device_x}, {device_y})")
+                return device_x, device_y
+            logger.warning(f"[COORD] Click outside image area!")
+            return None, None
+
+        def mousePressEvent(self, event):
+            """Handle mouse press - start touch down."""
+            if event.button() == Qt.LeftButton:
+                x = event.position().x()
+                y = event.position().y()
+                device_x, device_y = self._get_device_coords(x, y)
+                if device_x is not None:
+                    self._touch_start = (device_x, device_y)
+                    self._touch_current = (device_x, device_y)
+                    self._is_swiping = False
+                    # Send touch DOWN event immediately
+                    try:
+                        control_queue.put(('touch_down', device_x, device_y), timeout=0.1)
+                        logger.debug(f"[TOUCH] Down at ({device_x}, {device_y})")
+                    except Exception as e:
+                        logger.warning(f"[TOUCH] Failed to send touch_down: {e}")
+
+        def mouseMoveEvent(self, event):
+            """Handle mouse move - send touch move for real-time tracking."""
+            if self._touch_start is not None:
+                x = event.position().x()
+                y = event.position().y()
+                device_x, device_y = self._get_device_coords(x, y)
+                if device_x is not None:
+                    self._touch_current = (device_x, device_y)
+                    dx = abs(device_x - self._touch_start[0])
+                    dy = abs(device_y - self._touch_start[1])
+                    if dx > 10 or dy > 10:
+                        self._is_swiping = True
+                    # Send touch MOVE event for real-time tracking
+                    try:
+                        control_queue.put(('touch_move', device_x, device_y), timeout=0.05)
+                    except:
+                        pass
+
+        def mouseReleaseEvent(self, event):
+            """Handle mouse release - send touch up."""
+            if event.button() == Qt.LeftButton and self._touch_start is not None:
+                try:
+                    # Always send touch UP event
+                    x, y = self._touch_current if self._touch_current else self._touch_start
+                    control_queue.put(('touch_up', x, y), timeout=0.1)
+                    logger.debug(f"[TOUCH] Up at ({x}, {y})")
+                except:
+                    pass
+                finally:
+                    self._touch_start = None
+                    self._touch_current = None
+                    self._is_swiping = False
+
+        def wheelEvent(self, event):
+            """Handle mouse wheel for scroll."""
+            x = event.position().x()
+            y = event.position().y()
+            device_x, device_y = self._get_device_coords(x, y)
+            if device_x is not None:
+                delta = event.angleDelta().y() / 120.0
+                vscroll = -delta * 0.5
+                try:
+                    control_queue.put(('scroll', device_x, device_y, 0.0, vscroll), timeout=0.1)
+                except:
+                    pass
+
+        def keyPressEvent(self, event):
+            """Handle key press for control events."""
+            key = event.key()
+            key_map = {
+                Qt.Key_Back: 'back',
+                Qt.Key_Home: 'home',
+                Qt.Key_Menu: 'menu',
+                Qt.Key_Enter: 'enter',
+                Qt.Key_Return: 'enter',
+                Qt.Key_Escape: 'back',
+            }
+            action = key_map.get(key)
+            if action:
+                try:
+                    control_queue.put(('key', action), timeout=0.1)
+                    logger.debug(f"[KEY] {action}")
+                except:
+                    pass
+
+        def keyReleaseEvent(self, event):
+            """Handle key release."""
+            pass
+
     class PreviewWindow(QMainWindow):
         """Main window for preview."""
 
@@ -1275,6 +1423,13 @@ def preview_window_process(frame_queue: mp.Queue,
             self.setWindowTitle(self._base_title)
             self.setMinimumSize(400, 300)
             self._device_size = (width, height)
+
+            # Enable keyboard focus for the main window
+            self.setFocusPolicy(Qt.StrongFocus)
+
+            # Enable input method support
+            self.setAttribute(Qt.WA_InputMethodEnabled, True)
+            self.setInputMethodHints(Qt.ImhPreferLatin)  # Prefer Latin input for stability
 
             # Calculate initial size
             screen = QApplication.primaryScreen()
@@ -1288,7 +1443,17 @@ def preview_window_process(frame_queue: mp.Queue,
                 self.resize(min(width, 800), min(height, 600))
 
             # Create preview widget
-            self._widget = PreviewWidget()
+            if OPENGL_AVAILABLE:
+                # QOpenGLWindow is a QWindow, need to wrap it in a container widget
+                self._gl_window = PreviewWidget()
+                # Use custom container that forwards mouse events to GL window
+                self._widget = GLWindowContainer(self._gl_window, self)
+                self._widget.setFocusPolicy(Qt.StrongFocus)  # Enable keyboard focus
+                logger.info("[PREVIEW] Using QOpenGLWindow (low CPU mode)")
+            else:
+                # CPU mode uses QWidget directly
+                self._gl_window = None
+                self._widget = PreviewWidget()
             self.setCentralWidget(self._widget)
 
             # Center window on screen
@@ -1318,6 +1483,133 @@ def preview_window_process(frame_queue: mp.Queue,
 
             self._frame_count = 0
             self._last_true_e2e = 0  # Track last TRUE_E2E for title display
+
+            # Install event filter to catch keyboard events at application level
+            QApplication.instance().installEventFilter(self)
+            logger.debug("[PREVIEW] Event filter installed")
+
+        def eventFilter(self, obj, event):
+            """Event filter to catch keyboard and input method events at application level."""
+            from PySide6.QtCore import QEvent
+
+            # Log all event types for debugging (only for our window)
+            if self.isActiveWindow() and event.type() in [
+                QEvent.Type.KeyPress,
+                QEvent.Type.KeyRelease,
+                QEvent.Type.InputMethod,
+                QEvent.Type.InputMethodQuery,
+            ]:
+                logger.debug(f"[EVENT] type={event.type()}, obj={obj.__class__.__name__}")
+
+            # Handle input method events (for IME like Chinese input)
+            if event.type() == QEvent.Type.InputMethod:
+                if self.isActiveWindow():
+                    commit_string = event.commitString()
+                    preedit_string = event.preeditString()
+                    logger.debug(f"[IME] commit='{commit_string}', preedit='{preedit_string}'")
+                    if commit_string:
+                        try:
+                            control_queue.put(('text', commit_string), timeout=0.1)
+                            logger.debug(f"[TEXT] '{commit_string}' (from IME)")
+                        except Exception as e:
+                            logger.warning(f"[TEXT] Failed: {e}")
+                        return True  # Event handled
+
+            # Handle key press events
+            if event.type() == QEvent.Type.KeyPress:
+                # Only process if this window is active
+                if self.isActiveWindow():
+                    key = event.key()
+                    text = event.text()
+                    modifiers = event.modifiers()
+                    logger.debug(f"[EVENT_FILTER] key={key}, text='{text}', modifiers={modifiers}")
+
+                    # Extended key mappings (Qt.Key -> Android keycode name)
+                    # Reference: https://developer.android.com/reference/android/view/KeyEvent
+                    key_map = {
+                        # Navigation keys
+                        Qt.Key_Back: 'back',
+                        Qt.Key_Home: 'home',
+                        Qt.Key_Menu: 'menu',
+                        Qt.Key_Enter: 'enter',
+                        Qt.Key_Return: 'enter',
+                        Qt.Key_Escape: 'back',
+                        Qt.Key_Backtab: 'back',
+
+                        # Arrow keys
+                        Qt.Key_Left: 'dpad_left',
+                        Qt.Key_Right: 'dpad_right',
+                        Qt.Key_Up: 'dpad_up',
+                        Qt.Key_Down: 'dpad_down',
+
+                        # Media keys (only include keys that exist in PySide6)
+                        Qt.Key_VolumeUp: 'volume_up',
+                        Qt.Key_VolumeDown: 'volume_down',
+                        Qt.Key_VolumeMute: 'volume_mute',
+
+                        # Function keys
+                        Qt.Key_F1: 'f1',
+                        Qt.Key_F2: 'f2',
+                        Qt.Key_F3: 'f3',
+                        Qt.Key_F4: 'f4',
+                        Qt.Key_F5: 'f5',
+                        Qt.Key_F6: 'f6',
+                        Qt.Key_F7: 'f7',
+                        Qt.Key_F8: 'f8',
+                        Qt.Key_F9: 'f9',
+                        Qt.Key_F10: 'f10',
+                        Qt.Key_F11: 'f11',
+                        Qt.Key_F12: 'f12',
+
+                        # Special keys
+                        Qt.Key_Tab: 'tab',
+                        Qt.Key_Delete: 'del',
+                        Qt.Key_Backspace: 'del',
+                        Qt.Key_Insert: 'insert',
+                        Qt.Key_PageUp: 'page_up',
+                        Qt.Key_PageDown: 'page_down',
+                        Qt.Key_CapsLock: 'caps_lock',
+                    }
+
+                    action = key_map.get(key)
+                    if action:
+                        try:
+                            control_queue.put(('key', action), timeout=0.1)
+                            logger.debug(f"[KEY] {action}")
+                        except Exception as e:
+                            logger.warning(f"[KEY] Failed: {e}")
+                        return True  # Event handled
+
+                    # Text input
+                    if text:
+                        char = text[0] if len(text) > 0 else ''
+                        logger.debug(f"[TEXT_CHECK] char='{char}', printable={char.isprintable() if char else 'N/A'}")
+                        if char and (char.isprintable() or char in '\t\n'):
+                            try:
+                                control_queue.put(('text', char), timeout=0.1)
+                                logger.debug(f"[TEXT] '{char}'")
+                            except Exception as e:
+                                logger.warning(f"[TEXT] Failed: {e}")
+                            return True  # Event handled
+
+            return super().eventFilter(obj, event)
+
+        def inputMethodEvent(self, event):
+            """Handle input method events directly."""
+            commit_string = event.commitString()
+            if commit_string:
+                logger.debug(f"[IME_DIRECT] commitString='{commit_string}'")
+                try:
+                    control_queue.put(('text', commit_string), timeout=0.1)
+                    logger.debug(f"[TEXT] '{commit_string}' (from IME direct)")
+                except Exception as e:
+                    logger.warning(f"[TEXT] Failed: {e}")
+            event.accept()
+
+        @property
+        def _renderer(self):
+            """Return the actual renderer object (QOpenGLWindow or QWidget)."""
+            return self._gl_window if self._gl_window is not None else self._widget
 
         def _setup_event_notifier(self, handle):
             """Set up event notifier based on handle type."""
@@ -1508,6 +1800,13 @@ def preview_window_process(frame_queue: mp.Queue,
             logger.info(f"Device size changed: {old_w}x{old_h} -> {w}x{h}")
             self._device_size = (w, h)
 
+            # Notify MCP server about device size change for touch events
+            try:
+                control_queue.put(('device_size_changed', w, h), timeout=0.1)
+                logger.info(f"[ROTATION] Sent device_size_changed to MCP server: {w}x{h}")
+            except Exception as e:
+                logger.warning(f"[ROTATION] Failed to send device_size_changed: {e}")
+
             # Adjust window to new aspect ratio while keeping similar area
             current_w, current_h = self.width(), self.height()
             device_aspect = w / h
@@ -1525,7 +1824,7 @@ def preview_window_process(frame_queue: mp.Queue,
                 new_w = int(new_h * device_aspect)
 
             self.resize(new_w, new_h)
-            self._widget.set_device_size(w, h)
+            self._renderer.set_device_size(w, h)
 
         def _update_frame(self):
             """Check for new frames and update display - OPTIMIZED for low latency."""
@@ -1641,15 +1940,18 @@ def preview_window_process(frame_queue: mp.Queue,
 
                         # Update widget - core operation
                         widget_update_start = time.time()
-                        self._widget._frame_available_time = frame_available_time
-                        self._widget.update_frame(frame, self._frame_count, frame_format)
+                        self._renderer._frame_available_time = frame_available_time
+                        self._renderer.update_frame(frame, self._frame_count, frame_format)
                         widget_update_end = time.time()
 
-                        # Use repaint() for IMMEDIATE rendering (not update() which queues)
-                        # This is critical for low latency - update() merges requests
+                        # Trigger rendering
+                        # QOpenGLWindow uses update(), QWidget uses repaint()
                         update_call_start = time.time()
-                        self._widget.repaint()  # Force immediate paintGL
-                        self._widget._last_update_call_time = update_call_start
+                        if self._gl_window is not None:
+                            self._gl_window.update()  # QOpenGLWindow
+                        else:
+                            self._widget.repaint()  # QWidget fallback
+                        self._renderer._last_update_call_time = update_call_start
                         update_call_end = time.time()
 
                         if self._frame_count <= 5 or self._frame_count % 60 == 0:
@@ -1680,12 +1982,80 @@ def preview_window_process(frame_queue: mp.Queue,
                         self.set_device_size(w, h)
                     elif item is not None:
                         self._frame_count += 1
-                        self._widget.update_frame(item, self._frame_count)
-                        self._widget.repaint()  # Immediate rendering
+                        self._renderer.update_frame(item, self._frame_count)
+                        if self._gl_window is not None:
+                            self._gl_window.update()  # QOpenGLWindow
+                        else:
+                            self._widget.repaint()  # QWidget fallback
 
             except Exception as e:
                 if self._frame_count < 10:
                     logger.warning(f"Frame update error: {e}")
+
+        def keyPressEvent(self, event):
+            """Handle key press for control events and text input."""
+            key = event.key()
+            text = event.text()
+            modifiers = event.modifiers()
+
+            # Debug: log all key events
+            logger.debug(f"[KEY_EVENT] key={key}, text='{text}', modifiers={modifiers}")
+
+            # Control key mappings
+            key_map = {
+                Qt.Key_Back: 'back',
+                Qt.Key_Home: 'home',
+                Qt.Key_Menu: 'menu',
+                Qt.Key_Enter: 'enter',
+                Qt.Key_Return: 'enter',
+                Qt.Key_Escape: 'back',
+                Qt.Key_Backtab: 'back',  # Shift+Tab
+            }
+
+            # Check for control keys first
+            action = key_map.get(key)
+            if action:
+                try:
+                    control_queue.put(('key', action), timeout=0.1)
+                    logger.debug(f"[KEY] {action}")
+                except Exception as e:
+                    logger.warning(f"[KEY] Failed to send key: {e}")
+                return
+
+            # Handle text input (printable characters)
+            # Accept single printable characters (including space, letters, numbers, symbols)
+            if text:
+                char = text[0] if len(text) > 0 else ''
+                if char and (char.isprintable() or char in '\t\n'):
+                    try:
+                        control_queue.put(('text', char), timeout=0.1)
+                        logger.debug(f"[TEXT] '{char}' (ord={ord(char)})")
+                    except Exception as e:
+                        logger.warning(f"[TEXT] Failed to send text: {e}")
+                    return
+
+            # Pass other keys to parent
+            super().keyPressEvent(event)
+
+        def showEvent(self, event):
+            """Handle window show - activate and grab focus."""
+            super().showEvent(event)
+            # Activate window and grab keyboard focus
+            self.activateWindow()
+            self.raise_()
+            self.setFocus()
+            logger.debug("[PREVIEW] Window shown, focus grabbed")
+
+        def focusInEvent(self, event):
+            """Handle focus in."""
+            super().focusInEvent(event)
+            logger.debug("[PREVIEW] Window gained focus")
+
+        def mousePressEvent(self, event):
+            """Handle mouse press."""
+            super().mousePressEvent(event)
+            # Ensure window has focus when user clicks
+            self.setFocus()
 
         def closeEvent(self, event):
             self._timer.stop()

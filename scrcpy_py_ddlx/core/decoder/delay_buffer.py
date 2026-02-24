@@ -154,6 +154,8 @@ class DelayBuffer:
             pts = self._pending_frame.pts
             capture_time = self._pending_frame.capture_time
             udp_recv_time = self._pending_frame.udp_recv_time
+            width = self._pending_frame.width
+            height = self._pending_frame.height
 
             # Mark as consumed immediately
             self._consumed = True
@@ -161,7 +163,8 @@ class DelayBuffer:
         # Return frame reference (caller must handle it quickly)
         return FrameWithMetadata(
             frame=raw_frame, packet_id=packet_id, pts=pts,
-            capture_time=capture_time, udp_recv_time=udp_recv_time
+            capture_time=capture_time, udp_recv_time=udp_recv_time,
+            width=width, height=height
         )
 
     def consume(self) -> Optional[FrameWithMetadata]:
@@ -184,13 +187,16 @@ class DelayBuffer:
             pts = self._pending_frame.pts
             capture_time = self._pending_frame.capture_time
             udp_recv_time = self._pending_frame.udp_recv_time
+            width = self._pending_frame.width
+            height = self._pending_frame.height
 
             # Mark as consumed immediately
             self._consumed = True
 
         return FrameWithMetadata(
             frame=raw_frame, packet_id=packet_id, pts=pts,
-            capture_time=capture_time, udp_recv_time=udp_recv_time
+            capture_time=capture_time, udp_recv_time=udp_recv_time,
+            width=width, height=height
         )
 
     def pop(self) -> Optional:

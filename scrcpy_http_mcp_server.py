@@ -359,6 +359,14 @@ TOOLS = [
         }
     },
     {
+        "name": "restart_adb",
+        "description": "Restart ADB server. Use when ADB connection is stuck or device not detected. Executes: adb kill-server && adb start-server",
+        "inputSchema": {
+            "type": "object",
+            "properties": {}
+        }
+    },
+    {
         "name": "discover_devices",
         "description": "Auto-discover devices on local network. Scans for: 1) ADB connected devices (USB/WiFi), 2) Running scrcpy servers (UDP broadcast on port 27183). RECOMMENDED: Use USB when possible. For network mode, first push_server via USB, then discover and connect.",
         "inputSchema": {
@@ -988,6 +996,54 @@ class ScrcpyMCPHandler:
 
         return True
 
+    def _start_control_event_reader(self):
+        """Start background thread to read control events from preview window.
+
+        This is separate from frame sender because in Direct SHM mode,
+        frames are sent directly via shared memory, but we still need to
+        read control events (touch, key, etc.) from the preview process.
+        """
+        if not self._preview_manager or not self._preview_manager.is_running:
+            return
+
+        # Check if control reader is already running
+        if hasattr(self, '_control_reader_thread') and self._control_reader_thread is not None:
+            if self._control_reader_thread.is_alive():
+                return
+
+        def control_reader_loop():
+            """Read control events from preview and forward to client."""
+            import time
+            logger.info("Control event reader thread started")
+            while self._preview_manager and self._preview_manager.is_running:
+                try:
+                    # Check connection
+                    if not self._is_client_connected():
+                        time.sleep(0.1)
+                        continue
+
+                    # Handle control events from preview window
+                    events = self._preview_manager.get_control_events()
+                    for event in events:
+                        self._handle_preview_control_event(event)
+
+                    time.sleep(0.01)  # 10ms polling interval
+
+                except Exception as e:
+                    logger.warning(f"Control event reader error: {e}")
+                    time.sleep(0.1)
+
+            logger.info("Control event reader thread stopped")
+
+        import threading
+        self._control_reader_thread = threading.Thread(
+            target=control_reader_loop,
+            daemon=True,
+            name="ControlEventReader"
+        )
+        self._control_reader_thread.start()
+        logger.info("Control event reader thread started")
+
     def _start_frame_sender(self):
         """Start background thread to send frames to preview window."""
         if not self._preview_manager or not self._preview_manager.is_running:
@@ -1244,6 +1300,17 @@ class ScrcpyMCPHandler:
                     )
                     return True
 
+            # Device size change notification from preview process
+            elif event_type == 'device_size_changed':
+                w, h = event[1], event[2]
+                logger.info(f"[MCP] Received device_size_changed from preview: {w}x{h}")
+                # Update client.state.device_size for touch events
+                old_w, old_h = self._client.state.device_size
+                if (w, h) != (old_w, old_h):
+                    self._client.state.device_size = (w, h)
+                    logger.info(f"[MCP] Updated client.state.device_size: {old_w}x{old_h} -> {w}x{h}")
+                return True
+
             # Legacy tap and swipe (for backward compatibility)
             elif event_type == 'tap':
                 x, y = event[1], event[2]
@@ -1274,11 +1341,69 @@ class ScrcpyMCPHandler:
                 if hasattr(self._client, 'inject_keycode'):
                     from scrcpy_py_ddlx.core.protocol import AndroidKeyEventAction
                     # Map action names to Android key codes
+                    # Reference: https://developer.android.com/reference/android/view/KeyEvent
                     key_map = {
-                        'back': 4,      # KEYCODE_BACK
-                        'home': 3,      # KEYCODE_HOME
-                        'menu': 82,     # KEYCODE_MENU
-                        'enter': 66,    # KEYCODE_ENTER
+                        # Navigation keys
+                        'back': 4,          # KEYCODE_BACK
+                        'home': 3,          # KEYCODE_HOME
+                        'menu': 82,         # KEYCODE_MENU
+                        'enter': 66,        # KEYCODE_ENTER
+
+                        # Arrow / DPAD keys
+                        'dpad_left': 21,    # KEYCODE_DPAD_LEFT
+                        'dpad_right': 22,   # KEYCODE_DPAD_RIGHT
+                        'dpad_up': 19,      # KEYCODE_DPAD_UP
+                        'dpad_down': 20,    # KEYCODE_DPAD_DOWN
+                        'dpad_center': 23,  # KEYCODE_DPAD_CENTER
+
+                        # Media keys
+                        'volume_up': 24,    # KEYCODE_VOLUME_UP
+                        'volume_down': 25,  # KEYCODE_VOLUME_DOWN
+                        'volume_mute': 164, # KEYCODE_VOLUME_MUTE
+                        'media_play_pause': 85,  # KEYCODE_MEDIA_PLAY_PAUSE
+                        'media_stop': 86,   # KEYCODE_MEDIA_STOP
+                        'media_next': 87,   # KEYCODE_MEDIA_NEXT
+                        'media_previous': 88, # KEYCODE_MEDIA_PREVIOUS
+
+                        # Function keys
+                        'f1': 131,          # KEYCODE_F1
+                        'f2': 132,          # KEYCODE_F2
+                        'f3': 133,          # KEYCODE_F3
+                        'f4': 134,          # KEYCODE_F4
+                        'f5': 135,          # KEYCODE_F5
+                        'f6': 136,          # KEYCODE_F6
+                        'f7': 137,          # KEYCODE_F7
+                        'f8': 138,          # KEYCODE_F8
+                        'f9': 139,          # KEYCODE_F9
+                        'f10': 140,         # KEYCODE_F10
+                        'f11': 141,         # KEYCODE_F11
+                        'f12': 142,         # KEYCODE_F12
+
+                        # Special keys
+                        'tab': 61,          # KEYCODE_TAB
+                        'del': 67,          # KEYCODE_DEL (backspace)
+                        'insert': 124,      # KEYCODE_INSERT
+                        'page_up': 92,      # KEYCODE_PAGE_UP
+                        'page_down': 93,    # KEYCODE_PAGE_DOWN
+                        'caps_lock': 115,   # KEYCODE_CAPS_LOCK
+                        'num_lock': 143,    # KEYCODE_NUM_LOCK
+                        'scroll_lock': 116, # KEYCODE_SCROLL_LOCK
+
+                        # Power
+                        'power': 26,        # KEYCODE_POWER
+
+                        # Camera
+                        'camera': 27,       # KEYCODE_CAMERA
+                        'camera_focus': 80, # KEYCODE_FOCUS
+
+                        # Search
+                        'search': 84,       # KEYCODE_SEARCH
+
+                        # Calculator
+                        'calculator': 210,  # KEYCODE_CALCULATOR
+
+                        # Notifications
+                        'notification': 83, # KEYCODE_NOTIFICATION
                     }
                     keycode = key_map.get(action)
                     if keycode:
@@ -1286,6 +1411,14 @@ class ScrcpyMCPHandler:
                         self._client.inject_keycode(keycode, AndroidKeyEventAction.DOWN)
                         self._client.inject_keycode(keycode, AndroidKeyEventAction.UP)
                         return True
+
+            elif event_type == 'text':
+                text = event[1]
+                logger.debug(f"Preview text: '{text}'")
+                # Use inject_text for all text input (ASCII and non-ASCII)
+                if hasattr(self._client, 'inject_text'):
+                    self._client.inject_text(text)
+                    return True
 
             return False
 
@@ -1420,12 +1553,82 @@ class ScrcpyMCPHandler:
                 logger.info(f"Connected: mode={connection_mode}, video={video}, audio={audio}")
                 return self._server
 
+            # Connection failed - check if ADB needs restart
             logger.error(f"Connection failed: {result}")
+
+            # Check for ADB-related errors and try to restart ADB server
+            if self._should_restart_adb(result):
+                logger.info("Attempting to restart ADB server due to connection failure...")
+                if self._restart_adb_server():
+                    # Retry connection once after ADB restart
+                    logger.info("ADB server restarted, retrying connection...")
+                    try:
+                        result = self._server.connect()
+                        if result.get("success"):
+                            logger.info("Connection succeeded after ADB restart!")
+                            return self._server
+                    except Exception as retry_e:
+                        logger.error(f"Retry after ADB restart failed: {retry_e}")
+
             return None
 
         except Exception as e:
             logger.exception(f"连接失败: {e}")
+
+            # Check if this is an ADB-related exception
+            if self._is_adb_error(e):
+                logger.info("Attempting to restart ADB server due to exception...")
+                self._restart_adb_server()
+
             return None
+
+    def _should_restart_adb(self, result: Dict) -> bool:
+        """Check if ADB server should be restarted based on connection result."""
+        if not result:
+            return False
+
+        error = result.get("error", "")
+        if isinstance(error, dict):
+            error = str(error)
+
+        # Common ADB issues that can be fixed by restart
+        adb_error_patterns = [
+            "device not found",
+            "device offline",
+            "unauthorized",
+            "connection refused",
+            "cannot connect",
+            "timeout",
+            "ADB server",
+            "protocol fault",
+            "closed",
+        ]
+
+        error_lower = error.lower()
+        return any(pattern in error_lower for pattern in adb_error_patterns)
+
+    def _is_adb_error(self, exception: Exception) -> bool:
+        """Check if an exception is ADB-related."""
+        error_str = str(exception).lower()
+        adb_error_patterns = [
+            "device not found",
+            "device offline",
+            "connection refused",
+            "timeout",
+            "adb",
+            "protocol fault",
+        ]
+        return any(pattern in error_str for pattern in adb_error_patterns)
+
+    def _restart_adb_server(self) -> bool:
+        """Restart ADB server."""
+        try:
+            from scrcpy_py_ddlx.core.adb import ADBManager
+            adb = ADBManager()
+            return adb.restart_adb_server()
+        except Exception as e:
+            logger.error(f"Failed to restart ADB server: {e}")
+            return False
 
     def call_tool(self, tool_name: str, arguments: Dict) -> Dict:
         """调用工具（线程安全）"""
@@ -1720,10 +1923,13 @@ class ScrcpyMCPHandler:
                                     try:
                                         decoder._output_nv12 = True
                                         logger.info("Direct SHM mode enabled: GPU NV12 rendering")
+                                        # Start control event reader (separate from frame sender)
+                                        self._start_control_event_reader()
                                     except Exception as e:
                                         decoder._output_nv12 = False
                                         logger.warning(f"GPU NV12 not available, falling back to CPU: {e}")
                                         logger.warning("CPU mode: NOT recommended for >2Mbps or >30fps due to GIL contention")
+                                        self._start_frame_sender()
                                 else:
                                     logger.warning("Decoder not found, falling back to frame_sender_thread")
                                     self._start_frame_sender()
@@ -2116,6 +2322,35 @@ class ScrcpyMCPHandler:
                         result_text = json.dumps(result_data, ensure_ascii=False, indent=2)
                         return {"content": [{"type": "text", "text": result_text}]}
                     except Exception as e:
+                        return {"content": [{"type": "text", "text": json.dumps({"success": False, "error": str(e)}, ensure_ascii=False)}]}
+
+                # restart_adb - 重启 ADB 服务器
+                if tool_name == "restart_adb":
+                    try:
+                        from scrcpy_py_ddlx.core.adb import ADBManager
+                        adb = ADBManager()
+
+                        logger.info("Restarting ADB server via MCP tool...")
+                        success = adb.restart_adb_server()
+
+                        if success:
+                            # Also check connection
+                            connection_ok = adb.check_adb_connection(max_retries=1)
+                            result_data = {
+                                "success": True,
+                                "message": "ADB server restarted successfully",
+                                "connection_ok": connection_ok
+                            }
+                        else:
+                            result_data = {
+                                "success": False,
+                                "error": "Failed to restart ADB server"
+                            }
+
+                        result_text = json.dumps(result_data, ensure_ascii=False, indent=2)
+                        return {"content": [{"type": "text", "text": result_text}]}
+                    except Exception as e:
+                        logger.error(f"restart_adb error: {e}")
                         return {"content": [{"type": "text", "text": json.dumps({"success": False, "error": str(e)}, ensure_ascii=False)}]}
 
                 # discover_devices 操作特殊处理 - 不需要先连接
@@ -2611,9 +2846,21 @@ async def on_startup():
             devices = list_result.get("devices", [])
 
             if not devices:
-                logger.error("[AUTO_CONNECT] No USB devices found! Connect device via USB first.")
-                print("[AUTO_CONNECT] No USB devices found! Connect device via USB first.")
-                return
+                # Try to restart ADB and retry
+                logger.warning("[AUTO_CONNECT] No devices found, attempting ADB restart...")
+                print("[AUTO_CONNECT] No devices found, attempting ADB restart...")
+
+                restart_result = await _execute_tool("restart_adb", {})
+                if restart_result.get("success"):
+                    # Retry device detection after ADB restart
+                    await asyncio.sleep(1.0)
+                    list_result = await _execute_tool("list_devices", {})
+                    devices = list_result.get("devices", [])
+
+                if not devices:
+                    logger.error("[AUTO_CONNECT] No USB devices found! Connect device via USB first.")
+                    print("[AUTO_CONNECT] No USB devices found! Connect device via USB first.")
+                    return
 
             device = devices[0]
             device_id = device.get("id") or device.get("serial")
@@ -2621,7 +2868,7 @@ async def on_startup():
             logger.info(f"[AUTO_CONNECT] Found USB device: {device_name} ({device_id})")
             print(f"[AUTO_CONNECT] Found USB device: {device_name}")
 
-            # Step 2: Push server via USB with auto_connect
+            # Step 2: Push server via USB (one-time mode)
             logger.info("[AUTO_CONNECT] Step 2: Pushing server via USB...")
             print("[AUTO_CONNECT] Step 2: Pushing server via USB...")
             push_params = {
@@ -2629,9 +2876,8 @@ async def on_startup():
                 "video": _enable_video,
                 "audio": DEFAULT_AUDIO_ENABLED,
                 "auto_connect": False,  # We'll connect manually via network
-                "persistent": True,  # Use persistent mode for hot-reconnect
             }
-            push_result = await _execute_tool("push_server", push_params)
+            push_result = await _execute_tool("push_server_onetime", push_params)
 
             if not push_result.get("success"):
                 logger.error(f"[AUTO_CONNECT] Push failed: {push_result.get('error')}")
@@ -2720,9 +2966,21 @@ async def on_startup():
             devices = list_result.get("devices", [])
 
             if not devices:
-                logger.error("[AUTO_CONNECT] No devices found!")
-                print("[AUTO_CONNECT] No devices found!")
-                return
+                # Try to restart ADB and retry
+                logger.warning("[AUTO_CONNECT] No devices found, attempting ADB restart...")
+                print("[AUTO_CONNECT] No devices found, attempting ADB restart...")
+
+                restart_result = await _execute_tool("restart_adb", {})
+                if restart_result.get("success"):
+                    # Retry device detection after ADB restart
+                    await asyncio.sleep(1.0)
+                    list_result = await _execute_tool("list_devices", {})
+                    devices = list_result.get("devices", [])
+
+                if not devices:
+                    logger.error("[AUTO_CONNECT] No devices found!")
+                    print("[AUTO_CONNECT] No devices found!")
+                    return
 
             # Get first device
             device = devices[0]
@@ -2873,11 +3131,11 @@ def on_shutdown():
     os._exit(0)
 
 
+# Simple app without lifespan events (lifespan="off" in uvicorn)
+# Auto-connect is handled in main() via background thread
 app = Starlette(
     debug=False,
-    routes=routes,
-    on_startup=[on_startup],
-    on_shutdown=[on_shutdown]
+    routes=routes
 )
 
 
@@ -3003,31 +3261,54 @@ def main():
     print("=" * 70)
     print("")
 
-    # 设置信号处理器 - 第二次 Ctrl+C 强制退出
+    # 设置信号处理器 - Ctrl+C 退出
     import signal
     import os
 
     def signal_handler(signum, frame):
-        """Handle Ctrl+C - force exit on second interrupt."""
-        if not hasattr(signal_handler, 'count'):
-            signal_handler.count = 0
-        signal_handler.count += 1
-
-        if signal_handler.count >= 2:
-            print("\n强制退出...")
-            os._exit(0)
-        else:
-            print("\n按 Ctrl+C 再次强制退出...")
+        """Handle Ctrl+C - graceful shutdown."""
+        print("\n收到退出信号，正在关闭...")
+        try:
+            on_shutdown()
+        except Exception as e:
+            logger.error(f"Shutdown error: {e}")
+        os._exit(0)
 
     signal.signal(signal.SIGINT, signal_handler)
 
-    # 启动服务器 - 使用更短的关闭超时
+    # Start auto-connect in background thread (since lifespan is disabled)
+    if _auto_connect or _network_device or _network_push_device:
+        import threading
+        import asyncio
+
+        def run_auto_connect():
+            """Run auto_connect in a separate thread with its own event loop."""
+            # Wait for server to start
+            import time
+            time.sleep(1.0)
+
+            # Create new event loop for this thread
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            try:
+                loop.run_until_complete(on_startup())
+            except Exception as e:
+                logger.error(f"Auto-connect error: {e}")
+            finally:
+                loop.close()
+
+        auto_connect_thread = threading.Thread(target=run_auto_connect, daemon=True)
+        auto_connect_thread.start()
+        logger.info("Auto-connect thread started")
+
+    # 启动服务器 - 禁用 lifespan 以避免 Windows 上的兼容性问题
     uvicorn.run(
         app,
         host=host,
         port=port,
         log_level="info",
-        timeout_graceful_shutdown=1  # 减少优雅关闭等待时间（默认5秒）
+        loop="asyncio",
+        lifespan="off"
     )
 
 

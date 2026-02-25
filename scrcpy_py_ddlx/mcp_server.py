@@ -485,6 +485,7 @@ class ScrcpyMCPServer:
         self,
         device_id: Optional[str] = None,
         audio: Optional[bool] = None,
+        audio_dup: Optional[bool] = None,
         tcpip: bool = False,
         stay_awake: bool = True,
     ) -> Dict[str, Any]:
@@ -493,6 +494,7 @@ class ScrcpyMCPServer:
         Args:
             device_id: ADB device ID (None for auto-connect)
             audio: Enable audio streaming (None uses default_config.audio)
+            audio_dup: Duplicate audio on device and computer (None uses default_config.audio_dup)
             tcpip: Enable TCP/IP wireless mode
             stay_awake: Keep device awake
 
@@ -502,6 +504,8 @@ class ScrcpyMCPServer:
         # Use default_config.audio if audio parameter is not specified
         if audio is None:
             audio = self._default_config.audio
+        if audio_dup is None:
+            audio_dup = self._default_config.audio_dup
         if self._client is not None and self._client.state.connected:
             return {
                 "success": False,
@@ -514,6 +518,7 @@ class ScrcpyMCPServer:
             show_window=False,
             control=True,
             audio=audio,
+            audio_dup=audio_dup,
             lazy_decode=self._default_config.lazy_decode,
             tcpip=tcpip,
             tcpip_auto_disconnect=False,
@@ -630,15 +635,26 @@ class ScrcpyMCPServer:
 
             frame = self._client.screenshot(filename, quality=quality)
 
+            # Handle NV12 dict format (from Direct SHM mode)
+            # Supports: {'y': ..., 'u': ..., 'v': ...} or {'nv12_bytes': ..., 'width': ..., 'height': ...}
+            if isinstance(frame, dict) and ('y' in frame or 'nv12_bytes' in frame):
+                # Convert NV12 dict to BGR for saving
+                frame = self._nv12_dict_to_bgr(frame)
+
+            if frame is None:
+                return {"success": False, "error": "No frame available"}
+
             result = {
                 "success": True,
-                "shape": list(frame.shape) if frame is not None else None,
+                "shape": list(frame.shape),
             }
 
             if filename:
                 result["filename"] = filename
+                # Save the frame
+                self._save_frame_to_file(frame, filename, quality)
 
-            if return_base64 and frame is not None:
+            if return_base64:
                 import io
 
                 # Try OpenCV first, fallback to Pillow
@@ -651,7 +667,7 @@ class ScrcpyMCPServer:
                     try:
                         from PIL import Image
 
-                        img = Image.fromarray(frame)
+                        img = Image.fromarray(frame[:, :, ::-1])  # BGR to RGB
                         buffer = io.BytesIO()
                         img.save(buffer, format="PNG")
                         img_bytes = buffer.getvalue()
@@ -669,6 +685,92 @@ class ScrcpyMCPServer:
         except Exception as e:
             self._logger.error(f"Screenshot error: {e}")
             return {"success": False, "error": str(e)}
+
+    def _nv12_dict_to_bgr(self, nv12_dict: dict) -> Optional["np.ndarray"]:
+        """Convert NV12 dict to BGR numpy array.
+
+        Supports two formats:
+        1. Y/U/V separate planes: {'y': array, 'u': array, 'v': array}
+        2. NV12 bytes with dimensions: {'nv12_bytes': bytes, 'width': int, 'height': int}
+
+        Args:
+            nv12_dict: Dict with NV12 format data
+
+        Returns:
+            BGR numpy array or None if conversion fails
+        """
+        try:
+            import cv2
+            import numpy as np
+
+            # Check for NV12 bytes format (Direct SHM mode)
+            nv12_bytes = nv12_dict.get('nv12_bytes')
+            if nv12_bytes is not None:
+                width = nv12_dict.get('width')
+                height = nv12_dict.get('height')
+                if width is None or height is None:
+                    self._logger.error("NV12 bytes format missing width/height")
+                    return None
+
+                # Convert bytes to numpy array
+                nv12_array = np.frombuffer(nv12_bytes, dtype=np.uint8)
+                nv12_array = nv12_array.reshape((height * 3 // 2, width))
+
+                # Convert NV12 to BGR
+                bgr = cv2.cvtColor(nv12_array, cv2.COLOR_YUV2BGR_NV12)
+                return bgr
+
+            # Original Y/U/V separate planes format
+            y = nv12_dict.get('y')
+            u = nv12_dict.get('u')
+            v = nv12_dict.get('v')
+
+            if y is None or u is None or v is None:
+                self._logger.error("NV12 dict missing y/u/v planes")
+                return None
+
+            height, width = y.shape
+
+            # Reconstruct UV plane from separate U and V
+            uv = np.zeros((height // 2, width), dtype=np.uint8)
+            uv[:, 0::2] = u  # U at even columns
+            uv[:, 1::2] = v  # V at odd columns
+
+            # Combine Y and UV to form NV12
+            nv12 = np.concatenate([y.flatten(), uv.flatten()])
+
+            # Convert NV12 to BGR using OpenCV
+            bgr = cv2.cvtColor(nv12.reshape((height * 3 // 2, width)), cv2.COLOR_YUV2BGR_NV12)
+
+            return bgr
+
+        except Exception as e:
+            self._logger.error(f"NV12 to BGR conversion error: {e}")
+            return None
+
+    def _save_frame_to_file(self, frame: "np.ndarray", filename: str, quality: int = 80) -> bool:
+        """Save frame to file.
+
+        Args:
+            frame: BGR numpy array
+            filename: Output filename
+            quality: JPEG quality (1-100)
+
+        Returns:
+            True if saved successfully
+        """
+        try:
+            import cv2
+
+            ext = filename.lower().split('.')[-1]
+            if ext in ('jpg', 'jpeg'):
+                cv2.imwrite(filename, frame, [cv2.IMWRITE_JPEG_QUALITY, quality])
+            else:
+                cv2.imwrite(filename, frame)
+            return True
+        except Exception as e:
+            self._logger.error(f"Failed to save frame: {e}")
+            return False
 
     # ==================== Clipboard ====================
 

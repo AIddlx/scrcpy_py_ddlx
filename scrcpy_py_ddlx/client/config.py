@@ -76,6 +76,7 @@ class ClientConfig:
     # Audio settings
     audio: bool = False
     audio_codec: int = OldAudioDemuxer.OPUS  # RAW, OPUS, AAC, FDK_AAC, FLAC
+    audio_dup: bool = False  # Duplicate audio: play on both device and computer (Android 11+)
 
     # Clipboard
     clipboard_autosync: bool = False

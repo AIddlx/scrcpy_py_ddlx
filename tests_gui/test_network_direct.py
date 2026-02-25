@@ -234,6 +234,8 @@ Server Lifecycle Modes:
                            help='Enable audio (default: disabled)')
     audio_group.add_argument('--no-audio', dest='audio_enabled', action='store_false',
                            help='Disable audio')
+    audio_group.add_argument('--audio-dup', dest='audio_dup', action='store_true',
+                           help='Duplicate audio: play on both device and computer (Android 11+)')
 
     parser.set_defaults(
         reuse_server=False,
@@ -242,6 +244,7 @@ Server Lifecycle Modes:
         stay_alive=False,
         max_connections=-1,
         audio_enabled=False,
+        audio_dup=False,
         bitrate_mode='vbr',
         show_details=False,
         low_latency=False,
@@ -502,9 +505,20 @@ def start_server(args):
     # Use 'sh -c' to properly handle environment variable and output redirection
     # This is critical for network mode - server must continue running after USB is unplugged
     audio_flag = "true" if args.audio_enabled else "false"
+    audio_source_flag = "playback" if args.audio_dup else "output"
+    audio_dup_flag = "true" if args.audio_dup else "false"
     stay_alive_flag = "true" if args.stay_alive else "false"
     low_latency_flag = "true" if args.low_latency else "false"
     skip_frames_flag = "true" if args.skip_frames else "false"
+
+    # Build audio parameters
+    if args.audio_enabled:
+        if args.audio_dup:
+            audio_params = f"audio=true audio_source=playback audio_dup=true"
+        else:
+            audio_params = f"audio=true audio_source=output"
+    else:
+        audio_params = "audio=false"
 
     server_cmd = (
         "CLASSPATH=/data/local/tmp/scrcpy-server.apk app_process / "
@@ -522,7 +536,7 @@ def start_server(args):
         server_cmd += f"max_connections={args.max_connections} "
 
     server_cmd += (
-        f"video=true audio={audio_flag} control=true send_device_meta=true send_dummy_byte=true cleanup=false"
+        f"video=true {audio_params} control=true send_device_meta=true send_dummy_byte=true cleanup=false"
     )
 
     # Wrap with nohup and sh -c for proper background execution
@@ -759,6 +773,7 @@ def main():
 
         # Audio settings
         audio=args.audio_enabled,  # Enable audio if requested
+        audio_dup=args.audio_dup,  # Duplicate audio on device and computer
 
         # Display settings
         show_window=True,

@@ -93,6 +93,7 @@ scrcpy_logger = logging.getLogger('scrcpy_py_ddlx')
 
 # 默认音频配置（可通过 --audio 命令行参数修改）
 DEFAULT_AUDIO_ENABLED = False
+DEFAULT_AUDIO_DUP = False
 
 # MCP 协议版本和服务器信息
 MCP_PROTOCOL_VERSION = "2024-11-05"
@@ -324,6 +325,7 @@ TOOLS = [
                 "device_id": {"type": "string", "description": "Device serial (optional, uses first USB device)"},
                 "video": {"type": "boolean", "default": False, "description": "Enable video (for preview/screenshot)"},
                 "audio": {"type": "boolean", "default": False, "description": "Enable audio (for recording)"},
+                "audio_dup": {"type": "boolean", "default": False, "description": "Duplicate audio: play on both device and computer (Android 11+)"},
                 "video_codec": {"type": "string", "enum": ["auto", "h264", "h265", "av1"], "default": "auto"},
                 "video_bitrate": {"type": "integer", "default": 8000000},
                 "max_fps": {"type": "integer", "default": 60},
@@ -340,6 +342,7 @@ TOOLS = [
                 "device_id": {"type": "string", "description": "Device serial (optional, uses first USB device)"},
                 "video": {"type": "boolean", "default": False, "description": "Enable video (for preview/screenshot)"},
                 "audio": {"type": "boolean", "default": False, "description": "Enable audio (for recording)"},
+                "audio_dup": {"type": "boolean", "default": False, "description": "Duplicate audio: play on both device and computer (Android 11+)"},
                 "video_codec": {"type": "string", "enum": ["auto", "h264", "h265", "av1"], "default": "auto"},
                 "video_bitrate": {"type": "integer", "default": 8000000},
                 "max_fps": {"type": "integer", "default": 60},
@@ -1451,6 +1454,7 @@ class ScrcpyMCPHandler:
         device_id = kwargs.get('device_id', None)
         video = kwargs.get('video', True)
         audio = kwargs.get('audio', DEFAULT_AUDIO_ENABLED)
+        audio_dup = kwargs.get('audio_dup', DEFAULT_AUDIO_DUP)  # Duplicate audio on device and computer
         codec = kwargs.get('codec', 'auto')
         bitrate = kwargs.get('bitrate', 8000000)
         max_fps = kwargs.get('max_fps', 60)
@@ -1502,6 +1506,7 @@ class ScrcpyMCPHandler:
                 # 媒体设置
                 video=video,
                 audio=audio,
+                audio_dup=audio_dup,
                 codec=codec,
                 bitrate=bitrate,
                 max_fps=max_fps,
@@ -1533,10 +1538,10 @@ class ScrcpyMCPHandler:
             # 连接
             if connection_mode == "network":
                 # 网络模式：直接连接
-                result = self._server.connect()
+                result = self._server.connect(audio_dup=audio_dup)
             else:
                 # ADB 隧道模式
-                result = self._server.connect(audio=audio)
+                result = self._server.connect(audio=audio, audio_dup=audio_dup)
 
             # 检查连接结果
             if result.get("success") or "Already connected" in str(result.get("error", "")):
@@ -2050,6 +2055,7 @@ class ScrcpyMCPHandler:
 
                         # 音频参数
                         audio_enabled = arguments.get("audio", False)
+                        audio_dup = arguments.get("audio_dup", False)
 
                         # FEC 参数
                         fec_enabled = arguments.get("fec_enabled", False)
@@ -2160,6 +2166,15 @@ class ScrcpyMCPHandler:
                             stay_alive_str = "true" if stay_alive else "false"
                             audio_str = "true" if audio_enabled else "false"
 
+                            # Build audio parameters
+                            if audio_enabled:
+                                if audio_dup:
+                                    audio_params = "audio=true audio_source=playback audio_dup=true"
+                                else:
+                                    audio_params = "audio=true audio_source=output"
+                            else:
+                                audio_params = "audio=false"
+
                             # 获取 discovery_port（用于 UDP 唤醒）
                             discovery_port = arguments.get("discovery_port", 27183)
 
@@ -2209,7 +2224,7 @@ class ScrcpyMCPHandler:
                                     server_cmd += f"fec_group_size={fec_group_size} fec_parity_count={fec_parity_count} "
 
                             server_cmd += (
-                                f"video={'true' if video_enabled else 'false'} audio={audio_str} control=true send_device_meta=true send_dummy_byte=true cleanup=false"
+                                f"video={'true' if video_enabled else 'false'} {audio_params} control=true send_device_meta=true send_dummy_byte=true cleanup=false"
                             )
 
                             shell_cmd = f"nohup sh -c '{server_cmd}' > /data/local/tmp/scrcpy_server.log 2>&1 &"
@@ -2232,7 +2247,7 @@ class ScrcpyMCPHandler:
                                 "status": "running" if server_started else "failed",
                                 "stay_alive": stay_alive,
                                 "ports": {"control": control_port, "video": video_port, "audio": audio_port},
-                                "video": {"codec": video_codec, "bitrate": video_bitrate, "max_fps": max_fps, "bitrate_mode": bitrate_mode},
+                                "video": {"codec": actual_codec, "bitrate": video_bitrate, "max_fps": max_fps, "bitrate_mode": bitrate_mode},  # Use actual_codec, not video_codec
                                 "audio": audio_enabled,
                                 "fec": {"enabled": fec_enabled, "video": video_fec_enabled, "audio": audio_fec_enabled}
                             }
@@ -2269,7 +2284,8 @@ class ScrcpyMCPHandler:
                                 "device_id": device_ip,
                                 "video": video_enabled,
                                 "audio": audio_enabled,
-                                "codec": video_codec,
+                                "audio_dup": audio_dup,  # Pass audio_dup to connection
+                                "codec": actual_codec,  # Use resolved codec, not "auto"
                                 "bitrate": video_bitrate,
                                 "max_fps": max_fps
                             }
@@ -2875,6 +2891,7 @@ async def on_startup():
                 "device_id": device_id,
                 "video": _enable_video,
                 "audio": DEFAULT_AUDIO_ENABLED,
+                "audio_dup": DEFAULT_AUDIO_DUP,
                 "auto_connect": False,  # We'll connect manually via network
             }
             push_result = await _execute_tool("push_server_onetime", push_params)
@@ -2887,6 +2904,12 @@ async def on_startup():
             logger.info("[AUTO_CONNECT] Server pushed successfully!")
             print("[AUTO_CONNECT] Server pushed successfully!")
 
+            # Get the actual codec used by the server
+            start_info = push_result.get("start", {})
+            video_info = start_info.get("video", {})
+            actual_codec = video_info.get("codec", "h265")  # Default to h265 if not found
+            logger.info(f"[AUTO_CONNECT] Server started with codec: {actual_codec}")
+
             # Step 3: Wait a bit for server to start
             await asyncio.sleep(1.0)
 
@@ -2898,6 +2921,8 @@ async def on_startup():
                 "device_id": device_ip,
                 "video": _enable_video,
                 "audio": DEFAULT_AUDIO_ENABLED,
+                "audio_dup": DEFAULT_AUDIO_DUP,
+                "codec": actual_codec,  # Use the same codec as the server
             }
             result = await _execute_tool("connect", connect_params)
 
@@ -2931,6 +2956,7 @@ async def on_startup():
                 "device_id": _network_device,
                 "video": _enable_video,
                 "audio": DEFAULT_AUDIO_ENABLED,
+                "audio_dup": DEFAULT_AUDIO_DUP,
             }
 
             # Call connect tool
@@ -2996,6 +3022,7 @@ async def on_startup():
                 "device_id": device_id,
                 "video": _enable_video,
                 "audio": DEFAULT_AUDIO_ENABLED,
+                "audio_dup": DEFAULT_AUDIO_DUP,
             }
 
             result = await _execute_tool("connect", params)
@@ -3161,6 +3188,12 @@ def main():
         help="Enable audio streaming by default (for recording)"
     )
     parser.add_argument(
+        "--audio-dup",
+        action="store_true",
+        default=False,
+        help="Duplicate audio: play on both device and computer (Android 11+)"
+    )
+    parser.add_argument(
         "--host",
         type=str,
         default="127.0.0.1",
@@ -3200,8 +3233,9 @@ def main():
     args = parser.parse_args()
 
     # 保存默认音频配置到全局变量
-    global DEFAULT_AUDIO_ENABLED
+    global DEFAULT_AUDIO_ENABLED, DEFAULT_AUDIO_DUP
     DEFAULT_AUDIO_ENABLED = args.audio
+    DEFAULT_AUDIO_DUP = args.audio_dup
 
     # 设置自动连接参数
     global _auto_connect, _auto_preview, _network_device, _network_push_device, _enable_video

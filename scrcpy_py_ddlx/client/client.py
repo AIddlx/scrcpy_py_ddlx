@@ -105,6 +105,7 @@ class ScrcpyClient:
         self._video_packet_queue = None
         self._audio_packet_queue = None
         self._heartbeat = None  # TCP control channel heartbeat
+        self._config_extradata = None  # Store config data for multi-process mode
 
         # Stop event for thread coordination
         self._stop_event = Event()
@@ -171,11 +172,27 @@ class ScrcpyClient:
             if connection_mode == "network":
                 connection_mode = "udp"  # Network mode uses UDP
 
-            # ========== STEP 2-9: CREATE ALL COMPONENTS ==========
-            self._component_factory = ComponentFactory(
-                self.config, self.state, video_socket, control_socket, audio_socket,
-                connection_mode=connection_mode
-            )
+            # Check if multi-process mode is enabled
+            if getattr(self.config, 'multiprocess', False) and connection_mode == "udp":
+                # Use multi-process component factory for GIL avoidance
+                from scrcpy_py_ddlx.client.multiprocess_components import MultiprocessComponentFactory
+                logger.info("Using multi-process decoder architecture (GIL avoidance)")
+
+                self._component_factory = MultiprocessComponentFactory(
+                    self.config, self.state, control_socket,
+                    audio_socket=audio_socket,
+                    video_port=self.config.video_port,
+                    connection_mode=connection_mode
+                )
+
+                # In multi-process mode, we need to handle initialization differently
+                return self._initialize_components_multiprocess()
+            else:
+                # Use standard single-process component factory
+                self._component_factory = ComponentFactory(
+                    self.config, self.state, video_socket, control_socket, audio_socket,
+                    connection_mode=connection_mode
+                )
 
             # Create control queue first
             self._control_queue = self._component_factory.create_control_queue()
@@ -303,6 +320,139 @@ class ScrcpyClient:
             self.disconnect()
             return False
 
+    def _initialize_components_multiprocess(self) -> bool:
+        """
+        Initialize components for multi-process decoder architecture.
+
+        This method handles the different initialization flow for multi-process mode:
+        1. Close main process's video socket (decoder process will bind it)
+        2. Create control queue
+        3. Create decoder process
+        4. Start decoder process
+        5. Create video window with SHM source
+        6. Create controller
+        7. Create device receiver
+        8. Create audio components (audio stays in main process)
+        9. Mark success
+        """
+        import time
+
+        try:
+            # Step 1: Create control queue first
+            self._control_queue = self._component_factory.create_control_queue()
+
+            # Step 2: Create decoder process with known codec/size and extradata
+            # Main process already read config packets, pass info to decoder
+            self._video_decoder = self._component_factory.create_decoder_process(
+                extradata=self._config_extradata
+            )
+            if self._video_decoder is None:
+                logger.error("Failed to create decoder process")
+                self.disconnect()
+                return False
+
+            # Step 3: Start decoder process (binds UDP port)
+            self._component_factory.start_decoder_process()
+
+            # Step 4: Wait for decoder to bind port
+            max_wait = 3.0
+            start_wait = time.time()
+            while time.time() - start_wait < max_wait:
+                if self._video_decoder.is_running():
+                    break
+                time.sleep(0.05)
+
+            # Step 5: NOW close main process's video socket
+            # Decoder process is already bound with SO_REUSEADDR, so no packet loss
+            if self.state.video_socket:
+                try:
+                    self.state.video_socket.close()
+                    logger.info("Closed main process video socket (decoder process already bound)")
+                except Exception as e:
+                    logger.warning(f"Error closing video socket: {e}")
+                self.state.video_socket = None
+                self.state.video_udp_socket = None
+
+            # Step 6: Wait for decoder to receive config packet and initialize
+            logger.info("Waiting for decoder to initialize from config packet...")
+            time.sleep(0.5)  # Give decoder time to receive config packet
+
+            if not self._video_decoder.is_running():
+                logger.error("Decoder process failed to start")
+                self.disconnect()
+                return False
+
+            logger.info("Decoder process started successfully")
+
+            # Step 7: Request keyframe (PLI - Picture Loss Indication)
+            # This tells the server to send a new keyframe immediately
+            # Critical because main process consumed initial config/keyframes
+            if self.state.control_socket:
+                try:
+                    self.reset_video()  # Sends RESET_VIDEO to request new keyframe
+                    logger.info("Requested keyframe (PLI) for decoder process")
+                except Exception as e:
+                    logger.warning(f"Failed to request keyframe: {e}")
+
+            # Step 8: Create video window with SHM source
+            if self.config.show_window:
+                self._video_window = self._component_factory.create_video_window(
+                    self._video_decoder, self._control_queue
+                )
+                if self._video_window is None:
+                    logger.warning("Failed to create video window, continuing without display")
+
+            # Step 9: Create controller
+            if self.config.control:
+                self._control_thread = self._component_factory.create_controller(
+                    self._control_loop
+                )
+
+            # Step 10: Create device receiver
+            device_receiver = self._component_factory.create_device_receiver(
+                self._on_clipboard_event
+            )
+            if device_receiver:
+                self._device_receiver = device_receiver
+                if self._screenshot_callback is not None:
+                    self._device_receiver._callbacks.on_screenshot = self._screenshot_callback
+
+            # Step 11: Create audio components if enabled (audio stays in main process)
+            # Audio demuxer must be created BEFORE audio decoder (for packet queue)
+            if self.config.audio:
+                self._audio_demuxer = self._component_factory.create_audio_demuxer()
+                if self._audio_demuxer:
+                    self._audio_decoder = self._component_factory.create_audio_decoder()
+                    if self._audio_decoder:
+                        self._audio_player = self._component_factory.create_audio_player(
+                            self._audio_decoder
+                        )
+                        # Start audio demuxer
+                        if not self.start_audio_demuxer():
+                            logger.warning("Audio demuxer failed to start, continuing without audio")
+
+            # Step 12: Success
+            self.state.connected = True
+            self.state.running = True
+            logger.info("Multi-process client initialized successfully")
+
+            # Start heartbeat if control socket available
+            if self.state.control_socket is not None:
+                self._start_heartbeat()
+
+            # Start clipboard sync if enabled
+            if self.config.clipboard_autosync:
+                self._start_clipboard_monitor()
+
+            return True
+
+        except Exception as e:
+            logger.error(f"Multi-process initialization failed: {e}")
+            import traceback
+            traceback.print_exc()
+            self.disconnect()
+            return False
+
     def connect_hot(self,
                     device_ip: str,
                     discovery_port: int = 27183,
@@ -424,7 +574,11 @@ class ScrcpyClient:
 
         # Stop decoders
         if self._video_decoder is not None:
-            self._video_decoder.stop()
+            # Check if it's a multi-process decoder (has close method)
+            if hasattr(self._video_decoder, 'close'):
+                self._video_decoder.close()  # Closes process and SHM
+            else:
+                self._video_decoder.stop()
             self._video_decoder = None
 
         if self._audio_decoder is not None:
@@ -1031,7 +1185,14 @@ class ScrcpyClient:
         # Build server parameters (following official scrcpy logic)
         # Note: audio=true is the default, so we only pass audio=false when disabled
         # Note: audio_source=output is the default, so we don't pass it
-        audio_params = "" if self.config.audio else "audio=false"
+        if self.config.audio:
+            if self.config.audio_dup:
+                audio_params = "audio=true audio_source=playback audio_dup=true"
+                logger.info(f"[AUDIO_DUP] Using audio_source=playback with audio_dup=true")
+            else:
+                audio_params = "audio=true"
+        else:
+            audio_params = "audio=false"
         stay_awake_params = "stay_awake=true" if self.config.stay_awake else ""
         clipboard_params = (
             "clipboard_autosync=true"
@@ -1246,9 +1407,13 @@ class ScrcpyClient:
         )
 
         # Start server
-        audio_params = (
-            f"audio=true audio_source=output" if self.config.audio else "audio=false"
-        )
+        if self.config.audio:
+            if self.config.audio_dup:
+                audio_params = "audio=true audio_source=playback audio_dup=true"
+            else:
+                audio_params = "audio=true audio_source=output"
+        else:
+            audio_params = "audio=false"
         stay_awake_params = "stay_awake=true" if self.config.stay_awake else ""
         clipboard_params = (
             "clipboard_autosync=true"
@@ -1456,7 +1621,44 @@ class ScrcpyClient:
                 self._send_client_configuration(capabilities)
 
         if self.config.video:
-            if self.state.network_mode:
+            # In multi-process mode, read config packets here and save for decoder process
+            if self.state.network_mode and getattr(self.config, 'multiprocess', False):
+                logger.info("Multi-process mode: reading config packets for decoder process")
+                self.state.video_socket.settimeout(5.0)
+
+                # Read first config packet (contains codec_id, width, height)
+                packet1, addr = self.state.video_socket.recvfrom(65507)
+                if len(packet1) >= 36:
+                    udp_flags = struct.unpack('>I', packet1[12:16])[0]
+                    pts_flags, payload_size = struct.unpack('>QI', packet1[24:36])
+                    config_data1 = packet1[36:36+payload_size] if len(packet1) >= 36+payload_size else b''
+
+                    if len(config_data1) >= 12:
+                        self.state.codec_id = struct.unpack('>I', config_data1[0:4])[0]
+                        width = struct.unpack('>I', config_data1[4:8])[0]
+                        height = struct.unpack('>I', config_data1[8:12])[0]
+                        self.state.device_size = (width, height)
+                        logger.info(f"Config packet #1: codec={hex(self.state.codec_id)}, size={width}x{height}")
+
+                # Read second config packet (contains extradata/SPS/PPS)
+                self.state.video_socket.settimeout(2.0)
+                try:
+                    packet2, addr = self.state.video_socket.recvfrom(65507)
+                    if len(packet2) >= 36:
+                        udp_flags2 = struct.unpack('>I', packet2[12:16])[0]
+                        pts_flags2, payload_size2 = struct.unpack('>QI', packet2[24:36])
+                        config_data2 = packet2[36:36+payload_size2] if len(packet2) >= 36+payload_size2 else b''
+
+                        # Second config packet is SPS/PPS data (no video header prefix)
+                        # Use it directly as extradata
+                        if len(config_data2) > 0:
+                            self._config_extradata = config_data2
+                            logger.info(f"Config packet #2: SPS/PPS={len(self._config_extradata)} bytes")
+                except socket.timeout:
+                    logger.warning("Second config packet not received (may be okay)")
+
+                logger.info(f"Multi-process mode: config packets saved, extradata={len(self._config_extradata) if self._config_extradata else 0} bytes")
+            elif self.state.network_mode:
                 # Network UDP mode: codec/size comes in a UDP packet
                 # Format: [UDP Header: 16B] [Scrcpy Header: 12B] [Config Payload: 12B]
                 self.state.video_socket.settimeout(5.0)
@@ -1495,6 +1697,11 @@ class ScrcpyClient:
 
                 self.state.codec_id = codec_id
                 self.state.device_size = (width, height)
+
+                # Save extradata for multi-process mode (codec specific data after first 12 bytes)
+                if len(payload_bytes) > 12:
+                    self._config_extradata = payload_bytes[12:]
+                    logger.debug(f"Saved config extradata: {len(self._config_extradata)} bytes")
 
                 logger.info(f"Codec ID: 0x{codec_id:08x}")
                 logger.info(f"Video size: {width}x{height}")
@@ -2585,7 +2792,7 @@ class ScrcpyClient:
         Uses a background thread to avoid blocking the Qt event loop.
 
         Args:
-            frame: RGB numpy array from video decoder (VideoDecoder returns RGB)
+            frame: BGR numpy array (already converted from NV12 if needed)
             filename: Output filename
             quality: JPEG quality (1-100), only used for .jpg/.jpeg files
         """
@@ -2598,31 +2805,30 @@ class ScrcpyClient:
 
                 start = time.time()
 
-                # Use OpenCV
+                # Use OpenCV (expects BGR, which is what we have now)
                 import cv2
-
-                # Convert RGB to BGR for OpenCV (decoder returns RGB, cv2.imwrite expects BGR)
-                frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
 
                 # Determine format from extension
                 if filename.lower().endswith(".jpg") or filename.lower().endswith(
                     ".jpeg"
                 ):
                     # JPEG format with configurable quality
-                    cv2.imwrite(filename, frame_bgr, [cv2.IMWRITE_JPEG_QUALITY, quality])
+                    cv2.imwrite(filename, frame, [cv2.IMWRITE_JPEG_QUALITY, quality])
                 else:
                     # Default to PNG for quality
-                    cv2.imwrite(filename, frame_bgr)
+                    cv2.imwrite(filename, frame)
 
                 elapsed = time.time() - start
                 logger.info(f"Screenshot saved: {filename} ({elapsed * 1000:.1f}ms)")
             except ImportError:
-                # Fallback to Pillow (PIL expects RGB, which is what we have)
+                # Fallback to Pillow (PIL expects RGB, convert from BGR)
                 try:
                     from PIL import Image
                     import numpy as np
 
-                    img = Image.fromarray(frame)  # frame is already RGB
+                    # Convert BGR to RGB for PIL
+                    frame_rgb = frame[:, :, ::-1]
+                    img = Image.fromarray(frame_rgb)
                     img.save(filename)
                     logger.info(f"Screenshot saved: {filename} (via Pillow)")
                 except ImportError:
@@ -2730,6 +2936,11 @@ class ScrcpyClient:
         if frame is None:
             frame = self._video_decoder.get_frame_nowait()
 
+        # Handle NV12 dict format (Direct SHM mode)
+        # Supports: {'y': ..., 'u': ..., 'v': ...} or {'nv12_bytes': ..., 'width': ..., 'height': ...}
+        if isinstance(frame, dict) and ('y' in frame or 'nv12_bytes' in frame):
+            frame = self._nv12_dict_to_bgr(frame)
+
         if frame is not None and filename:
             # Save asynchronously in background thread (non-blocking!)
             self._save_frame_async(frame, filename, quality)
@@ -2740,6 +2951,62 @@ class ScrcpyClient:
             self.disable_video()
 
         return frame
+
+    def _nv12_dict_to_bgr(self, nv12_dict: dict):
+        """Convert NV12 dict to BGR numpy array.
+
+        Supports two formats:
+        1. Y/U/V separate planes: {'y': array, 'u': array, 'v': array}
+        2. NV12 bytes with dimensions: {'nv12_bytes': bytes, 'width': int, 'height': int}
+        """
+        try:
+            import cv2
+            import numpy as np
+
+            # Check for NV12 bytes format (Direct SHM mode)
+            nv12_bytes = nv12_dict.get('nv12_bytes')
+            if nv12_bytes is not None:
+                width = nv12_dict.get('width')
+                height = nv12_dict.get('height')
+                if width is None or height is None:
+                    logger.error("NV12 bytes format missing width/height")
+                    return None
+
+                # Convert bytes to numpy array
+                nv12_array = np.frombuffer(nv12_bytes, dtype=np.uint8)
+                nv12_array = nv12_array.reshape((height * 3 // 2, width))
+
+                # Convert NV12 to BGR
+                bgr = cv2.cvtColor(nv12_array, cv2.COLOR_YUV2BGR_NV12)
+                return bgr
+
+            # Original Y/U/V separate planes format
+            y = nv12_dict.get('y')
+            u = nv12_dict.get('u')
+            v = nv12_dict.get('v')
+
+            if y is None or u is None or v is None:
+                logger.error("NV12 dict missing y/u/v planes")
+                return None
+
+            height, width = y.shape
+
+            # Reconstruct UV plane from separate U and V
+            uv = np.zeros((height // 2, width), dtype=np.uint8)
+            uv[:, 0::2] = u  # U at even columns
+            uv[:, 1::2] = v  # V at odd columns
+
+            # Combine Y and UV to form NV12
+            nv12 = np.concatenate([y.flatten(), uv.flatten()])
+
+            # Convert NV12 to BGR using OpenCV
+            bgr = cv2.cvtColor(nv12.reshape((height * 3 // 2, width)), cv2.COLOR_YUV2BGR_NV12)
+
+            return bgr
+
+        except Exception as e:
+            logger.error(f"NV12 to BGR conversion error: {e}")
+            return None
 
     def screenshot_network_standalone(
         self, filename: Optional[str] = None, timeout: float = 10.0

@@ -35,6 +35,7 @@ class NetworkConnection:
     control_socket: Optional[socket.socket] = None
     video_socket: Optional[socket.socket] = None
     audio_socket: Optional[socket.socket] = None
+    file_socket: Optional[socket.socket] = None  # TCP file transfer socket
     client_address: Optional[str] = None
 
 
@@ -91,7 +92,8 @@ class ConnectionManager:
 
     @staticmethod
     def setup_network_mode(host: str, control_port: int, video_port: int,
-                           audio_port: int, send_dummy_byte: bool = True) -> NetworkConnection:
+                           audio_port: int, file_port: int = 0,
+                           send_dummy_byte: bool = True) -> NetworkConnection:
         """
         Setup network mode connection.
 
@@ -100,6 +102,7 @@ class ConnectionManager:
             control_port: TCP control port
             video_port: UDP video port
             audio_port: UDP audio port
+            file_port: TCP file transfer port (0 = disabled)
             send_dummy_byte: Whether to wait for dummy byte
 
         Returns:
@@ -127,8 +130,46 @@ class ConnectionManager:
                 raise ConnectionError("No dummy byte received")
             logger.debug("Received dummy byte from control channel")
 
+        # Create TCP file server socket (client listens, server connects)
+        if file_port > 0:
+            conn.file_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            conn.file_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            conn.file_socket.bind(('0.0.0.0', file_port))
+            conn.file_socket.listen(1)
+            conn.file_socket.settimeout(30.0)  # 30 second timeout for server to connect
+            logger.info(f"File socket listening on 0.0.0.0:{file_port}")
+
         conn.client_address = host
         logger.info(f"Network mode connected: control={host}:{control_port}, "
-                   f"video=0.0.0.0:{video_port}, audio=0.0.0.0:{audio_port}")
+                   f"video=0.0.0.0:{video_port}, audio=0.0.0.0:{audio_port}, file=0.0.0.0:{file_port}")
 
         return conn
+
+    @staticmethod
+    def accept_file_connection(conn: NetworkConnection, timeout: float = 30.0) -> Optional[socket.socket]:
+        """
+        Accept file socket connection from server.
+
+        Args:
+            conn: NetworkConnection with file_socket listening
+            timeout: Accept timeout in seconds
+
+        Returns:
+            Accepted file socket or None if failed
+        """
+        if conn.file_socket is None:
+            return None
+
+        try:
+            conn.file_socket.settimeout(timeout)
+            client_sock, addr = conn.file_socket.accept()
+            conn.file_socket.close()  # Close the listening socket
+            conn.file_socket = client_sock  # Replace with connected socket
+            logger.info(f"File socket connected from {addr}")
+            return client_sock
+        except socket.timeout:
+            logger.warning(f"File socket accept timeout after {timeout}s")
+            return None
+        except Exception as e:
+            logger.error(f"File socket accept error: {e}")
+            return None

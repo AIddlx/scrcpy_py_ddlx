@@ -107,6 +107,7 @@ class ClientConfig:
     control_port: int = 27184  # TCP control port (network mode)
     video_port: int = 27185  # UDP video port (network mode)
     audio_port: int = 27186  # UDP audio port (network mode)
+    file_port: int = 27187  # TCP file transfer port (network mode)
     discovery_port: int = 27183  # UDP discovery port
 
     # FEC (Forward Error Correction) settings for UDP mode

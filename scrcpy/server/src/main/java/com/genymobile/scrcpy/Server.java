@@ -195,9 +195,11 @@ public final class Server {
                             options.getControlPort(),
                             options.getVideoPort(),
                             options.getAudioPort(),
+                            options.getFilePort(),
                             options.getVideo(),
                             options.getAudio(),
                             options.getControl(),
+                            true,  // file always enabled
                             options.getSendDummyByte()
                     );
 
@@ -451,6 +453,7 @@ public final class Server {
         boolean audio = options.getAudio();
         boolean sendDummyByte = options.getSendDummyByte();
         boolean networkMode = options.isNetworkMode();
+        boolean file = true;  // File transfer is always enabled
 
         if (networkMode) {
             Ln.i("Starting in network mode (TCP direct connection)");
@@ -458,13 +461,15 @@ public final class Server {
                     options.getControlPort(),
                     options.getVideoPort(),
                     options.getAudioPort(),
+                    options.getFilePort(),
                     video,
                     audio,
                     control,
+                    file,
                     sendDummyByte
             );
         } else {
-            return DesktopConnection.open(scid, tunnelForward, video, audio, control, sendDummyByte);
+            return DesktopConnection.open(scid, tunnelForward, video, audio, control, file, sendDummyByte);
         }
     }
 

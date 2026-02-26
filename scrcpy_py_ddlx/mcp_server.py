@@ -419,6 +419,106 @@ class ScrcpyMCPServer:
                     },
                 },
             },
+            # ==================== File Transfer ====================
+            "open_file_channel": {
+                "description": "Open a file transfer channel to the device",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "timeout": {
+                            "type": "number",
+                            "description": "Timeout in seconds (default: 10)",
+                            "default": 10.0,
+                        },
+                    },
+                },
+            },
+            "list_dir": {
+                "description": "List files and directories on the device",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": "Directory path on device (default: /sdcard)",
+                            "default": "/sdcard",
+                        },
+                    },
+                },
+            },
+            "pull_file": {
+                "description": "Download a file from the device to PC",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "device_path": {
+                            "type": "string",
+                            "description": "File path on device (e.g., /sdcard/Download/file.txt)",
+                        },
+                        "local_path": {
+                            "type": "string",
+                            "description": "Local path to save the file",
+                        },
+                    },
+                    "required": ["device_path", "local_path"],
+                },
+            },
+            "push_file": {
+                "description": "Upload a file from PC to the device",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "local_path": {
+                            "type": "string",
+                            "description": "Local file path on PC",
+                        },
+                        "device_path": {
+                            "type": "string",
+                            "description": "Target path on device (e.g., /sdcard/Download/file.txt)",
+                        },
+                    },
+                    "required": ["local_path", "device_path"],
+                },
+            },
+            "delete_file": {
+                "description": "Delete a file or directory on the device",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "device_path": {
+                            "type": "string",
+                            "description": "Path to delete on device",
+                        },
+                    },
+                    "required": ["device_path"],
+                },
+            },
+            "make_dir": {
+                "description": "Create a directory on the device",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "device_path": {
+                            "type": "string",
+                            "description": "Directory path to create",
+                        },
+                    },
+                    "required": ["device_path"],
+                },
+            },
+            "file_stat": {
+                "description": "Get file information on the device",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "device_path": {
+                            "type": "string",
+                            "description": "File or directory path",
+                        },
+                    },
+                    "required": ["device_path"],
+                },
+            },
         }
 
     def _setup_logging(
@@ -530,6 +630,7 @@ class ScrcpyMCPServer:
             control_port=self._default_config.control_port,
             video_port=self._default_config.video_port,
             audio_port=self._default_config.audio_port,
+            file_port=self._default_config.file_port,
             discovery_port=self._default_config.discovery_port,
             # Inherit media settings (CRITICAL: these were missing!)
             bitrate=self._default_config.bitrate,
@@ -1617,6 +1718,264 @@ class ScrcpyMCPServer:
             return result
         except Exception as e:
             self._logger.error(f"Screenshot standalone error: {e}")
+            return {"success": False, "error": str(e)}
+
+    # ==================== File Transfer ====================
+
+    def open_file_channel(self, timeout: float = 10.0) -> Dict[str, Any]:
+        """Open a file transfer channel to the device
+
+        Args:
+            timeout: Timeout in seconds
+
+        Returns:
+            Dictionary with result
+        """
+        if self._client is None or not self._client.state.connected:
+            return {"success": False, "error": "Not connected"}
+
+        try:
+            # Check if already open
+            if self._client.file_channel is not None and self._client.file_channel.is_connected():
+                return {"success": True, "message": "File channel already open"}
+
+            success = self._client.open_file_channel(timeout=timeout)
+            if success:
+                return {"success": True, "message": "File channel opened"}
+            else:
+                return {"success": False, "error": "Failed to open file channel (timeout)"}
+        except Exception as e:
+            self._logger.error(f"Open file channel error: {e}")
+            return {"success": False, "error": str(e)}
+
+    def list_dir(self, path: str = "/sdcard") -> Dict[str, Any]:
+        """List files and directories on the device
+
+        Args:
+            path: Directory path on device
+
+        Returns:
+            Dictionary with file list
+        """
+        if self._client is None or not self._client.state.connected:
+            return {"success": False, "error": "Not connected"}
+
+        try:
+            # Ensure file channel is open
+            if self._client.file_channel is None or not self._client.file_channel.is_connected():
+                open_result = self.open_file_channel()
+                if not open_result.get("success"):
+                    return open_result
+
+            fc = self._client.file_channel
+            files = fc.list_dir(path)
+
+            entries = []
+            for f in files:
+                entries.append({
+                    "name": f.name,
+                    "type": f.type,
+                    "size": f.size,
+                    "mtime": f.mtime,
+                })
+
+            return {
+                "success": True,
+                "path": path,
+                "entries": entries,
+                "count": len(entries),
+            }
+        except Exception as e:
+            self._logger.error(f"List dir error: {e}")
+            return {"success": False, "error": str(e)}
+
+    def pull_file(self, device_path: str, local_path: str) -> Dict[str, Any]:
+        """Download a file from the device to PC
+
+        Args:
+            device_path: File path on device
+            local_path: Local path to save the file
+
+        Returns:
+            Dictionary with result
+        """
+        if self._client is None or not self._client.state.connected:
+            return {"success": False, "error": "Not connected"}
+
+        try:
+            # Ensure file channel is open
+            if self._client.file_channel is None or not self._client.file_channel.is_connected():
+                open_result = self.open_file_channel()
+                if not open_result.get("success"):
+                    return open_result
+
+            fc = self._client.file_channel
+
+            def on_progress(received: int, total: int):
+                self._logger.debug(f"Pull progress: {received}/{total} bytes")
+
+            fc.pull_file(device_path, local_path, on_progress=on_progress)
+
+            # Get file size
+            from pathlib import Path
+            local_file = Path(local_path)
+            size = local_file.stat().st_size if local_file.exists() else 0
+
+            return {
+                "success": True,
+                "device_path": device_path,
+                "local_path": local_path,
+                "size": size,
+            }
+        except Exception as e:
+            self._logger.error(f"Pull file error: {e}")
+            return {"success": False, "error": str(e)}
+
+    def push_file(self, local_path: str, device_path: str) -> Dict[str, Any]:
+        """Upload a file from PC to the device
+
+        Args:
+            local_path: Local file path on PC
+            device_path: Target path on device
+
+        Returns:
+            Dictionary with result
+        """
+        if self._client is None or not self._client.state.connected:
+            return {"success": False, "error": "Not connected"}
+
+        try:
+            from pathlib import Path
+
+            # Check local file exists
+            local_file = Path(local_path)
+            if not local_file.exists():
+                return {"success": False, "error": f"Local file not found: {local_path}"}
+
+            # Ensure file channel is open
+            if self._client.file_channel is None or not self._client.file_channel.is_connected():
+                open_result = self.open_file_channel()
+                if not open_result.get("success"):
+                    return open_result
+
+            fc = self._client.file_channel
+
+            def on_progress(sent: int, total: int):
+                self._logger.debug(f"Push progress: {sent}/{total} bytes")
+
+            fc.push_file(local_path, device_path, on_progress=on_progress)
+
+            return {
+                "success": True,
+                "local_path": local_path,
+                "device_path": device_path,
+                "size": local_file.stat().st_size,
+            }
+        except Exception as e:
+            self._logger.error(f"Push file error: {e}")
+            return {"success": False, "error": str(e)}
+
+    def delete_file(self, device_path: str) -> Dict[str, Any]:
+        """Delete a file or directory on the device
+
+        Args:
+            device_path: Path to delete
+
+        Returns:
+            Dictionary with result
+        """
+        if self._client is None or not self._client.state.connected:
+            return {"success": False, "error": "Not connected"}
+
+        try:
+            # Ensure file channel is open
+            if self._client.file_channel is None or not self._client.file_channel.is_connected():
+                open_result = self.open_file_channel()
+                if not open_result.get("success"):
+                    return open_result
+
+            fc = self._client.file_channel
+            success = fc.delete(device_path)
+
+            return {
+                "success": success,
+                "device_path": device_path,
+            }
+        except Exception as e:
+            self._logger.error(f"Delete file error: {e}")
+            return {"success": False, "error": str(e)}
+
+    def make_dir(self, device_path: str) -> Dict[str, Any]:
+        """Create a directory on the device
+
+        Args:
+            device_path: Directory path to create
+
+        Returns:
+            Dictionary with result
+        """
+        if self._client is None or not self._client.state.connected:
+            return {"success": False, "error": "Not connected"}
+
+        try:
+            # Ensure file channel is open
+            if self._client.file_channel is None or not self._client.file_channel.is_connected():
+                open_result = self.open_file_channel()
+                if not open_result.get("success"):
+                    return open_result
+
+            fc = self._client.file_channel
+            success = fc.mkdir(device_path)
+
+            return {
+                "success": success,
+                "device_path": device_path,
+            }
+        except Exception as e:
+            self._logger.error(f"Make dir error: {e}")
+            return {"success": False, "error": str(e)}
+
+    def file_stat(self, device_path: str) -> Dict[str, Any]:
+        """Get file information on the device
+
+        Args:
+            device_path: File or directory path
+
+        Returns:
+            Dictionary with file info
+        """
+        if self._client is None or not self._client.state.connected:
+            return {"success": False, "error": "Not connected"}
+
+        try:
+            # Ensure file channel is open
+            if self._client.file_channel is None or not self._client.file_channel.is_connected():
+                open_result = self.open_file_channel()
+                if not open_result.get("success"):
+                    return open_result
+
+            fc = self._client.file_channel
+            info = fc.stat(device_path)
+
+            if info is None:
+                return {
+                    "success": True,
+                    "exists": False,
+                    "path": device_path,
+                }
+
+            return {
+                "success": True,
+                "exists": True,
+                "path": device_path,
+                "type": info.get("type"),
+                "size": info.get("size"),
+                "mtime": info.get("mtime"),
+                "canRead": info.get("canRead"),
+                "canWrite": info.get("canWrite"),
+            }
+        except Exception as e:
+            self._logger.error(f"File stat error: {e}")
             return {"success": False, "error": str(e)}
 
     # ==================== App Control ====================

@@ -28,6 +28,7 @@ from scrcpy_py_ddlx.core.protocol import (
 from scrcpy_py_ddlx.core.keycode import KeyCode
 from scrcpy_py_ddlx.core.stream import StreamParser
 from scrcpy_py_ddlx.core.control import ControlMessage
+from scrcpy_py_ddlx.core.file import FileChannel, FileChannelError
 from scrcpy_py_ddlx.core.negotiation import (
     DeviceCapabilities,
     ClientConfiguration,
@@ -106,6 +107,13 @@ class ScrcpyClient:
         self._audio_packet_queue = None
         self._heartbeat = None  # TCP control channel heartbeat
         self._config_extradata = None  # Store config data for multi-process mode
+
+        # File transfer
+        self._file_channel: Optional[FileChannel] = None  # Network mode only
+        self._file_channel_ready = Event()
+        self._file_ops = None  # ADB mode: FileOps instance (lazy init)
+        self._file_conn = None  # NetworkConnection with file_socket
+        self._file_socket: Optional[socket.socket] = None  # Connected file socket
 
         # Stop event for thread coordination
         self._stop_event = Event()
@@ -531,6 +539,9 @@ class ScrcpyClient:
             self._heartbeat.stop()
             self._heartbeat = None
 
+        # Close file channel
+        self._close_file_channel()
+
         # ========== Cleanup in reverse order ==========
 
         # Stop demuxers first (reverse of start)
@@ -718,6 +729,7 @@ class ScrcpyClient:
         # Wire up PONG callback to device receiver
         if self._device_receiver is not None:
             self._device_receiver._callbacks.on_pong = self._on_pong_received
+            self._device_receiver._callbacks.on_file_channel_info = self._on_file_channel_info
 
     def _send_ping(self, timestamp: int) -> None:
         """
@@ -758,6 +770,267 @@ class ScrcpyClient:
                 self._video_window.close()
             except Exception:
                 pass
+
+    # ===== File operations (hybrid: ADB mode vs Network mode) =====
+
+    def _get_file_ops(self):
+        """
+        Get file operations handler for ADB mode.
+
+        Returns:
+            FileOps for ADB mode, None for network mode
+        """
+        if self.state.network_mode:
+            # Network mode: use file channel (handled separately)
+            return None
+        else:
+            # ADB mode: use ADB commands
+            if self._file_ops is None:
+                from scrcpy_py_ddlx.core.file import FileOps
+                from scrcpy_py_ddlx.core.adb import ADBManager
+                self._file_ops = FileOps(ADBManager(), self.state.device_serial)
+            return self._file_ops
+
+    def list_dir(self, path: str = "/sdcard") -> List[dict]:
+        """
+        List directory contents.
+
+        Args:
+            path: Directory path on device
+
+        Returns:
+            List of file info dicts
+        """
+        if self.state.network_mode:
+            # Network mode: use file channel
+            if not self._ensure_file_channel():
+                raise RuntimeError("Failed to open file channel")
+            files = self._file_channel.list_dir(path)
+            return [{"name": f.name, "type": f.type, "size": f.size, "mtime": f.mtime} for f in files]
+        else:
+            # ADB mode: use adb shell
+            ops = self._get_file_ops()
+            if ops is None:
+                raise RuntimeError("File operations not available (device not connected)")
+            files = ops.list_dir(path)
+            return [{"name": f.name, "type": f.type, "size": f.size, "mtime": f.mtime} for f in files]
+
+    def pull_file(self, device_path: str, local_path: str,
+                  on_progress=None) -> bool:
+        """
+        Download a file from the device.
+
+        Args:
+            device_path: File path on device
+            local_path: Local file path to save
+
+        Returns:
+            True if successful
+        """
+        if self.state.network_mode:
+            if not self._ensure_file_channel():
+                raise RuntimeError("Failed to open file channel")
+            self._file_channel.pull_file(device_path, local_path, on_progress)
+        else:
+            ops = self._get_file_ops()
+            if ops is None:
+                raise RuntimeError("File operations not available (device not connected)")
+            ops.pull_file(device_path, local_path, on_progress)
+        return True
+
+    def push_file(self, local_path: str, device_path: str,
+                  on_progress=None) -> bool:
+        """
+        Upload a file to the device.
+
+        Args:
+            local_path: Local file path
+            device_path: Target path on device
+
+        Returns:
+            True if successful
+        """
+        if self.state.network_mode:
+            if not self._ensure_file_channel():
+                raise RuntimeError("Failed to open file channel")
+            self._file_channel.push_file(local_path, device_path, on_progress)
+        else:
+            ops = self._get_file_ops()
+            if ops is None:
+                raise RuntimeError("File operations not available (device not connected)")
+            ops.push_file(local_path, device_path, on_progress)
+        return True
+
+    def delete_file(self, device_path: str) -> bool:
+        """Delete a file or directory on the device."""
+        if self.state.network_mode:
+            if not self._ensure_file_channel():
+                raise RuntimeError("Failed to open file channel")
+            return self._file_channel.delete(device_path)
+        else:
+            ops = self._get_file_ops()
+            if ops is None:
+                raise RuntimeError("File operations not available (device not connected)")
+            return ops.delete(device_path)
+
+    def make_dir(self, device_path: str) -> bool:
+        """Create a directory on the device."""
+        if self.state.network_mode:
+            if not self._ensure_file_channel():
+                raise RuntimeError("Failed to open file channel")
+            return self._file_channel.mkdir(device_path)
+        else:
+            ops = self._get_file_ops()
+            if ops is None:
+                raise RuntimeError("File operations not available (device not connected)")
+            return ops.mkdir(device_path)
+
+    def file_stat(self, device_path: str) -> Optional[dict]:
+        """Get file information."""
+        if self.state.network_mode:
+            if not self._ensure_file_channel():
+                raise RuntimeError("Failed to open file channel")
+            return self._file_channel.stat(device_path)
+        else:
+            ops = self._get_file_ops()
+            if ops is None:
+                raise RuntimeError("File operations not available (device not connected)")
+            return ops.stat(device_path)
+
+    # ===== File channel (network mode only) =====
+
+    def _start_file_socket_accept(self):
+        """Start background thread to accept file socket connection."""
+        if self._file_conn is None or self._file_conn.file_socket is None:
+            return
+
+        def _accept_thread():
+            try:
+                logger.debug("File socket accept thread started")
+                self._file_socket = ConnectionManager.accept_file_connection(
+                    self._file_conn, timeout=30.0
+                )
+                if self._file_socket is not None:
+                    logger.info("File socket accepted in background")
+            except Exception as e:
+                logger.error(f"File socket accept error: {e}")
+
+        thread = threading.Thread(target=_accept_thread, daemon=True, name="FileSocketAccept")
+        thread.start()
+
+    def _ensure_file_channel(self) -> bool:
+        """Ensure file channel is open (network mode only)."""
+        if not self.state.network_mode:
+            return False
+
+        if self._file_channel is not None and self._file_channel.is_connected():
+            return True
+
+        # Check if background accept completed
+        if self._file_socket is not None:
+            # Create FileChannel with pre-connected socket
+            self._file_channel = FileChannel()
+            self._file_channel.set_connected_socket(self._file_socket)
+            self._file_channel_ready.set()
+            logger.info("File channel ready via pre-established socket")
+            return True
+
+        # File socket not yet connected (background accept still running or failed)
+        logger.warning("File socket not yet connected")
+        return False
+
+    def _on_file_channel_info(self, port: int, session_id: int) -> None:
+        """Called when FILE_CHANNEL_INFO message is received (network mode)."""
+        try:
+            host = self._get_server_host()
+            logger.info(f"File channel info received: {host}:{port}, session_id={session_id}")
+
+            self._file_channel = FileChannel()
+            if self._file_channel.connect(host, port, session_id):
+                self._file_channel_ready.set()
+                logger.info(f"File channel ready: {host}:{port}")
+            else:
+                logger.error("Failed to connect file channel")
+                self._file_channel = None
+
+        except Exception as e:
+            logger.error(f"Error setting up file channel: {e}")
+            self._file_channel = None
+
+    def _get_server_host(self) -> str:
+        """Get the server host address from the control connection."""
+        if self.state.control_socket is not None:
+            try:
+                return self.state.control_socket.getpeername()[0]
+            except Exception:
+                pass
+        return "127.0.0.1"
+
+    def _open_file_channel(self, timeout: float = 10.0) -> bool:
+        """Open file channel (network mode only)."""
+        if not self.state.network_mode:
+            logger.warning("File channel only available in network mode")
+            return False
+
+        if self._file_channel is not None and self._file_channel.is_connected():
+            return True
+
+        # Reset the ready event
+        self._file_channel_ready.clear()
+
+        # Send OPEN_FILE_CHANNEL request
+        msg = ControlMessage(ControlMessageType.OPEN_FILE_CHANNEL)
+        msg.set_open_file_channel()
+
+        try:
+            success = self._control_queue.put(msg)
+            if not success:
+                logger.error("Failed to put OPEN_FILE_CHANNEL message into queue")
+                return False
+            logger.debug("Sent OPEN_FILE_CHANNEL request")
+        except Exception as e:
+            logger.error(f"Failed to send OPEN_FILE_CHANNEL: {e}")
+            return False
+
+        # Wait for response
+        if self._file_channel_ready.wait(timeout):
+            return self._file_channel is not None and self._file_channel.is_connected()
+        else:
+            logger.warning("Timeout waiting for file channel")
+            return False
+
+    @property
+    def file_channel(self) -> Optional[FileChannel]:
+        """Get the file channel (network mode only)."""
+        return self._file_channel
+
+    def _close_file_channel(self) -> None:
+        """Close the file channel (internal use)."""
+        if self._file_channel is not None:
+            self._file_channel.close()
+            self._file_channel = None
+            self._file_channel_ready.clear()
+            logger.info("File channel closed")
+            self._file_channel = None
+            self._file_channel_ready.clear()
+            logger.info("File channel closed")
+
+        # Clean up ADB port forwarding (ADB tunnel mode only)
+        if hasattr(self, '_file_channel_forward_port') and self._file_channel_forward_port:
+            try:
+                from scrcpy_py_ddlx.core.adb import ADBManager
+                adb = ADBManager()
+                adb._execute(
+                    ["forward", "--remove", f"tcp:{self._file_channel_forward_port}"],
+                    device_serial=self.state.device_serial,
+                    timeout=2.0,
+                    capture_output=False,
+                )
+                logger.info(f"Removed file channel port forward: tcp:{self._file_channel_forward_port}")
+            except Exception as e:
+                logger.debug(f"Failed to remove file channel port forward: {e}")
+            finally:
+                self._file_channel_forward_port = None
 
     # ===== Lifecycle management methods =====
 
@@ -939,12 +1212,14 @@ class ScrcpyClient:
             if not wake_device(host, self.config.discovery_port):
                 logger.warning(f"Failed to wake device at {host}, trying direct connect...")
 
-            # Setup network connection
+            # Setup network connection with file port
+            file_port = getattr(self.config, 'file_port', 27187)
             conn = ConnectionManager.setup_network_mode(
                 host=host,
                 control_port=self.config.control_port,
                 video_port=self.config.video_port,
                 audio_port=self.config.audio_port if self.config.audio else 0,
+                file_port=file_port,
                 send_dummy_byte=True
             )
 
@@ -963,6 +1238,13 @@ class ScrcpyClient:
                 self.state.audio_udp_socket = conn.audio_socket  # For cleanup
                 self.state.audio_socket = conn.audio_socket       # Direct socket for demuxer
                 logger.info("Audio UDP socket ready")
+
+            # Store file connection for later use
+            self._file_conn = conn
+
+            # Start async file socket accept in background thread
+            # This avoids blocking the main thread during file operations
+            self._start_file_socket_accept()
 
             logger.info(f"Network mode connected to {host}")
             return True

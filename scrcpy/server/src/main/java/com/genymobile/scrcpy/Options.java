@@ -79,6 +79,7 @@ public class Options {
     private int controlPort = 0;
     private int videoPort = 27185;
     private int audioPort = 27186;
+    private int filePort = 27187;  // File transfer port (TCP)
     private int discoveryPort = 27183;
 
     // FEC (Forward Error Correction) for UDP mode
@@ -331,6 +332,10 @@ public class Options {
 
     public int getAudioPort() {
         return audioPort;
+    }
+
+    public int getFilePort() {
+        return filePort;
     }
 
     public int getDiscoveryPort() {
@@ -664,6 +669,9 @@ public class Options {
                     break;
                 case "audio_port":
                     options.audioPort = Integer.parseInt(value);
+                    break;
+                case "file_port":
+                    options.filePort = Integer.parseInt(value);
                     break;
                 case "discovery_port":
                     options.discoveryPort = Integer.parseInt(value);

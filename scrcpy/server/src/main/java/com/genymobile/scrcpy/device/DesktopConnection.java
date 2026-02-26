@@ -12,6 +12,8 @@ import android.net.LocalSocket;
 import android.net.LocalSocketAddress;
 
 import java.io.Closeable;
+import java.io.DataInputStream;
+import java.io.DataOutputStream;
 import java.io.FileDescriptor;
 import java.io.IOException;
 import java.io.InputStream;
@@ -32,6 +34,7 @@ public final class DesktopConnection implements Closeable {
     // Network mode fields
     private final boolean networkMode;
     private Socket controlTcpSocket;
+    private Socket fileTcpSocket;  // File transfer socket (network mode)
     private OutputStream videoOutputStream;
     private OutputStream audioOutputStream;
     private InputStream controlInputStream;
@@ -44,6 +47,7 @@ public final class DesktopConnection implements Closeable {
     private InetAddress clientAddress;
     private int clientVideoPort;
     private int clientAudioPort;
+    private int clientFilePort;  // File transfer port
 
     private final LocalSocket videoSocket;
     private final FileDescriptor videoFd;
@@ -54,17 +58,24 @@ public final class DesktopConnection implements Closeable {
     private final LocalSocket controlSocket;
     private final ControlChannel controlChannel;
 
-    private DesktopConnection(LocalSocket videoSocket, LocalSocket audioSocket, LocalSocket controlSocket) throws IOException {
+    // File socket for ADB tunnel mode
+    private final LocalSocket fileSocket;
+    private final FileDescriptor fileFd;
+
+    private DesktopConnection(LocalSocket videoSocket, LocalSocket audioSocket, LocalSocket controlSocket, LocalSocket fileSocket) throws IOException {
         this.networkMode = false;
         this.videoSocket = videoSocket;
         this.audioSocket = audioSocket;
         this.controlSocket = controlSocket;
+        this.fileSocket = fileSocket;
 
         videoFd = videoSocket != null ? videoSocket.getFileDescriptor() : null;
         audioFd = audioSocket != null ? audioSocket.getFileDescriptor() : null;
+        fileFd = fileSocket != null ? fileSocket.getFileDescriptor() : null;
         controlChannel = controlSocket != null ? new ControlChannel(controlSocket) : null;
 
         this.controlTcpSocket = null;
+        this.fileTcpSocket = null;
         this.videoOutputStream = null;
         this.audioOutputStream = null;
         this.controlInputStream = null;
@@ -75,23 +86,27 @@ public final class DesktopConnection implements Closeable {
         this.clientAddress = null;
         this.clientVideoPort = 0;
         this.clientAudioPort = 0;
+        this.clientFilePort = 0;
     }
 
-    // Network mode constructor (TCP control + UDP media)
+    // Network mode constructor (TCP control + UDP media + TCP file)
     private DesktopConnection(Socket controlTcpSocket,
-                              InetAddress clientAddress, int clientVideoPort, int clientAudioPort,
-                              boolean video, boolean audio, boolean control) throws IOException {
+                              InetAddress clientAddress, int clientVideoPort, int clientAudioPort, int clientFilePort,
+                              boolean video, boolean audio, boolean control, boolean file) throws IOException {
         this.networkMode = true;
         this.videoSocket = null;
         this.audioSocket = null;
         this.controlSocket = null;
+        this.fileSocket = null;
         this.videoFd = null;
         this.audioFd = null;
+        this.fileFd = null;
 
         this.controlTcpSocket = controlTcpSocket;
         this.clientAddress = clientAddress;
         this.clientVideoPort = clientVideoPort;
         this.clientAudioPort = clientAudioPort;
+        this.clientFilePort = clientFilePort;
 
         // Create UDP sockets and senders for video/audio
         if (video && clientVideoPort > 0) {
@@ -123,6 +138,9 @@ public final class DesktopConnection implements Closeable {
             this.controlInputStream = null;
             this.controlChannel = null;
         }
+
+        // File socket will be connected later via connectFileSocket()
+        this.fileTcpSocket = null;
     }
 
     private static LocalSocket connect(String abstractName) throws IOException {
@@ -140,13 +158,14 @@ public final class DesktopConnection implements Closeable {
         return SOCKET_NAME_PREFIX + String.format("_%08x", scid);
     }
 
-    public static DesktopConnection open(int scid, boolean tunnelForward, boolean video, boolean audio, boolean control, boolean sendDummyByte)
+    public static DesktopConnection open(int scid, boolean tunnelForward, boolean video, boolean audio, boolean control, boolean file, boolean sendDummyByte)
             throws IOException {
         String socketName = getSocketName(scid);
 
         LocalSocket videoSocket = null;
         LocalSocket audioSocket = null;
         LocalSocket controlSocket = null;
+        LocalSocket fileSocket = null;
         try {
             if (tunnelForward) {
                 try (LocalServerSocket localServerSocket = new LocalServerSocket(socketName)) {
@@ -174,6 +193,10 @@ public final class DesktopConnection implements Closeable {
                             sendDummyByte = false;
                         }
                     }
+                    if (file) {
+                        fileSocket = localServerSocket.accept();
+                        Ln.i("File socket connected (forward mode)");
+                    }
                 }
             } else {
                 if (video) {
@@ -184,6 +207,11 @@ public final class DesktopConnection implements Closeable {
                 }
                 if (control) {
                     controlSocket = connect(socketName);
+                }
+                // File socket uses same socket name (reverse mode connects to same tunnel)
+                if (file) {
+                    fileSocket = connect(socketName);
+                    Ln.i("File socket connected (reverse mode)");
                 }
             }
         } catch (IOException | RuntimeException e) {
@@ -196,16 +224,20 @@ public final class DesktopConnection implements Closeable {
             if (controlSocket != null) {
                 controlSocket.close();
             }
+            if (fileSocket != null) {
+                fileSocket.close();
+            }
             throw e;
         }
 
-        return new DesktopConnection(videoSocket, audioSocket, controlSocket);
+        return new DesktopConnection(videoSocket, audioSocket, controlSocket, fileSocket);
     }
 
-    // Network mode: TCP control + UDP media
+    // Network mode: TCP control + UDP media + TCP file
     // Client connects to control port, then server sends video/audio via UDP
-    public static DesktopConnection openNetwork(int controlPort, int videoPort, int audioPort,
-                                                 boolean video, boolean audio, boolean control,
+    // File transfer uses separate TCP connection
+    public static DesktopConnection openNetwork(int controlPort, int videoPort, int audioPort, int filePort,
+                                                 boolean video, boolean audio, boolean control, boolean file,
                                                  boolean sendDummyByte) throws IOException {
         Socket controlTcpSocket = null;
         ServerSocket controlServerSocket = null;
@@ -230,7 +262,15 @@ public final class DesktopConnection implements Closeable {
 
                 // Now create UDP senders using client's IP and ports
                 // videoPort and audioPort are the client's UDP listening ports
-                return new DesktopConnection(controlTcpSocket, clientAddr, videoPort, audioPort, video, audio, control);
+                // filePort is the client's TCP listening port for file transfer
+                DesktopConnection connection = new DesktopConnection(controlTcpSocket, clientAddr, videoPort, audioPort, filePort, video, audio, control, file);
+
+                // Connect file socket immediately for network mode
+                if (file && filePort > 0) {
+                    connection.connectFileSocket();
+                }
+
+                return connection;
             } else {
                 throw new IOException("Control connection is required for network mode");
             }
@@ -243,6 +283,112 @@ public final class DesktopConnection implements Closeable {
                 controlServerSocket.close();
             }
             throw e;
+        }
+    }
+
+    /**
+     * Connect to client's file socket (network mode only).
+     * Called after connection is established, when file transfer is needed.
+     * Starts a handler thread to process file requests.
+     */
+    public void connectFileSocket() throws IOException {
+        if (!networkMode || fileTcpSocket != null) {
+            return;
+        }
+        if (clientFilePort <= 0) {
+            throw new IOException("File port not configured");
+        }
+        fileTcpSocket = new Socket(clientAddress, clientFilePort);
+        Ln.i("File socket connected to " + clientAddress + ":" + clientFilePort);
+
+        // Start file channel handler thread for network mode
+        startFileChannelHandler();
+    }
+
+    /**
+     * Start file channel handler thread (network mode).
+     * This handles file requests from the client on the connected socket.
+     */
+    private void startFileChannelHandler() {
+        if (fileTcpSocket == null) {
+            return;
+        }
+
+        Thread handlerThread = new Thread(() -> {
+            try {
+                DataInputStream input = new DataInputStream(fileTcpSocket.getInputStream());
+                DataOutputStream output = new DataOutputStream(fileTcpSocket.getOutputStream());
+
+                Ln.i("File channel handler started (network mode)");
+
+                while (!fileTcpSocket.isClosed()) {
+                    try {
+                        // Read frame header: [cmd:1B][length:4B]
+                        int cmd = input.readUnsignedByte();
+                        int length = input.readInt();
+
+                        // Read payload
+                        byte[] payload = null;
+                        if (length > 0) {
+                            payload = new byte[length];
+                            input.readFully(payload);
+                        } else {
+                            payload = new byte[0];
+                        }
+
+                        // Handle command
+                        com.genymobile.scrcpy.file.FileChannelHandler.handle(cmd, payload, output);
+                        output.flush();
+
+                    } catch (java.net.SocketException e) {
+                        Ln.d("File channel handler: socket closed");
+                        break;
+                    } catch (IOException e) {
+                        Ln.e("File channel handler error", e);
+                        break;
+                    }
+                }
+            } catch (IOException e) {
+                Ln.e("Failed to start file channel handler", e);
+            } finally {
+                Ln.i("File channel handler stopped (network mode)");
+            }
+        }, "FileChannelHandler-Network");
+        handlerThread.setDaemon(true);
+        handlerThread.start();
+    }
+
+    /**
+     * Get file socket input stream (network mode).
+     */
+    public java.io.InputStream getFileInputStream() throws IOException {
+        if (networkMode) {
+            if (fileTcpSocket != null) {
+                return fileTcpSocket.getInputStream();
+            }
+            return null;
+        } else {
+            if (fileSocket != null) {
+                return fileSocket.getInputStream();
+            }
+            return null;
+        }
+    }
+
+    /**
+     * Get file socket output stream (network mode).
+     */
+    public java.io.OutputStream getFileOutputStream() throws IOException {
+        if (networkMode) {
+            if (fileTcpSocket != null) {
+                return fileTcpSocket.getOutputStream();
+            }
+            return null;
+        } else {
+            if (fileSocket != null) {
+                return fileSocket.getOutputStream();
+            }
+            return null;
         }
     }
 
@@ -268,6 +414,18 @@ public final class DesktopConnection implements Closeable {
                     controlTcpSocket.shutdownOutput();
                 } catch (IOException e) {
                     // Ignore - socket may already be closed
+                }
+            }
+            if (fileTcpSocket != null) {
+                try {
+                    fileTcpSocket.shutdownInput();
+                } catch (IOException e) {
+                    // Ignore
+                }
+                try {
+                    fileTcpSocket.shutdownOutput();
+                } catch (IOException e) {
+                    // Ignore
                 }
             }
             // UDP sockets don't need shutdown
@@ -296,6 +454,14 @@ public final class DesktopConnection implements Closeable {
                     // Ignore
                 }
             }
+            if (fileSocket != null) {
+                try {
+                    fileSocket.shutdownInput();
+                    fileSocket.shutdownOutput();
+                } catch (IOException e) {
+                    // Ignore
+                }
+            }
         }
     }
 
@@ -303,6 +469,9 @@ public final class DesktopConnection implements Closeable {
         if (networkMode) {
             if (controlTcpSocket != null) {
                 controlTcpSocket.close();
+            }
+            if (fileTcpSocket != null) {
+                fileTcpSocket.close();
             }
             if (videoUdpSender != null) {
                 videoUdpSender.close();
@@ -325,6 +494,9 @@ public final class DesktopConnection implements Closeable {
             }
             if (controlSocket != null) {
                 controlSocket.close();
+            }
+            if (fileSocket != null) {
+                fileSocket.close();
             }
         }
     }

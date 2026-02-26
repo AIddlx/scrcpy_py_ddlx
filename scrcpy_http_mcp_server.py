@@ -154,6 +154,7 @@ TOOLS = [
                 "control_port": {"type": "integer", "default": 27184, "description": "TCP control port (network mode, default: 27184)"},
                 "video_port": {"type": "integer", "default": 27185, "description": "UDP video port (network mode, default: 27185)"},
                 "audio_port": {"type": "integer", "default": 27186, "description": "UDP audio port (network mode, default: 27186)"},
+                "file_port": {"type": "integer", "default": 27187, "description": "TCP file transfer port (network mode, default: 27187)"},
                 "stay_alive": {"type": "boolean", "default": False, "description": "Stay-alive mode: server keeps running after disconnect (network mode)"},
                 "wake_server": {"type": "boolean", "default": True, "description": "Use UDP wake packet to connect to sleeping server (network mode, stay-alive)"},
                 # 媒体参数
@@ -288,6 +289,7 @@ TOOLS = [
                 "control_port": {"type": "integer", "description": "TCP control port", "default": 27184},
                 "video_port": {"type": "integer", "description": "UDP video port", "default": 27185},
                 "audio_port": {"type": "integer", "description": "UDP audio port", "default": 27186},
+                "file_port": {"type": "integer", "description": "TCP file transfer port", "default": 27187},
                 # 视频参数
                 "video_codec": {
                     "type": "string",
@@ -701,6 +703,77 @@ TOOLS = [
     #         "required": ["duration"]
     #     }
     # },
+    # ==================== 文件传输 ====================
+    # 文件传输支持两种模式：
+    # - ADB 模式 (默认): 使用 adb push/pull/shell 命令，简单可靠
+    # - 网络模式: 使用独立文件通道，适用于无线直连
+    {
+        "name": "list_dir",
+        "description": "List files and directories on the device. Works in both ADB mode (via adb shell) and network mode (via file channel).",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "Directory path on device (default: /sdcard)", "default": "/sdcard"}
+            }
+        }
+    },
+    {
+        "name": "pull_file",
+        "description": "Download a file from the device to PC. Works in both ADB mode (via adb pull) and network mode (via file channel).",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "device_path": {"type": "string", "description": "File path on device (e.g., /sdcard/Download/file.txt)"},
+                "local_path": {"type": "string", "description": "Local path to save the file"}
+            },
+            "required": ["device_path", "local_path"]
+        }
+    },
+    {
+        "name": "push_file",
+        "description": "Upload a file from PC to the device. Works in both ADB mode (via adb push) and network mode (via file channel).",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "local_path": {"type": "string", "description": "Local file path on PC"},
+                "device_path": {"type": "string", "description": "Target path on device (e.g., /sdcard/Download/file.txt)"}
+            },
+            "required": ["local_path", "device_path"]
+        }
+    },
+    {
+        "name": "delete_file",
+        "description": "Delete a file or directory on the device. Works in both ADB mode and network mode.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "device_path": {"type": "string", "description": "Path to delete on device"}
+            },
+            "required": ["device_path"]
+        }
+    },
+    {
+        "name": "make_dir",
+        "description": "Create a directory on the device. Works in both ADB mode and network mode.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "device_path": {"type": "string", "description": "Directory path to create"}
+            },
+            "required": ["device_path"]
+        }
+    },
+    {
+        "name": "file_stat",
+        "description": "Get file information on the device. Works in both ADB mode and network mode.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "device_path": {"type": "string", "description": "File or directory path"}
+            },
+            "required": ["device_path"]
+        }
+    },
 ]
 
 # 服务器资源列表
@@ -1467,6 +1540,7 @@ class ScrcpyMCPHandler:
         control_port = kwargs.get('control_port', 27184)
         video_port = kwargs.get('video_port', 27185)
         audio_port = kwargs.get('audio_port', 27186)
+        file_port = kwargs.get('file_port', 27187)
         wake_server = kwargs.get('wake_server', True)
 
         # FEC 参数
@@ -1502,6 +1576,7 @@ class ScrcpyMCPHandler:
                 control_port=control_port,
                 video_port=video_port,
                 audio_port=audio_port,
+                file_port=file_port,
 
                 # 媒体设置
                 video=video,
@@ -2044,6 +2119,7 @@ class ScrcpyMCPHandler:
                         control_port = arguments.get("control_port", 27184)
                         video_port = arguments.get("video_port", 27185)
                         audio_port = arguments.get("audio_port", 27186)
+                        file_port = arguments.get("file_port", 27187)
 
                         # 视频参数
                         video_enabled = arguments.get("video", True)  # 默认开启（兼容旧版）
@@ -2206,7 +2282,7 @@ class ScrcpyMCPHandler:
                                 f"CLASSPATH={remote_path} app_process / "
                                 f"com.genymobile.scrcpy.Server 3.3.4 log_level=info "
                                 f"discovery_port={discovery_port} "
-                                f"control_port={control_port} video_port={video_port} audio_port={audio_port} "
+                                f"control_port={control_port} video_port={video_port} audio_port={audio_port} file_port={file_port} "
                                 f"video_codec={actual_codec} video_bit_rate={video_bitrate} max_fps={max_fps} "
                                 f"bitrate_mode={bitrate_mode} i_frame_interval={i_frame_interval} "
                                 f"stay_alive={stay_alive_str} "
@@ -2555,6 +2631,174 @@ class ScrcpyMCPHandler:
                     if alive_error:
                         return {"content": [{"type": "text", "text": json.dumps(alive_error, ensure_ascii=False)}]}
 
+                # ==================== 文件传输工具处理 ====================
+                # 文件传输支持两种模式：
+                # - ADB 模式：使用 adb push/pull/shell 命令
+                # - 网络模式：使用独立文件通道
+
+                if tool_name == "list_dir":
+                    path = arguments.get("path", "/sdcard")
+                    try:
+                        # Debug: check client and state
+                        if self._client is None:
+                            return {"content": [{"type": "text", "text": json.dumps({
+                                "success": False, "error": "No client connected"
+                            }, ensure_ascii=False)}]}
+                        logger.info(f"list_dir: _client={self._client}, _client.state={self._client.state}")
+                        logger.info(f"list_dir: network_mode={self._client.state.network_mode}, connected={self._client.state.connected}")
+                        entries = self._client.list_dir(path)
+                        # Debug: log network_mode value
+                        logger.debug(f"list_dir: network_mode={self._client.state.network_mode}")
+                        return {"content": [{"type": "text", "text": json.dumps({
+                            "success": True,
+                            "path": path,
+                            "entries": entries,
+                            "count": len(entries),
+                            "mode": "network" if self._client.state.network_mode else "adb"
+                        }, ensure_ascii=False)}]}
+                    except Exception as e:
+                        return {"content": [{"type": "text", "text": json.dumps({
+                            "success": False,
+                            "error": str(e)
+                        }, ensure_ascii=False)}]}
+
+                if tool_name == "pull_file":
+                    device_path = arguments.get("device_path")
+                    local_path = arguments.get("local_path")
+                    if not device_path or not local_path:
+                        return {"content": [{"type": "text", "text": json.dumps({
+                            "success": False,
+                            "error": "Both device_path and local_path are required"
+                        }, ensure_ascii=False)}]}
+
+                    try:
+                        self._client.pull_file(device_path, local_path)
+
+                        from pathlib import Path
+                        local_file = Path(local_path)
+                        size = local_file.stat().st_size if local_file.exists() else 0
+
+                        return {"content": [{"type": "text", "text": json.dumps({
+                            "success": True,
+                            "device_path": device_path,
+                            "local_path": local_path,
+                            "size": size,
+                            "mode": "network" if self._client.state.network_mode else "adb"
+                        }, ensure_ascii=False)}]}
+                    except Exception as e:
+                        return {"content": [{"type": "text", "text": json.dumps({
+                            "success": False,
+                            "error": str(e)
+                        }, ensure_ascii=False)}]}
+
+                if tool_name == "push_file":
+                    local_path = arguments.get("local_path")
+                    device_path = arguments.get("device_path")
+                    if not local_path or not device_path:
+                        return {"content": [{"type": "text", "text": json.dumps({
+                            "success": False,
+                            "error": "Both local_path and device_path are required"
+                        }, ensure_ascii=False)}]}
+
+                    try:
+                        from pathlib import Path
+                        local_file = Path(local_path)
+                        if not local_file.exists():
+                            return {"content": [{"type": "text", "text": json.dumps({
+                                "success": False,
+                                "error": f"Local file not found: {local_path}"
+                            }, ensure_ascii=False)}]}
+
+                        self._client.push_file(local_path, device_path)
+
+                        return {"content": [{"type": "text", "text": json.dumps({
+                            "success": True,
+                            "local_path": local_path,
+                            "device_path": device_path,
+                            "size": local_file.stat().st_size,
+                            "mode": "network" if self._client.state.network_mode else "adb"
+                        }, ensure_ascii=False)}]}
+                    except Exception as e:
+                        return {"content": [{"type": "text", "text": json.dumps({
+                            "success": False,
+                            "error": str(e)
+                        }, ensure_ascii=False)}]}
+
+                if tool_name == "delete_file":
+                    device_path = arguments.get("device_path")
+                    if not device_path:
+                        return {"content": [{"type": "text", "text": json.dumps({
+                            "success": False,
+                            "error": "device_path is required"
+                        }, ensure_ascii=False)}]}
+
+                    try:
+                        success = self._client.delete_file(device_path)
+                        return {"content": [{"type": "text", "text": json.dumps({
+                            "success": success,
+                            "device_path": device_path,
+                            "mode": "network" if self._client.state.network_mode else "adb"
+                        }, ensure_ascii=False)}]}
+                    except Exception as e:
+                        return {"content": [{"type": "text", "text": json.dumps({
+                            "success": False,
+                            "error": str(e)
+                        }, ensure_ascii=False)}]}
+
+                if tool_name == "make_dir":
+                    device_path = arguments.get("device_path")
+                    if not device_path:
+                        return {"content": [{"type": "text", "text": json.dumps({
+                            "success": False,
+                            "error": "device_path is required"
+                        }, ensure_ascii=False)}]}
+
+                    try:
+                        success = self._client.make_dir(device_path)
+                        return {"content": [{"type": "text", "text": json.dumps({
+                            "success": success,
+                            "device_path": device_path,
+                            "mode": "network" if self._client.state.network_mode else "adb"
+                        }, ensure_ascii=False)}]}
+                    except Exception as e:
+                        return {"content": [{"type": "text", "text": json.dumps({
+                            "success": False,
+                            "error": str(e)
+                        }, ensure_ascii=False)}]}
+
+                if tool_name == "file_stat":
+                    device_path = arguments.get("device_path")
+                    if not device_path:
+                        return {"content": [{"type": "text", "text": json.dumps({
+                            "success": False,
+                            "error": "device_path is required"
+                        }, ensure_ascii=False)}]}
+
+                    try:
+                        info = self._client.file_stat(device_path)
+                        if info is None:
+                            return {"content": [{"type": "text", "text": json.dumps({
+                                "success": True,
+                                "exists": False,
+                                "path": device_path
+                            }, ensure_ascii=False)}]}
+
+                        return {"content": [{"type": "text", "text": json.dumps({
+                            "success": True,
+                            "exists": True,
+                            "path": device_path,
+                            "type": info.get("type"),
+                            "size": info.get("size"),
+                            "mtime": info.get("mtime"),
+                            "mode": "network" if self._client.state.network_mode else "adb"
+                        }, ensure_ascii=False)}]}
+                    except Exception as e:
+                        return {"content": [{"type": "text", "text": json.dumps({
+                            "success": False,
+                            "error": str(e)
+                        }, ensure_ascii=False)}]}
+
+                # ==================== screenshot 处理 ====================
                 # screenshot: 根据 video 配置和连接模式选择方法
                 if tool_name == "screenshot":
                     video_enabled = self._current_config and self._current_config.video

@@ -114,6 +114,9 @@ public class Options {
     private boolean sendDummyByte = true; // write a byte on start to detect connection issues
     private boolean sendCodecMeta = true; // write the codec metadata before the stream
 
+    // Authentication (v1.4)
+    private String authKeyFile = null;    // Path to authentication key file
+
     public Ln.Level getLogLevel() {
         return logLevel;
     }
@@ -320,6 +323,10 @@ public class Options {
 
     public boolean getSendCodecMeta() {
         return sendCodecMeta;
+    }
+
+    public String getAuthKeyFile() {
+        return authKeyFile;
     }
 
     public int getControlPort() {
@@ -651,6 +658,9 @@ public class Options {
                     break;
                 case "send_codec_meta":
                     options.sendCodecMeta = Boolean.parseBoolean(value);
+                    break;
+                case "auth_key_file":
+                    options.authKeyFile = value;
                     break;
                 case "raw_stream":
                     boolean rawStream = Boolean.parseBoolean(value);

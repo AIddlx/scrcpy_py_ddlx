@@ -35,6 +35,11 @@ public final class ControlMessage {
     public static final int TYPE_STOP_AUDIO = 24;           // Stop audio stream (encoder standby)
     // Heartbeat (TCP control channel keepalive)
     public static final int TYPE_PING = 25;                 // Heartbeat request (client -> server)
+    // File transfer (independent TCP file channel)
+    public static final int TYPE_OPEN_FILE_CHANNEL = 26;    // Request to open file channel
+
+    // Authentication (v1.4)
+    public static final int TYPE_RESPONSE = 0xF1;           // Client -> Server: authentication response
 
     public static final long SEQUENCE_INVALID = 0;
 
@@ -64,6 +69,7 @@ public final class ControlMessage {
     private int vendorId;
     private int productId;
     private long timestamp;  // For PING message
+    private int quality;     // For SCREENSHOT message (JPEG quality 1-100)
 
     private ControlMessage() {
     }
@@ -183,10 +189,23 @@ public final class ControlMessage {
         return msg;
     }
 
+    public static ControlMessage createScreenshot(int quality) {
+        ControlMessage msg = new ControlMessage();
+        msg.type = TYPE_SCREENSHOT;
+        msg.quality = quality;
+        return msg;
+    }
+
     public static ControlMessage createPing(long timestamp) {
         ControlMessage msg = new ControlMessage();
         msg.type = TYPE_PING;
         msg.timestamp = timestamp;
+        return msg;
+    }
+
+    public static ControlMessage createOpenFileChannel() {
+        ControlMessage msg = new ControlMessage();
+        msg.type = TYPE_OPEN_FILE_CHANNEL;
         return msg;
     }
 
@@ -276,5 +295,9 @@ public final class ControlMessage {
 
     public long getTimestamp() {
         return timestamp;
+    }
+
+    public int getQuality() {
+        return quality;
     }
 }

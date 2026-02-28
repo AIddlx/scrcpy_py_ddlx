@@ -38,6 +38,7 @@ public class ScreenshotCapture {
     private ImageReader imageReader;
     private android.os.IBinder display;
     private Size videoSize;
+    private int lastRotation = -1;  // 记录上次旋转状态
 
     private final Lock frameLock = new ReentrantLock();
     private final Condition frameCondition = frameLock.newCondition();
@@ -58,12 +59,19 @@ public class ScreenshotCapture {
     public void init() throws ConfigurationException {
         try {
             // Get display info
+            // 注意：displayInfo.getSize() 返回的 logicalWidth/logicalHeight 已经考虑了旋转
+            // 竖屏时返回 1080x2400，横屏时返回 2400x1080
             DisplayInfo displayInfo = ServiceManager.getDisplayManager().getDisplayInfo(displayId);
             if (displayInfo == null) {
                 throw new ConfigurationException("Display " + displayId + " not found");
             }
 
+            // 记录初始旋转状态
+            lastRotation = displayInfo.getRotation();
             Size displaySize = displayInfo.getSize();
+
+            Ln.d("ScreenshotCapture: initial rotation=" + lastRotation + ", size=" + displaySize.getWidth() + "x" + displaySize.getHeight());
+
             videoSize = computeVideoSize(displaySize, options.getMaxSize());
 
             Ln.i("ScreenshotCapture: creating ImageReader " + videoSize.getWidth() + "x" + videoSize.getHeight());
@@ -126,17 +134,129 @@ public class ScreenshotCapture {
     }
 
     /**
+     * Check if rotation changed and reconfigure display if needed.
+     * This allows screenshots to adapt to screen orientation changes.
+     */
+    private void checkAndReconfigureForRotation() {
+        try {
+            DisplayInfo displayInfo = ServiceManager.getDisplayManager().getDisplayInfo(displayId);
+            if (displayInfo == null) {
+                return;
+            }
+
+            int currentRotation = displayInfo.getRotation();
+            if (lastRotation == -1) {
+                // First time, just record the rotation
+                lastRotation = currentRotation;
+                return;
+            }
+
+            if (currentRotation == lastRotation) {
+                // No rotation change
+                return;
+            }
+
+            Ln.i("ScreenshotCapture: rotation changed from " + lastRotation + " to " + currentRotation + ", reconfiguring...");
+
+            // 注意：displayInfo.getSize() 返回的尺寸已经考虑了旋转
+            // 不需要再根据旋转值交换宽高
+            Size displaySize = displayInfo.getSize();
+            Size newSize = computeVideoSize(displaySize, options.getMaxSize());
+
+            Ln.d("ScreenshotCapture: new size=" + newSize.getWidth() + "x" + newSize.getHeight() + " (displaySize=" + displaySize.getWidth() + "x" + displaySize.getHeight() + ")");
+
+            // Check if size actually changed
+            if (videoSize != null &&
+                newSize.getWidth() == videoSize.getWidth() &&
+                newSize.getHeight() == videoSize.getHeight()) {
+                // Size unchanged, just update rotation
+                lastRotation = currentRotation;
+                return;
+            }
+
+            // Need to reconfigure
+            videoSize = newSize;
+            lastRotation = currentRotation;
+
+            // Recreate ImageReader with new size
+            if (imageReader != null) {
+                imageReader.setOnImageAvailableListener(null, null);
+                if (imageReader.getSurface() != null) {
+                    imageReader.getSurface().release();
+                }
+            }
+
+            Ln.i("ScreenshotCapture: recreating ImageReader " + videoSize.getWidth() + "x" + videoSize.getHeight());
+            imageReader = ImageReader.newInstance(
+                videoSize.getWidth(),
+                videoSize.getHeight(),
+                IMAGE_FORMAT,
+                MAX_IMAGES
+            );
+
+            // Set up frame listener
+            Handler handler = new Handler(Looper.getMainLooper());
+            imageReader.setOnImageAvailableListener(new ImageReader.OnImageAvailableListener() {
+                @Override
+                public void onImageAvailable(ImageReader reader) {
+                    frameLock.lock();
+                    try {
+                        if (pendingFrame != null) {
+                            pendingFrame.close();
+                        }
+                        pendingFrame = reader.acquireLatestImage();
+                        frameReady = true;
+                        frameCondition.signalAll();
+                    } finally {
+                        frameLock.unlock();
+                    }
+                }
+            }, handler);
+
+            // Update display configuration
+            Surface surface = imageReader.getSurface();
+            int layerStack = displayInfo.getLayerStack();
+            Rect displayRect = new Rect(0, 0, videoSize.getWidth(), videoSize.getHeight());
+            Rect deviceRect = new Rect(0, 0, displaySize.getWidth(), displaySize.getHeight());
+
+            SurfaceControl.openTransaction();
+            try {
+                SurfaceControl.setDisplaySurface(display, surface);
+                SurfaceControl.setDisplayLayerStack(display, layerStack);
+                SurfaceControl.setDisplayProjection(display, 0, deviceRect, displayRect);
+            } finally {
+                SurfaceControl.closeTransaction();
+            }
+
+            Ln.i("ScreenshotCapture: reconfigured for rotation " + currentRotation);
+
+        } catch (Exception e) {
+            Ln.e("ScreenshotCapture: failed to reconfigure for rotation: " + e.getMessage());
+        }
+    }
+
+    /**
      * Capture a screenshot.
      *
      * @param timeoutMs Timeout in milliseconds
      * @return Bitmap of the screenshot, or null on failure
      */
     public Bitmap captureScreenshot(long timeoutMs) {
+        // 检查旋转变化并重新配置显示
+        checkAndReconfigureForRotation();
+
         frameLock.lock();
         try {
-            // Wait for frame
+            // 清除旧帧，等待新帧 - 这样可以确保获取完整的帧而不是撕裂的帧
+            if (pendingFrame != null) {
+                pendingFrame.close();
+                pendingFrame = null;
+            }
+            frameReady = false;
+
+            // Wait for new frame
             long startTime = System.currentTimeMillis();
-            while (!frameReady && pendingFrame == null) {
+            while (!frameReady || pendingFrame == null) {
                 long elapsed = System.currentTimeMillis() - startTime;
                 if (elapsed >= timeoutMs) {
                     Ln.w("ScreenshotCapture: timeout waiting for frame");
@@ -157,6 +277,10 @@ public class ScreenshotCapture {
 
             // Convert to Bitmap
             Bitmap bitmap = imageToBitmap(pendingFrame, videoSize.getWidth(), videoSize.getHeight());
+
+            // Close the Image after conversion to prevent resource leak
+            pendingFrame.close();
+            pendingFrame = null;
             frameReady = false;
 
             return bitmap;

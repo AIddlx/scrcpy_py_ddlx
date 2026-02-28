@@ -23,6 +23,9 @@ from .protocol import (
     CopyKey,
     DEVICE_NAME_FIELD_LENGTH,
     CONTROL_MSG_CLIPBOARD_TEXT_MAX_LENGTH,
+    TYPE_CHALLENGE,
+    TYPE_AUTH_RESULT,
+    AUTH_CHALLENGE_SIZE,
 )
 
 logger = logging.getLogger(__name__)
@@ -37,10 +40,72 @@ class DeviceMessageType(Enum):
     APP_LIST = 3            # List of installed applications
     SCREENSHOT = 4          # Screenshot image data (JPEG)
     PONG = 5                # Heartbeat response (server -> client)
+    FILE_CHANNEL_INFO = 6   # File channel port info (server -> client)
+    # Authentication message types (v1.4)
+    CHALLENGE = 0xF0        # Authentication challenge (server -> client)
+    AUTH_RESULT = 0xF2      # Authentication result (server -> client)
 
 
-# Receiver buffer size (from official scrcpy)
-DEVICE_MSG_MAX_SIZE = 256 * 1024  # 256KB buffer
+# Receiver buffer size (supports 4K screenshots)
+DEVICE_MSG_MAX_SIZE = 4 * 1024 * 1024  # 4MB buffer
+
+
+class ProtocolError(Exception):
+    """Exception raised when protocol parsing fails."""
+    pass
+
+
+def parse_challenge(data: bytes) -> bytes:
+    """
+    Parse CHALLENGE message from server.
+
+    Format: [type:1][challenge:32]
+
+    Args:
+        data: Raw bytes from server
+
+    Returns:
+        32-byte challenge
+
+    Raises:
+        ProtocolError: If message is invalid
+    """
+    if len(data) < 33:
+        raise ProtocolError(f"Challenge message too short: {len(data)} bytes")
+    if data[0] != TYPE_CHALLENGE:
+        raise ProtocolError(f"Invalid challenge message type: 0x{data[0]:02x}")
+    return data[1:33]
+
+
+def parse_auth_result(data: bytes) -> tuple:
+    """
+    Parse AUTH_RESULT message from server.
+
+    Format: [type:1][result:1][error_len:2][error:N]
+
+    Args:
+        data: Raw bytes from server
+
+    Returns:
+        Tuple of (success: bool, error_message: str)
+
+    Raises:
+        ProtocolError: If message is invalid
+    """
+    if len(data) < 2:
+        raise ProtocolError(f"Auth result message too short: {len(data)} bytes")
+    if data[0] != TYPE_AUTH_RESULT:
+        raise ProtocolError(f"Invalid auth result message type: 0x{data[0]:02x}")
+
+    success = data[1] == 1
+    error_msg = ""
+
+    if not success and len(data) >= 4:
+        error_len = struct.unpack(">H", data[2:4])[0]
+        if len(data) >= 4 + error_len:
+            error_msg = data[4:4 + error_len].decode('utf-8', errors='ignore')
+
+    return success, error_msg
 
 
 @dataclass
@@ -84,6 +149,7 @@ class ReceiverCallbacks:
     on_app_list: Optional[Callable[[List[Dict[str, Any]]], None]] = None
     on_screenshot: Optional[Callable[[Optional[bytes]], None]] = None  # JPEG data or None if failed
     on_pong: Optional[Callable[[int], None]] = None  # Heartbeat response callback (timestamp)
+    on_file_channel_info: Optional[Callable[[int, int], None]] = None  # port, session_id
 
 
 class DeviceMessageReceiver:
@@ -258,6 +324,15 @@ class DeviceMessageReceiver:
 
         elif msg_type == DeviceMessageType.PONG.value:
             return self._process_pong(buffer, size)
+
+        elif msg_type == DeviceMessageType.FILE_CHANNEL_INFO.value:
+            return self._process_file_channel_info(buffer, size)
+
+        elif msg_type == DeviceMessageType.CHALLENGE.value:
+            return self._process_challenge(buffer, size)
+
+        elif msg_type == DeviceMessageType.AUTH_RESULT.value:
+            return self._process_auth_result(buffer, size)
 
         else:
             logger.warning(f"Unknown device message type: {msg_type}")
@@ -517,6 +592,97 @@ class DeviceMessageReceiver:
                 logger.error(f"PONG callback error: {e}")
 
         return 9
+
+    def _process_file_channel_info(self, buffer: bytearray, size: int) -> int:
+        """
+        Process FILE_CHANNEL_INFO message (type 6).
+
+        Format:
+        - 1 byte: type = 6
+        - 2 bytes: port (big-endian)
+        - 4 bytes: session_id (big-endian)
+
+        Returns:
+            Number of bytes consumed (always 7 if size >= 7)
+        """
+        if size < 7:
+            return 0
+
+        # Read port and session_id
+        port = struct.unpack(">H", buffer[1:3])[0]
+        session_id = struct.unpack(">I", buffer[3:7])[0]
+
+        logger.info(f"[DeviceReceiver] FILE_CHANNEL_INFO: port={port}, session_id={session_id}")
+
+        # Trigger callback
+        if self._callbacks.on_file_channel_info:
+            try:
+                self._callbacks.on_file_channel_info(port, session_id)
+            except Exception as e:
+                logger.error(f"FILE_CHANNEL_INFO callback error: {e}")
+        else:
+            logger.warning("[DeviceReceiver] FILE_CHANNEL_INFO message received but no callback registered!")
+
+        return 7
+
+
+    def _process_challenge(self, buffer: bytearray, size: int) -> int:
+        """
+        Process CHALLENGE message (type 0xF0) - authentication challenge.
+
+        Format:
+        - 1 byte: type = 0xF0
+        - 32 bytes: challenge (random bytes)
+
+        Returns:
+            Number of bytes consumed (always 33 if size >= 33)
+        """
+        if size < 33:  # type (1) + challenge (32)
+            return 0
+
+        # Read challenge
+        challenge = bytes(buffer[1:33])
+
+        logger.debug(f"[DeviceReceiver] CHALLENGE message received: {len(challenge)} bytes")
+
+        # Store challenge for later use (authentication is handled in connection phase)
+        # This is mainly for debugging - actual auth happens before receiver starts
+        return 33
+
+    def _process_auth_result(self, buffer: bytearray, size: int) -> int:
+        """
+        Process AUTH_RESULT message (type 0xF2) - authentication result.
+
+        Format:
+        - 1 byte: type = 0xF2
+        - 1 byte: result (0 = failure, 1 = success)
+        - 2 bytes: error_len (big-endian, only if failure)
+        - N bytes: error message (UTF-8, only if failure)
+
+        Returns:
+            Number of bytes consumed
+        """
+        if size < 2:  # type (1) + result (1)
+            return 0
+
+        # Read result
+        success = buffer[1] == 1
+
+        if success:
+            logger.info("[DeviceReceiver] AUTH_RESULT: Authentication successful")
+            return 2
+        else:
+            # Read error message
+            if size < 4:  # type (1) + result (1) + error_len (2)
+                return 0
+
+            error_len = struct.unpack(">H", buffer[2:4])[0]
+            if size < 4 + error_len:
+                return 0  # Incomplete message
+
+            error_msg = buffer[4:4 + error_len].decode('utf-8', errors='ignore')
+            logger.warning(f"[DeviceReceiver] AUTH_RESULT: Authentication failed - {error_msg}")
+            return 4 + error_len
 
 
 class DeviceMessageParser:

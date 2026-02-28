@@ -1,5 +1,6 @@
 package com.genymobile.scrcpy.device;
 
+import com.genymobile.scrcpy.control.AuthHandler;
 import com.genymobile.scrcpy.control.ControlChannel;
 import com.genymobile.scrcpy.device.CapabilityNegotiation;
 import com.genymobile.scrcpy.udp.UdpMediaSender;
@@ -238,7 +239,7 @@ public final class DesktopConnection implements Closeable {
     // File transfer uses separate TCP connection
     public static DesktopConnection openNetwork(int controlPort, int videoPort, int audioPort, int filePort,
                                                  boolean video, boolean audio, boolean control, boolean file,
-                                                 boolean sendDummyByte) throws IOException {
+                                                 boolean sendDummyByte, byte[] authKey) throws IOException {
         Socket controlTcpSocket = null;
         ServerSocket controlServerSocket = null;
 
@@ -255,6 +256,14 @@ public final class DesktopConnection implements Closeable {
                 controlServerSocket.close();
                 InetAddress clientAddr = controlTcpSocket.getInetAddress();
                 Ln.i("Control client connected from " + clientAddr);
+
+                // Perform authentication BEFORE dummy byte (if auth key provided)
+                if (authKey != null && authKey.length > 0) {
+                    if (!AuthHandler.authenticate(controlTcpSocket, authKey)) {
+                        controlTcpSocket.close();
+                        throw new IOException("Authentication failed");
+                    }
+                }
 
                 if (sendDummyByte) {
                     controlTcpSocket.getOutputStream().write(0);

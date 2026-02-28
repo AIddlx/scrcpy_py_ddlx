@@ -11,6 +11,11 @@ public final class DeviceMessage {
     public static final int TYPE_APP_LIST = 3;
     public static final int TYPE_SCREENSHOT = 4;  // Screenshot image data (JPEG)
     public static final int TYPE_PONG = 5;        // Heartbeat response (server -> client)
+    public static final int TYPE_FILE_CHANNEL_INFO = 6;  // File channel port info
+
+    // Authentication message types (v1.4)
+    public static final int TYPE_CHALLENGE = 0xF0;    // Server -> Client: authentication challenge
+    public static final int TYPE_AUTH_RESULT = 0xF2;  // Server -> Client: authentication result
 
     private int type;
     private String text;
@@ -19,6 +24,8 @@ public final class DeviceMessage {
     private byte[] data;
     private List<DeviceApp> apps;
     private long timestamp;  // For PONG message
+    private int port;        // For FILE_CHANNEL_INFO
+    private int sessionId;   // For FILE_CHANNEL_INFO
 
     private DeviceMessage() {
     }
@@ -66,6 +73,14 @@ public final class DeviceMessage {
         return event;
     }
 
+    public static DeviceMessage createFileChannelInfo(int port, int sessionId) {
+        DeviceMessage event = new DeviceMessage();
+        event.type = TYPE_FILE_CHANNEL_INFO;
+        event.port = port;
+        event.sessionId = sessionId;
+        return event;
+    }
+
     public int getType() {
         return type;
     }
@@ -92,5 +107,13 @@ public final class DeviceMessage {
 
     public long getTimestamp() {
         return timestamp;
+    }
+
+    public int getPort() {
+        return port;
+    }
+
+    public int getSessionId() {
+        return sessionId;
     }
 }

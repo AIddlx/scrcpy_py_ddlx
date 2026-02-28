@@ -156,6 +156,22 @@ public final class Server {
         int connectionCount = 0;
         int maxConnections = options.getMaxConnections();
 
+        // Load auth key once at startup (for stay-alive mode, key is reused)
+        byte[] authKey = null;
+        if (options.getAuthKeyFile() != null) {
+            File keyFile = new File(options.getAuthKeyFile());
+            if (keyFile.exists()) {
+                authKey = java.nio.file.Files.readAllBytes(keyFile.toPath());
+                Ln.i("Auth key loaded from " + options.getAuthKeyFile() + " (" + authKey.length + " bytes)");
+                // Delete key file after reading (security measure)
+                if (keyFile.delete()) {
+                    Ln.d("Auth key file deleted after reading");
+                }
+            } else {
+                Ln.w("Auth key file not found: " + options.getAuthKeyFile());
+            }
+        }
+
         Ln.i("Stay-alive mode enabled. Listening on UDP port " + options.getDiscoveryPort());
 
         try {
@@ -201,7 +217,8 @@ public final class Server {
                             options.getAudio(),
                             options.getControl(),
                             true,  // file always enabled
-                            options.getSendDummyByte()
+                            options.getSendDummyByte(),
+                            authKey  // auth key (null if not configured)
                     );
 
                     // Start a monitor thread to force close connection on terminate request
@@ -471,6 +488,22 @@ public final class Server {
         boolean networkMode = options.isNetworkMode();
         boolean file = true;  // File transfer is always enabled
 
+        // Load auth key if specified (network mode only)
+        byte[] authKey = null;
+        if (networkMode && options.getAuthKeyFile() != null) {
+            File keyFile = new File(options.getAuthKeyFile());
+            if (keyFile.exists()) {
+                authKey = java.nio.file.Files.readAllBytes(keyFile.toPath());
+                Ln.i("Auth key loaded from " + options.getAuthKeyFile() + " (" + authKey.length + " bytes)");
+                // Delete key file after reading (single-use)
+                if (keyFile.delete()) {
+                    Ln.d("Auth key file deleted after reading");
+                }
+            } else {
+                Ln.w("Auth key file not found: " + options.getAuthKeyFile());
+            }
+        }
+
         if (networkMode) {
             Ln.i("Starting in network mode (TCP direct connection)");
             return DesktopConnection.openNetwork(
@@ -482,7 +515,8 @@ public final class Server {
                     audio,
                     control,
                     file,
-                    sendDummyByte
+                    sendDummyByte,
+                    authKey
             );
         } else {
             return DesktopConnection.open(scid, tunnelForward, video, audio, control, file, sendDummyByte);

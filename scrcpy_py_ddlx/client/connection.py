@@ -9,6 +9,16 @@ import logging
 from typing import Optional, Tuple
 from dataclasses import dataclass
 
+# Import authentication module
+from ..core.auth import (
+    calculate_hmac,
+    AuthError,
+    AUTH_CHALLENGE_SIZE,
+    AUTH_RESPONSE_SIZE,
+)
+from ..core.device_msg import parse_challenge, parse_auth_result, ProtocolError
+from ..core.protocol import TYPE_RESPONSE
+
 logger = logging.getLogger(__name__)
 
 
@@ -91,9 +101,95 @@ class ConnectionManager:
         return sock
 
     @staticmethod
+    def perform_auth(socket_: socket.socket, auth_key: bytes, timeout: float = 5.0) -> bool:
+        """
+        Execute HMAC-SHA256 Challenge-Response authentication.
+
+        Flow:
+        1. Receive CHALLENGE (33 bytes: type + 32-byte challenge)
+        2. Calculate HMAC-SHA256(key, challenge)
+        3. Send RESPONSE (33 bytes: type + 32-byte response)
+        4. Receive AUTH_RESULT
+
+        Args:
+            socket_: Control socket
+            auth_key: 32-byte authentication key
+            timeout: Socket timeout for auth operations
+
+        Returns:
+            True if authentication successful
+
+        Raises:
+            AuthError: If authentication fails
+            socket.timeout: If timeout occurs
+        """
+        original_timeout = socket_.gettimeout()
+        socket_.settimeout(timeout)
+
+        try:
+            # 1. Receive CHALLENGE
+            challenge_data = ConnectionManager._recv_exact(socket_, 33)
+            challenge = parse_challenge(challenge_data)
+            logger.debug(f"Received authentication challenge ({len(challenge)} bytes)")
+
+            # 2. Calculate RESPONSE
+            response = calculate_hmac(auth_key, challenge)
+            if len(response) != AUTH_RESPONSE_SIZE:
+                raise AuthError(f"Invalid response size: {len(response)}")
+
+            # 3. Send RESPONSE
+            response_msg = bytes([TYPE_RESPONSE]) + response
+            socket_.sendall(response_msg)
+            logger.debug("Sent authentication response")
+
+            # 4. Receive AUTH_RESULT
+            # Result format: [type:1][result:1][error_len:2][error:N]
+            # Read at least 4 bytes first
+            result_header = ConnectionManager._recv_exact(socket_, 4)
+            success, error_msg = parse_auth_result(result_header)
+
+            # If there's an error message, it's already parsed from header
+            # (for simplicity, we assume error messages fit in initial read)
+
+            if not success:
+                raise AuthError(f"Authentication failed: {error_msg}")
+
+            return True
+
+        except ProtocolError as e:
+            raise AuthError(f"Protocol error during authentication: {e}")
+        finally:
+            socket_.settimeout(original_timeout)
+
+    @staticmethod
+    def _recv_exact(socket_: socket.socket, n: int) -> bytes:
+        """
+        Receive exactly n bytes from socket.
+
+        Args:
+            socket_: Socket to read from
+            n: Number of bytes to receive
+
+        Returns:
+            Exactly n bytes
+
+        Raises:
+            ConnectionError: If connection closed
+            socket.timeout: If timeout occurs
+        """
+        data = bytearray()
+        while len(data) < n:
+            chunk = socket_.recv(n - len(data))
+            if not chunk:
+                raise ConnectionError(f"Connection closed after receiving {len(data)} of {n} bytes")
+            data.extend(chunk)
+        return bytes(data)
+
+    @staticmethod
     def setup_network_mode(host: str, control_port: int, video_port: int,
                            audio_port: int, file_port: int = 0,
-                           send_dummy_byte: bool = True) -> NetworkConnection:
+                           send_dummy_byte: bool = True,
+                           auth_key: Optional[bytes] = None) -> NetworkConnection:
         """
         Setup network mode connection.
 
@@ -104,17 +200,23 @@ class ConnectionManager:
             audio_port: UDP audio port
             file_port: TCP file transfer port (0 = disabled)
             send_dummy_byte: Whether to wait for dummy byte
+            auth_key: Optional 32-byte authentication key (enables auth if provided)
 
         Returns:
             NetworkConnection with all sockets configured
+
+        Raises:
+            ConnectionError: If connection fails
+            AuthError: If authentication fails
         """
         conn = NetworkConnection()
 
         # Create UDP receivers first (before sending wake)
         # Use different buffer sizes for video vs audio
-        conn.video_socket = ConnectionManager.create_udp_receiver(
-            video_port, buffer_size=VIDEO_SOCKET_BUFFER
-        )
+        if video_port > 0:
+            conn.video_socket = ConnectionManager.create_udp_receiver(
+                video_port, buffer_size=VIDEO_SOCKET_BUFFER
+            )
         if audio_port > 0:
             conn.audio_socket = ConnectionManager.create_udp_receiver(
                 audio_port, buffer_size=AUDIO_SOCKET_BUFFER
@@ -122,6 +224,12 @@ class ConnectionManager:
 
         # Connect TCP control
         conn.control_socket = ConnectionManager.connect_tcp_control(host, control_port)
+
+        # Perform authentication BEFORE dummy byte (if auth_key provided)
+        if auth_key is not None:
+            logger.info("Performing authentication...")
+            ConnectionManager.perform_auth(conn.control_socket, auth_key)
+            logger.info("Authentication successful")
 
         # Wait for dummy byte
         if send_dummy_byte:

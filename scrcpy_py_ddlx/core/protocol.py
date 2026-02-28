@@ -105,6 +105,8 @@ class ControlMessageType(IntEnum):
     STOP_AUDIO = 24          # Stop audio stream (encoder standby)
     # Heartbeat (TCP control channel keepalive)
     PING = 25                # Heartbeat request (client -> server)
+    # File transfer (independent TCP file channel)
+    OPEN_FILE_CHANNEL = 26   # Request to open file channel
 
 
 # ============================================================================
@@ -119,6 +121,7 @@ class DeviceMessageType(IntEnum):
     APP_LIST = 3  # List of installed applications
     SCREENSHOT = 4  # Screenshot image data (JPEG)
     PONG = 5      # Heartbeat response (server -> client)
+    FILE_CHANNEL_INFO = 6  # File channel port info (server -> client)
 
 
 # ============================================================================
@@ -333,3 +336,22 @@ class UdpPacketType(IntEnum):
     FRAGMENTED = 1
     FEC_DATA = 2
     FEC_PARITY = 3
+
+
+# ============================================================================
+# Authentication Message Types (v1.4)
+# ============================================================================
+
+# Authentication flow:
+# 1. Server sends CHALLENGE (32 bytes random) to client
+# 2. Client calculates HMAC-SHA256(key, challenge) and sends RESPONSE
+# 3. Server verifies and sends AUTH_RESULT (success/failure)
+
+TYPE_CHALLENGE: Final[int] = 0xF0      # Server -> Client: 32-byte random challenge
+TYPE_RESPONSE: Final[int] = 0xF1       # Client -> Server: 32-byte HMAC-SHA256 response
+TYPE_AUTH_RESULT: Final[int] = 0xF2    # Server -> Client: Authentication result
+
+# Authentication constants
+AUTH_KEY_SIZE: Final[int] = 32         # 256 bits
+AUTH_CHALLENGE_SIZE: Final[int] = 32   # 256 bits
+AUTH_RESPONSE_SIZE: Final[int] = 32    # 256 bits (HMAC-SHA256 output)

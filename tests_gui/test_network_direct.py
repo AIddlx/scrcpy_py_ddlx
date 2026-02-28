@@ -34,6 +34,7 @@ NOTE: ADB is only used to START the server. After server is running, you can unp
 """
 
 import sys
+import os
 import logging
 import subprocess
 import time
@@ -45,6 +46,26 @@ from datetime import datetime
 # Add project root to Python path
 project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
+
+
+def get_device_serial():
+    """
+    Get device serial number via ADB.
+
+    Returns:
+        str or None: Device serial number, or None if detection fails
+    """
+    try:
+        result = subprocess.run(
+            ['adb', 'get-serialno'],
+            capture_output=True, text=True, timeout=5
+        )
+        serial = result.stdout.strip()
+        if serial and serial != 'unknown':
+            return serial
+    except Exception as e:
+        print(f"[WARN] Get serial failed: {e}")
+    return None
 
 
 def get_device_ip_via_adb():
@@ -228,6 +249,15 @@ Server Lifecycle Modes:
     dbg_group.add_argument('--queue-size', dest='packet_queue_size', type=int, default=3,
                            help='Packet queue size (1=lowest latency, 3=most stable, default: 3)')
 
+    # Authentication settings (v1.4)
+    auth_group = parser.add_argument_group('Authentication Settings')
+    auth_group.add_argument('--auth', dest='auth_enabled', action='store_true',
+                            help='Enable HMAC-SHA256 authentication (network mode only)')
+    auth_group.add_argument('--no-auth', dest='auth_enabled', action='store_false',
+                            help='Disable authentication (default)')
+    auth_group.add_argument('--auth-key', dest='auth_key_path', type=str, default=None,
+                            help='Path to auth key file (default: ~/.config/scrcpy-py-ddlx/auth_keys/{serial}.key)')
+
     # Audio settings
     audio_group = parser.add_argument_group('Audio Settings')
     audio_group.add_argument('--audio', dest='audio_enabled', action='store_true',
@@ -251,7 +281,8 @@ Server Lifecycle Modes:
         encoder_priority=1,
         encoder_buffer=0,
         skip_frames=True,
-        multiprocess=False
+        multiprocess=False,
+        auth_enabled=True,  # 默认启用认证（网络模式）
     )
 
     return parser.parse_args()
@@ -430,7 +461,7 @@ def check_server_running():
         return False
 
 
-def start_server(args):
+def start_server(args, device_serial: str = None):
     """
     Start server on device.
 
@@ -441,6 +472,13 @@ def start_server(args):
     When args.reuse_server=True:
     - If server is already running, skip push/start and let client use UDP wake
     - If server is not running, push and start as normal
+
+    Authentication:
+    - If args.auth_enabled=True: Generate/load auth key and push to device
+    - Key is saved locally for client to use during connection
+
+    Returns:
+        bool: True if successful, False otherwise
     """
     server_running = check_server_running()
 
@@ -472,6 +510,54 @@ def start_server(args):
             print(f"[WARN] Server APK not found: {server_apk}")
     else:
         print("[INFO] PUSH_SERVER=False: Skipping server push")
+
+    # Handle authentication key
+    auth_key = None
+    if args.auth_enabled and device_serial:
+        from scrcpy_py_ddlx.core.auth import (
+            generate_auth_key, save_auth_key, load_auth_key
+        )
+        import tempfile
+
+        # Try to load existing key, or generate new one
+        auth_key = load_auth_key(device_serial)
+        if auth_key is None:
+            print(f"[INFO] Generating new auth key for device {device_serial}")
+            auth_key = generate_auth_key()
+        else:
+            print(f"[INFO] Loaded existing auth key for device {device_serial}")
+
+        # Save key locally (for client to use)
+        save_auth_key(device_serial, auth_key)
+
+        # Also save with IP as key (for client's load_auth_key(host) call)
+        if args.device_ip:
+            save_auth_key(args.device_ip, auth_key)
+            print(f"[INFO] Auth key also saved with IP: {args.device_ip}")
+
+        # Push key to device
+        print("[INFO] Pushing auth key to device...")
+        temp_key_path = Path(tempfile.gettempdir()) / "scrcpy-auth.key"
+        temp_key_path.write_bytes(auth_key)
+
+        # Use MSYS_NO_PATHCONV to prevent Git Bash path conversion
+        env = os.environ.copy()
+        env['MSYS_NO_PATHCONV'] = '1'
+        result = subprocess.run(
+            ['adb', 'push', str(temp_key_path), '/data/local/tmp/scrcpy-auth.key'],
+            capture_output=True, text=True, timeout=10,
+            env=env
+        )
+        temp_key_path.unlink()  # Clean up temp file
+
+        if result.returncode != 0:
+            print(f"[WARN] Failed to push auth key: {result.stderr}")
+        else:
+            print(f"[INFO] Auth key pushed to device")
+    elif not args.auth_enabled:
+        print("[INFO] Authentication disabled (--no-auth)")
+    elif not device_serial:
+        print("[WARN] Cannot setup auth: device serial not available")
 
     # Start server
     print("[INFO] Starting server...")
@@ -534,6 +620,10 @@ def start_server(args):
 
     if args.stay_alive and args.max_connections > 0:
         server_cmd += f"max_connections={args.max_connections} "
+
+    # Add auth_key_file parameter if authentication is enabled
+    if args.auth_enabled and auth_key:
+        server_cmd += "auth_key_file=/data/local/tmp/scrcpy-auth.key "
 
     server_cmd += (
         f"video=true {audio_params} control=true send_device_meta=true send_dummy_byte=true cleanup=false"
@@ -609,6 +699,13 @@ def main():
             print("[ERROR]   python tests_gui/test_network_direct.py --ip 192.168.1.100")
             return
 
+    # Get device serial for authentication
+    device_serial = get_device_serial()
+    if device_serial:
+        print(f"[INFO] Device serial: {device_serial}")
+    else:
+        print("[WARN] Could not get device serial, authentication may not work")
+
     # Handle --list-encoders
     if args.list_encoders:
         print("[INFO] Querying device encoders...")
@@ -668,6 +765,14 @@ def main():
     print(f"[INFO] Video codec: {args.video_codec.upper()}, Bitrate: {args.video_bitrate // 1000} Kbps, Max FPS: {args.max_fps}")
     print(f"[INFO] Audio: {'enabled' if args.audio_enabled else 'disabled'}")
 
+    # Show authentication status
+    if args.auth_enabled:
+        print(f"[INFO] Authentication: ENABLED (HMAC-SHA256)")
+        if args.auth_key_path:
+            print(f"[INFO] Auth key path: {args.auth_key_path}")
+    else:
+        print(f"[INFO] Authentication: DISABLED (--no-auth)")
+
     # Show low latency settings
     if args.low_latency or args.encoder_priority != 1 or args.encoder_buffer != 0 or not args.skip_frames:
         print(f"[INFO] Low Latency: low_latency={args.low_latency}, priority={args.encoder_priority}, "
@@ -720,7 +825,7 @@ def main():
         else:
             print("[INFO] Found running server (will restart)")
 
-    if not start_server(args):
+    if not start_server(args, device_serial):
         return
 
     # Create client config for network mode

@@ -1,8 +1,8 @@
 # scrcpy-py-ddlx 客户端-服务端通信协议规范
 
-> **版本**: 1.3
-> **最后更新**: 2026-02-20
-> **状态**: 实现 - TCP控制通道心跳已添加
+> **版本**: 1.4
+> **最后更新**: 2026-02-28
+> **状态**: 实现 - 网络模式认证已添加
 
 本文档定义了 scrcpy-py-ddlx 项目中客户端（Python）和服务端（Android/Java）之间的通信协议。**任何对协议的修改都必须同时更新本文档，并确保双方实现一致。**
 
@@ -513,6 +513,7 @@ Scrcpy 头部: 12 字节
 | 19 | TYPE_GET_APP_LIST | 获取应用列表 |
 | 20-24 | TYPE_*_VIDEO/AUDIO | 媒体流控制 |
 | **25** | **TYPE_PING** | **心跳请求 [v1.3新增]** |
+| **0xF1** | **TYPE_RESPONSE** | **认证响应 [v1.4新增]** |
 
 #### 服务端 -> 客户端 (DeviceMessage)
 
@@ -524,6 +525,12 @@ Scrcpy 头部: 12 字节
 | 3 | TYPE_APP_LIST | 应用列表 |
 | 4 | TYPE_SCREENSHOT | 截图数据 |
 | **5** | **TYPE_PONG** | **心跳响应 [v1.3新增]** |
+| 6 | TYPE_FILE_CHANNEL_INFO | 文件通道端口信息 |
+| **0xF0** | **TYPE_CHALLENGE** | **认证挑战 [v1.4新增]** |
+| **0xF2** | **TYPE_AUTH_RESULT** | **认证结果 [v1.4新增]** |
+| **6** | **TYPE_FILE_CHANNEL_INFO** | **文件通道端口信息** |
+| **0xF0** | **TYPE_CHALLENGE** | **认证挑战 [v1.4新增]** |
+| **0xF2** | **TYPE_AUTH_RESULT** | **认证结果 [v1.4新增]** |
 
 ### 6.3 心跳机制 (v1.3)
 
@@ -577,6 +584,88 @@ PONG (Server -> Client):
 | 客户端心跳管理器 | `heartbeat.py` - `HeartbeatManager` |
 | 客户端 PING 发送 | `control.py` - `set_ping()` |
 | 客户端 PONG 接收 | `device_msg.py` - `_process_pong()` |
+
+### 6.4 认证机制 (v1.4)
+
+网络模式使用 HMAC-SHA256 Challenge-Response 认证，防止未授权访问。
+
+#### 安全设计
+
+- **密钥生成**: 客户端生成 32 字节随机密钥
+- **密钥分发**: 通过 ADB 安全通道推送到设备
+- **认证算法**: HMAC-SHA256
+- **密钥存储**: 本地文件 (0600 权限)
+- **密钥生命周期**: 单次会话有效（服务端读取后删除）
+
+#### 消息格式
+
+```
+CHALLENGE (Server -> Client):
+  类型:        1 字节 = 0xF0
+  challenge:   32 字节 (随机数)
+  总大小:      33 字节
+
+RESPONSE (Client -> Server):
+  类型:        1 字节 = 0xF1
+  response:    32 字节 (HMAC-SHA256(key, challenge))
+  总大小:      33 字节
+
+AUTH_RESULT (Server -> Client):
+  类型:        1 字节 = 0xF2
+  result:      1 字节 (0=失败, 1=成功)
+  error_len:   2 字节 (uint16, big-endian, 仅失败时)
+  error_msg:   N 字节 (UTF-8, 仅失败时)
+  总大小:      2+ 字节
+```
+
+#### 认证流程
+
+```
+┌─────────────────┐                    ┌─────────────────┐
+│    客户端        │                    │    服务端        │
+└────────┬────────┘                    └────────┬────────┘
+         │                                      │
+         │         TCP 连接建立                  │
+         │  ─────────────────────────────────> │
+         │                                      │
+         │  <─── CHALLENGE (32字节随机数) ─────│
+         │                                      │
+         │  计算: response = HMAC(key, challenge)
+         │                                      │
+         │  ──── RESPONSE (32字节HMAC) ───────>│
+         │                                      │
+         │                              验证: compare(response, expected)
+         │                                      │
+         │  <─── AUTH_RESULT (成功/失败) ──────│
+         │                                      │
+         │         认证成功，继续连接            │
+         │  ──── Dummy Byte (可选) ──────────> │
+         │                                      │
+```
+
+#### 实现位置
+
+| 组件 | 文件 |
+|------|------|
+| 客户端密钥管理 | `auth.py` - 密钥生成/加载/HMAC计算 |
+| 客户端认证流程 | `connection.py` - `perform_auth()` |
+| 服务端认证处理 | `AuthHandler.java` |
+| 服务端消息类型 | `DeviceMessage.java` - TYPE_CHALLENGE/AUTH_RESULT |
+| 客户端消息类型 | `ControlMessage.java` - TYPE_RESPONSE |
+| 服务端参数解析 | `Options.java` - authKeyFile |
+
+#### 密钥文件路径
+
+| 位置 | 路径 |
+|------|------|
+| 客户端本地 | `~/.config/scrcpy-py-ddlx/auth_keys/{device_serial}.key` |
+| 设备临时 | `/data/local/tmp/scrcpy-auth.key` (读取后删除) |
+
+#### 向后兼容
+
+- **ADB 模式**: 跳过认证（已通过 ADB 安全通道）
+- **无密钥**: 跳过认证（兼容旧版本服务端）
+- **认证失败**: 断开连接并返回错误信息
 
 ---
 

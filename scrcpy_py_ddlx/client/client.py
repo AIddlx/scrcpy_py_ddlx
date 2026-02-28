@@ -45,6 +45,10 @@ from scrcpy_py_ddlx.client.config import ClientConfig, ClientState
 from scrcpy_py_ddlx.client.components import ComponentFactory, USE_STREAMING_DEMUXER
 from scrcpy_py_ddlx.client.connection import ConnectionManager, NetworkConnection
 from scrcpy_py_ddlx.client.udp_wake import wake_device
+from scrcpy_py_ddlx.core.auth import (
+    load_auth_key,
+    AuthError,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -1204,6 +1208,7 @@ class ScrcpyClient:
         Initialize server connection in network mode.
 
         Uses TCP for control and UDP for media streams.
+        Includes HMAC-SHA256 Challenge-Response authentication if auth key exists.
         """
         try:
             host = self.config.host
@@ -1212,15 +1217,32 @@ class ScrcpyClient:
             if not wake_device(host, self.config.discovery_port):
                 logger.warning(f"Failed to wake device at {host}, trying direct connect...")
 
-            # Setup network connection with file port
+            # Load authentication key if available
+            # Auth key is identified by device IP (host)
+            auth_key = None
+            try:
+                auth_key = load_auth_key(host)
+                if auth_key:
+                    logger.info(f"Auth key loaded for {host}, will perform authentication")
+                else:
+                    logger.debug(f"No auth key found for {host}, connecting without auth")
+            except AuthError as e:
+                logger.warning(f"Failed to load auth key: {e}, connecting without auth")
+
+            # Setup network connection with file port and optional auth
             file_port = getattr(self.config, 'file_port', 27187)
+            video_port = self.config.video_port if self.config.video else 0
+            audio_port = self.config.audio_port if self.config.audio else 0
+            logger.info(f"Network mode ports: video={video_port} (enabled={self.config.video}), "
+                       f"audio={audio_port} (enabled={self.config.audio})")
             conn = ConnectionManager.setup_network_mode(
                 host=host,
                 control_port=self.config.control_port,
-                video_port=self.config.video_port,
-                audio_port=self.config.audio_port if self.config.audio else 0,
+                video_port=video_port,
+                audio_port=audio_port,
                 file_port=file_port,
-                send_dummy_byte=True
+                send_dummy_byte=True,
+                auth_key=auth_key
             )
 
             # Store control socket in state
@@ -2838,7 +2860,7 @@ class ScrcpyClient:
         msg.set_reset_video()
         self._control_queue.put(msg)
 
-    def request_screenshot(self) -> None:
+    def request_screenshot(self, quality: int = 75) -> None:
         """
         Request a screenshot via control message.
 
@@ -2853,11 +2875,15 @@ class ScrcpyClient:
         The screenshot will be received as a DeviceMessage with type SCREENSHOT.
         Use register_screenshot_callback() to handle the response.
 
+        Args:
+            quality: JPEG quality (1-100), default 75
+
         Note: Requires server support for SCREENSHOT message (TYPE_SCREENSHOT = 18).
         """
         msg = ControlMessage(ControlMessageType.SCREENSHOT)
+        msg._data["quality"] = max(1, min(100, quality))
         self._control_queue.put(msg)
-        logger.debug("Requested screenshot via control message")
+        logger.debug(f"Requested screenshot via control message (quality={quality})")
 
     def register_screenshot_callback(self, callback) -> None:
         """

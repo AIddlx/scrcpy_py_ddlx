@@ -40,56 +40,59 @@ try:
 except ImportError:
     STARLETTE_AVAILABLE = False
 
-# 配置日志
-log_dir = Path("logs")
-log_dir.mkdir(exist_ok=True)
+# 配置日志 - 使用统一的日志配置模块
+from scrcpy_py_ddlx.core.logging_config import setup_logging, get_cache_dir
 
-timestamp = datetime.now()
-log_file = log_dir / f"scrcpy_http_mcp_{timestamp.strftime('%Y%m%d_%H%M%S')}.log"
-
-# 创建日志格式
-log_format = '%(asctime)s | %(levelname)-8s | %(name)s | %(message)s'
-
-
-class ConsoleFilter(logging.Filter):
-    """
-    控制台日志过滤器
-
-    - 对于音频模块：只显示 WARNING 及以上
-    - 对于其他模块：显示 INFO 及以上
-    """
-    def filter(self, record):
-        # 音频模块只显示 WARNING+
-        if 'audio' in record.name.lower():
-            return record.levelno >= logging.WARNING
-        # 其他模块显示 INFO+
-        return record.levelno >= logging.INFO
-
-
-# 文件处理器：保存全部日志（DEBUG 及以上）
-file_handler = logging.FileHandler(log_file, encoding='utf-8')
-file_handler.setLevel(logging.DEBUG)
-file_handler.setFormatter(logging.Formatter(log_format))
-# 文件不使用过滤器，保存所有日志
-
-# 控制台处理器：使用过滤器控制显示
-console_handler = logging.StreamHandler(sys.stdout)
-console_handler.setLevel(logging.DEBUG)  # 设为 DEBUG，让过滤器决定
-console_handler.setFormatter(logging.Formatter(log_format))
-console_handler.addFilter(ConsoleFilter())  # 添加自定义过滤器
-
-# 配置根日志器
-root_logger = logging.getLogger()
-root_logger.setLevel(logging.DEBUG)  # 根级别设为 DEBUG，允许所有日志通过
-root_logger.addHandler(file_handler)
-root_logger.addHandler(console_handler)
-
+log_file = setup_logging(prefix="session")
 logger = logging.getLogger(__name__)
+logger.info(f"日志文件: {log_file}")
+logger.info(f"日志目录: {get_cache_dir() / 'logs'}")
 
-# 启用 scrcpy_py_ddlx 模块的日志
-# 不在这里设置级别，让日志传播到根日志器处理
-scrcpy_logger = logging.getLogger('scrcpy_py_ddlx')
-# 不要设置级别，使用默认的 NOTSET，让日志传播到根日志器
+
+def get_documents_dir() -> Path:
+    """
+    获取系统文档目录。
+
+    Windows: C:\\Users\\{user}\\Documents
+    Linux: ~/Documents (或 XDG_DOCUMENTS_DIR)
+    macOS: ~/Documents
+    """
+    home = Path.home()
+
+    if sys.platform == "win32":
+        # Windows: 使用 USERPROFILE\\Documents
+        docs = home / "Documents"
+    elif sys.platform == "darwin":
+        # macOS: ~/Documents
+        docs = home / "Documents"
+    else:
+        # Linux: 尝试 XDG_DOCUMENTS_DIR，否则 ~/Documents
+        xdg_docs = os.environ.get("XDG_DOCUMENTS_DIR")
+        if xdg_docs:
+            docs = Path(xdg_docs)
+        else:
+            docs = home / "Documents"
+
+    # 确保目录存在
+    docs.mkdir(parents=True, exist_ok=True)
+    return docs
+
+
+def get_save_dir(category: str) -> Path:
+    """
+    获取保存目录。
+
+    Args:
+        category: 类别 ("screenshots", "recordings", "files")
+
+    Returns:
+        保存目录路径
+    """
+    docs = get_documents_dir()
+    save_dir = docs / "scrcpy-py-ddlx" / category
+    save_dir.mkdir(parents=True, exist_ok=True)
+    return save_dir
+
 
 # 默认音频配置（可通过 --audio 命令行参数修改）
 DEFAULT_AUDIO_ENABLED = False
@@ -320,7 +323,7 @@ TOOLS = [
     # 网络模式专用推送工具
     {
         "name": "push_server_onetime",
-        "description": "Push and start scrcpy server for ONE-TIME network connection. REQUIRES USB. Server exits after disconnect. Set auto_connect=true to connect immediately after push. DEFAULT: control-only (no video/audio). Set video=true for preview/screenshot, audio=true for recording.",
+        "description": "Push and start scrcpy server for ONE-TIME network connection. REQUIRES USB. Server exits after disconnect. Set auto_connect=true to connect immediately after push. DEFAULT: control-only (no video/audio). Set video=true for preview/screenshot, audio=true for recording. SECURITY: auth=true (default) enables HMAC-SHA256 authentication.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -331,13 +334,14 @@ TOOLS = [
                 "video_codec": {"type": "string", "enum": ["auto", "h264", "h265", "av1"], "default": "auto"},
                 "video_bitrate": {"type": "integer", "default": 8000000},
                 "max_fps": {"type": "integer", "default": 60},
-                "auto_connect": {"type": "boolean", "default": False, "description": "Auto connect via network after push (one-step flow)"}
+                "auto_connect": {"type": "boolean", "default": False, "description": "Auto connect via network after push (one-step flow)"},
+                "auth": {"type": "boolean", "default": True, "description": "Enable HMAC-SHA256 authentication (recommended for network mode)"}
             }
         }
     },
     {
         "name": "push_server_persistent",
-        "description": "Push and start scrcpy server for PERSISTENT network connection. REQUIRES USB. Server keeps running after disconnect, supports hot-reconnect. DEFAULT: control-only (no video/audio). Set video=true for preview/screenshot, audio=true for recording. Flow: 1) USB connect, 2) push_server_persistent(video=true,audio=true), 3) unplug USB, 4) connect/disconnect anytime. Server runs until stop_server() or device reboot.",
+        "description": "Push and start scrcpy server for PERSISTENT network connection. REQUIRES USB. Server keeps running after disconnect, supports hot-reconnect. DEFAULT: control-only (no video/audio). Set video=true for preview/screenshot, audio=true for recording. Flow: 1) USB connect, 2) push_server_persistent(video=true,audio=true), 3) unplug USB, 4) connect/disconnect anytime. Server runs until stop_server() or device reboot. SECURITY: auth=true (default) enables HMAC-SHA256 authentication.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -349,7 +353,8 @@ TOOLS = [
                 "video_bitrate": {"type": "integer", "default": 8000000},
                 "max_fps": {"type": "integer", "default": 60},
                 "max_connections": {"type": "integer", "default": -1, "description": "Max connections before exit (-1 = unlimited)"},
-                "fec_enabled": {"type": "boolean", "default": False, "description": "Enable FEC for unstable networks"}
+                "fec_enabled": {"type": "boolean", "default": False, "description": "Enable FEC for unstable networks"},
+                "auth": {"type": "boolean", "default": True, "description": "Enable HMAC-SHA256 authentication (recommended for network mode)"}
             }
         }
     },
@@ -384,7 +389,7 @@ TOOLS = [
     # 屏幕
     {
         "name": "screenshot",
-        "description": "Capture screenshot from device. MODES: 1) video=true (default): Fast screenshot from video stream (~16ms). 2) video=false (low power): Screenshot via ADB screencap (~500ms), no video stream needed. Recording requires audio=true.",
+        "description": "Capture screenshot from device. Automatically selects best method based on connection mode (video stream / TCP control / ADB screencap).",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -663,7 +668,7 @@ TOOLS = [
     # 录 音
     {
         "name": "record_audio",
-        "description": "Record audio to file for a specific duration. Three modes: (1) format=auto or omit -> passthrough original OPUS to .ogg (best quality), (2) format=wav -> decode to PCM WAV, (3) format=opus/mp3 -> decode and re-encode",
+        "description": "Record audio from device. Automatically selects best method based on connection mode. Requires audio=true at startup.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -895,6 +900,8 @@ class ScrcpyMCPHandler:
         self._server = None
         self._lock = threading.Lock()  # 线程安全锁
         self._current_config = None    # 当前配置
+        self._screenshot_method = None  # 截图方式: "video_stream", "tcp_screenshot", "adb_screencap"
+        self._audio_method = None       # 音频录制方式: "audio_stream", "adb_record"
 
     def _is_client_connected(self) -> bool:
         """检查客户端是否已连接"""
@@ -1037,6 +1044,8 @@ class ScrcpyMCPHandler:
             self._server = None
             self._client = None
             self._current_config = None
+            self._screenshot_method = None
+            self._audio_method = None
             logger.info("Cleaned up dead connection")
 
     def _config_matches(self, **kwargs) -> bool:
@@ -1071,6 +1080,154 @@ class ScrcpyMCPHandler:
                 return False
 
         return True
+
+    def _screenshot_via_tcp(self, arguments: dict) -> dict:
+        """
+        通过 TCP SCREENSHOT 控制消息截图。
+
+        适用于: 网络模式 + video=false
+        原理: 发送 TYPE_SCREENSHOT 控制消息，服务端通过 SurfaceControl 截图并返回 JPEG
+        """
+        import threading
+        import time
+        from pathlib import Path
+        from PIL import Image
+        import io
+
+        # 获取质量参数，默认75
+        quality = arguments.get('quality', 75)
+
+        jpeg_data = None
+        error_msg = None
+        screenshot_event = threading.Event()
+
+        def on_screenshot(data):
+            nonlocal jpeg_data, error_msg
+            if data:
+                jpeg_data = data
+            else:
+                error_msg = "Server returned empty screenshot"
+            screenshot_event.set()
+
+        try:
+            # 注册回调并发送截图请求（带质量参数）
+            self._client.register_screenshot_callback(on_screenshot)
+            self._client.request_screenshot(quality=quality)
+
+            # 等待截图完成（最多 5 秒）
+            if not screenshot_event.wait(timeout=5.0):
+                return {
+                    "success": False,
+                    "error": "Screenshot timeout",
+                    "hint": "Server did not respond to SCREENSHOT request"
+                }
+
+            if error_msg or not jpeg_data:
+                return {
+                    "success": False,
+                    "error": error_msg or "No screenshot data received"
+                }
+
+            # 处理截图数据
+            img_format = arguments.get('format', 'jpg')
+
+            img = Image.open(io.BytesIO(jpeg_data))
+            width, height = img.size
+
+            timestamp = __import__("datetime").datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
+            save_dir = get_save_dir("screenshots")
+            filename = str(save_dir / f"screenshot_{timestamp}.{img_format}")
+
+            if img_format.lower() in ('jpg', 'jpeg'):
+                if img.mode == 'RGBA':
+                    img = img.convert('RGB')
+                img.save(filename, 'JPEG', quality=quality)
+            else:
+                img.save(filename, 'PNG')
+
+            return {
+                "success": True,
+                "filename": filename,
+                "width": width,
+                "height": height,
+                "orientation": "portrait" if height > width else "landscape",
+                "format": img_format,
+                "quality": quality if img_format.lower() in ('jpg', 'jpeg') else None,
+                "method": "tcp_screenshot"
+            }
+
+        except Exception as e:
+            logger.error(f"TCP screenshot failed: {e}")
+            return {
+                "success": False,
+                "error": str(e),
+                "hint": "TCP screenshot failed, try reconnecting"
+            }
+
+    def _screenshot_via_adb(self, arguments: dict) -> dict:
+        """
+        通过 ADB screencap 截图。
+
+        适用于: ADB 隧道模式 + video=false
+        原理: 执行 adb exec-out screencap -p 获取 PNG 数据
+        """
+        import subprocess
+        from pathlib import Path
+        from PIL import Image
+        import io
+
+        try:
+            device_serial = getattr(self._client.state, 'device_serial', None) if self._client else None
+
+            # 构建 ADB 命令
+            adb_cmd = ['adb']
+            if device_serial:
+                adb_cmd.extend(['-s', device_serial])
+            adb_cmd.extend(['exec-out', 'screencap', '-p'])
+
+            # 执行截图
+            proc = subprocess.run(adb_cmd, capture_output=True, timeout=10)
+            if proc.returncode != 0:
+                raise Exception(f"ADB screencap failed: {proc.stderr.decode()}")
+
+            # 获取格式和质量参数
+            img_format = arguments.get('format', 'jpg')
+            quality = arguments.get('quality', 80)
+
+            # 打开图片
+            img = Image.open(io.BytesIO(proc.stdout))
+            width, height = img.size
+
+            # 根据格式保存
+            timestamp = __import__("datetime").datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
+            save_dir = get_save_dir("screenshots")
+            filename = str(save_dir / f"screenshot_{timestamp}.{img_format}")
+
+            if img_format.lower() in ('jpg', 'jpeg'):
+                if img.mode == 'RGBA':
+                    img = img.convert('RGB')
+                img.save(filename, 'JPEG', quality=quality)
+            else:
+                img.save(filename, 'PNG')
+
+            return {
+                "success": True,
+                "filename": filename,
+                "width": width,
+                "height": height,
+                "orientation": "portrait" if height > width else "landscape",
+                "format": img_format,
+                "quality": quality if img_format.lower() in ('jpg', 'jpeg') else None,
+                "method": "adb_screencap"
+            }
+
+        except Exception as e:
+            logger.error(f"ADB screencap failed: {e}")
+            return {
+                "success": False,
+                "error": str(e),
+                "hint": "Check ADB connection"
+            }
 
     def _start_control_event_reader(self):
         """Start background thread to read control events from preview window.
@@ -1522,12 +1679,27 @@ class ScrcpyMCPHandler:
                 - fec_enabled, video_fec_enabled, audio_fec_enabled: FEC 开关
                 - fec_group_size, fec_parity_count: FEC 参数
         """
-        # 提取参数
-        connection_mode = kwargs.get('connection_mode', 'adb_tunnel')
+        # 从当前配置获取默认值（如果存在）
+        if self._current_config:
+            default_connection_mode = getattr(self._current_config, 'connection_mode', 'adb_tunnel')
+            default_video = self._current_config.video
+            default_audio = self._current_config.audio
+            default_audio_dup = getattr(self._current_config, 'audio_dup', DEFAULT_AUDIO_DUP)
+        else:
+            default_connection_mode = 'adb_tunnel'
+            default_video = True
+            default_audio = DEFAULT_AUDIO_ENABLED
+            default_audio_dup = DEFAULT_AUDIO_DUP
+
+        # 提取参数，使用当前配置作为默认值
+        connection_mode = kwargs.get('connection_mode', default_connection_mode)
         device_id = kwargs.get('device_id', None)
-        video = kwargs.get('video', True)
-        audio = kwargs.get('audio', DEFAULT_AUDIO_ENABLED)
-        audio_dup = kwargs.get('audio_dup', DEFAULT_AUDIO_DUP)  # Duplicate audio on device and computer
+        video = kwargs.get('video', default_video)
+        audio = kwargs.get('audio', default_audio)
+        audio_dup = kwargs.get('audio_dup', default_audio_dup)
+
+        # Debug: log parameter values
+        logger.info(f"[CONNECT] Parameters: video={video}, audio={audio}, connection_mode={connection_mode}")
         codec = kwargs.get('codec', 'auto')
         bitrate = kwargs.get('bitrate', 8000000)
         max_fps = kwargs.get('max_fps', 60)
@@ -1606,6 +1778,25 @@ class ScrcpyMCPHandler:
             )
 
             self._current_config = config
+
+            # 根据配置确定截图方式
+            if video:
+                self._screenshot_method = "video_stream"
+            elif connection_mode == "network":
+                # 网络模式 + video=false: 使用 TCP SCREENSHOT 控制消息（SurfaceControl截图）
+                self._screenshot_method = "tcp_screenshot"
+            else:
+                # ADB 隧道模式 + video=false: 使用 ADB screencap
+                self._screenshot_method = "adb_screencap"
+            logger.info(f"Screenshot method: {self._screenshot_method}")
+
+            # 根据配置确定音频录制方式
+            if audio:
+                self._audio_method = "audio_stream"
+            else:
+                # audio=false: 使用 ADB screenrecord 录制
+                self._audio_method = "adb_record"
+            logger.info(f"Audio method: {self._audio_method}")
 
             # 创建服务器
             self._server = create_mcp_server(default_config=config, log_file=None, enable_console_log=False)
@@ -2148,6 +2339,9 @@ class ScrcpyMCPHandler:
                         fec_group_size = arguments.get("fec_group_size", 4)
                         fec_parity_count = arguments.get("fec_parity_count", 1)
 
+                        # 认证参数
+                        auth_enabled = arguments.get("auth", True)
+
                         # 构建基础 adb 命令前缀
                         def adb_cmd(args):
                             if device_id:
@@ -2241,6 +2435,76 @@ class ScrcpyMCPHandler:
                         else:
                             result_data["push"] = "skipped"
 
+                        # 处理认证密钥
+                        auth_key_file_param = ""
+                        if auth_enabled and start_server:
+                            try:
+                                from scrcpy_py_ddlx.core.auth import (
+                                    generate_auth_key, save_auth_key, load_auth_key
+                                )
+                                import tempfile
+
+                                # 获取设备序列号
+                                serial_result = subprocess.run(
+                                    adb_cmd(["shell", "getprop ro.serialno"]),
+                                    capture_output=True, text=True, timeout=5
+                                )
+                                device_serial = serial_result.stdout.strip() if serial_result.returncode == 0 else None
+
+                                if device_serial:
+                                    # 加载或生成密钥
+                                    auth_key = load_auth_key(device_serial)
+                                    if auth_key is None:
+                                        auth_key = generate_auth_key()
+                                        logger.info(f"Generated new auth key for device {device_serial}")
+
+                                    # 保存密钥（用序列号和 IP 两种方式）
+                                    save_auth_key(device_serial, auth_key)
+
+                                    # 获取设备 IP 并保存（客户端用 IP 查找密钥）
+                                    try:
+                                        ip_result = subprocess.run(
+                                            adb_cmd(["shell", "ip route | awk '/src/ {print $NF}' | head -1"]),
+                                            capture_output=True, text=True, timeout=5
+                                        )
+                                        device_ip = ip_result.stdout.strip() if ip_result.returncode == 0 else None
+                                        if device_ip:
+                                            save_auth_key(device_ip, auth_key)
+                                            logger.info(f"Auth key also saved with IP: {device_ip}")
+                                    except Exception:
+                                        pass
+
+                                    # 推送密钥到设备
+                                    temp_key_path = os.path.join(tempfile.gettempdir(), "scrcpy-auth.key")
+                                    with open(temp_key_path, 'wb') as f:
+                                        f.write(auth_key)
+
+                                    # 使用 MSYS_NO_PATHCONV 防止路径转换
+                                    env = os.environ.copy()
+                                    env['MSYS_NO_PATHCONV'] = '1'
+                                    push_key_result = subprocess.run(
+                                        adb_cmd(["push", temp_key_path, "/data/local/tmp/scrcpy-auth.key"]),
+                                        capture_output=True, text=True, timeout=10,
+                                        env=env
+                                    )
+                                    os.unlink(temp_key_path)
+
+                                    if push_key_result.returncode == 0:
+                                        auth_key_file_param = "auth_key_file=/data/local/tmp/scrcpy-auth.key "
+                                        result_data["auth"] = {"enabled": True, "device_serial": device_serial}
+                                        logger.info(f"Auth key pushed to device {device_serial}")
+                                    else:
+                                        logger.warning(f"Failed to push auth key: {push_key_result.stderr}")
+                                        result_data["auth"] = {"enabled": False, "error": "Push failed"}
+                                else:
+                                    logger.warning("Could not get device serial, skipping auth")
+                                    result_data["auth"] = {"enabled": False, "error": "No device serial"}
+                            except Exception as e:
+                                logger.warning(f"Auth setup failed: {e}")
+                                result_data["auth"] = {"enabled": False, "error": str(e)}
+                        else:
+                            result_data["auth"] = {"enabled": False, "reason": "Disabled or no start"}
+
                         # 启动服务端
                         if start_server:
                             logger.info("Starting server with nohup...")
@@ -2306,6 +2570,9 @@ class ScrcpyMCPHandler:
                                     server_cmd += f"audio_fec_enabled=true "
                                 if video_fec_enabled or audio_fec_enabled:
                                     server_cmd += f"fec_group_size={fec_group_size} fec_parity_count={fec_parity_count} "
+
+                            # 认证参数
+                            server_cmd += auth_key_file_param
 
                             server_cmd += (
                                 f"video={'true' if video_enabled else 'false'} {audio_params} control=true send_device_meta=true send_dummy_byte=true cleanup=false"
@@ -2538,8 +2805,7 @@ class ScrcpyMCPHandler:
                 if tool_name == "screenshot":
                     from datetime import datetime
                     from pathlib import Path
-                    screenshots_dir = Path("screenshots")
-                    screenshots_dir.mkdir(exist_ok=True)
+                    screenshots_dir = get_save_dir("screenshots")
                     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S_%f')[:-3]  # 毫秒精度
 
                     # 获取格式和质量参数
@@ -2551,20 +2817,11 @@ class ScrcpyMCPHandler:
                     arguments["filename"] = filename
                     arguments["quality"] = quality
 
-                # record_audio 操作特殊处理 - 处理 audio=False 情况 + 格式选择
+                # record_audio 操作特殊处理 - 格式选择
                 if tool_name == "record_audio":
-                    # 检查音频是否启用
-                    if self._current_config and not self._current_config.audio:
-                        return {
-                            "content": [{"type": "text", "text": json.dumps({
-                                "success": False,
-                                "error": "Audio not enabled",
-                                "hint": "Reconnect with audio=true to enable recording, or use ADB to record directly on device."
-                            }, ensure_ascii=False)}]}
                     from datetime import datetime
                     from pathlib import Path
-                    recordings_dir = Path("recordings")
-                    recordings_dir.mkdir(exist_ok=True)
+                    recordings_dir = get_save_dir("recordings")
                     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
 
                     # 获取格式参数，默认 auto（透传原始格式）
@@ -2602,8 +2859,7 @@ class ScrcpyMCPHandler:
                 if tool_name == "record_video":
                     from datetime import datetime
                     from pathlib import Path
-                    recordings_dir = Path("recordings")
-                    recordings_dir.mkdir(exist_ok=True)
+                    recordings_dir = get_save_dir("recordings")
                     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
                     # Use MKV format if audio is enabled (supports OPUS passthrough)
                     audio_enabled = self._current_config and self._current_config.audio
@@ -2807,14 +3063,14 @@ class ScrcpyMCPHandler:
                         }, ensure_ascii=False)}]}
 
                 # ==================== screenshot 处理 ====================
-                # screenshot: 根据 video 配置和连接模式选择方法
+                # screenshot: 使用连接时确定的截图方式
                 if tool_name == "screenshot":
-                    video_enabled = self._current_config and self._current_config.video
-                    connection_mode = getattr(self._current_config, 'connection_mode', 'adb_tunnel') if self._current_config else 'adb_tunnel'
+                    screenshot_method = self._screenshot_method or "adb_screencap"
+                    logger.debug(f"Screenshot using method: {screenshot_method}")
 
-                    if video_enabled:
-                        # 模式一：实时预览模式 - 从视频流截取当前帧 (~16ms)
-                        logger.info("Screenshot from video stream (video=true)")
+                    if screenshot_method == "video_stream":
+                        # 模式一：从视频流截取当前帧 (~16ms)
+                        logger.debug("Screenshot from video stream")
                         result = server.screenshot(**arguments)
                         if result.get("success"):
                             result["method"] = "video_stream"
@@ -2822,83 +3078,51 @@ class ScrcpyMCPHandler:
                             screen_warning = self._check_screen_off()
                             if screen_warning:
                                 result["warning"] = screen_warning
-                                logger.warning(f"Screen off detected during screenshot: {screen_warning}")
-                    elif connection_mode == "adb_tunnel":
-                        # ADB 隧道模式 + video=False：直接用 ADB screencap (~300ms)
-                        logger.info("Screenshot via ADB screencap (video=false)")
-                        try:
-                            import subprocess
-                            from pathlib import Path
-                            from PIL import Image
-                            import io
+                                logger.warning(f"Screen off detected: {screen_warning}")
 
-                            device_serial = getattr(self._client.state, 'device_serial', None) if self._client else None
+                    elif screenshot_method == "tcp_screenshot":
+                        # 网络模式 + video=false: TCP SCREENSHOT 控制消息 (~50-100ms)
+                        logger.debug("Screenshot via TCP SCREENSHOT control message")
+                        result = self._screenshot_via_tcp(arguments)
 
-                            # 构建 ADB 命令
-                            adb_cmd = ['adb']
-                            if device_serial:
-                                adb_cmd.extend(['-s', device_serial])
-                            adb_cmd.extend(['exec-out', 'screencap', '-p'])
-
-                            # 执行截图
-                            proc = subprocess.run(adb_cmd, capture_output=True, timeout=10)
-                            if proc.returncode != 0:
-                                raise Exception(f"ADB screencap failed: {proc.stderr.decode()}")
-
-                            # 获取格式和质量参数
-                            img_format = arguments.get('format', 'jpg') if 'format' in arguments else 'jpg'
-                            quality = arguments.get('quality', 80)
-
-                            # 打开图片
-                            img = Image.open(io.BytesIO(proc.stdout))
-                            width, height = img.size
-
-                            # 根据格式保存
-                            timestamp = __import__("datetime").datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
-                            filename = str(Path("screenshots") / f"screenshot_{timestamp}.{img_format}")
-                            Path("screenshots").mkdir(exist_ok=True)
-
-                            if img_format.lower() in ('jpg', 'jpeg'):
-                                # JPEG with quality
-                                if img.mode == 'RGBA':
-                                    img = img.convert('RGB')  # JPEG doesn't support alpha
-                                img.save(filename, 'JPEG', quality=quality)
-                            else:
-                                # PNG (lossless)
-                                img.save(filename, 'PNG')
-
-                            result = {
-                                "success": True,
-                                "filename": filename,
-                                "width": width,
-                                "height": height,
-                                "orientation": "portrait" if height > width else "landscape",
-                                "format": img_format,
-                                "quality": quality if img_format.lower() in ('jpg', 'jpeg') else None,
-                                "method": "adb_screencap"
-                            }
-                        except Exception as e:
-                            logger.warning(f"ADB screencap failed: {e}")
-                            result = {
-                                "success": False,
-                                "error": str(e),
-                                "hint": "Check ADB connection"
-                            }
                     else:
-                        # 网络模式 + video=False：使用 REQUEST_VIDEO_FRAME 控制消息
-                        logger.info("Screenshot via REQUEST_VIDEO_FRAME (network mode, video=false)")
-                        try:
-                            server._client.request_video_frame()
-                            import time
-                            time.sleep(0.5)
-                            result = server.screenshot(**arguments)
-                        except Exception as e:
-                            logger.warning(f"request_video_frame failed: {e}")
-                            result = {
-                                "success": False,
-                                "error": f"Screenshot failed: {e}",
-                                "hint": "Reconnect with video=true"
-                            }
+                        # ADB screencap (~300ms)
+                        logger.debug("Screenshot via ADB screencap")
+                        result = self._screenshot_via_adb(arguments)
+
+                # ==================== record_audio 处理 ====================
+                # record_audio: 使用连接时确定的音频录制方式
+                elif tool_name == "record_audio":
+                    audio_method = self._audio_method or "adb_record"
+                    logger.debug(f"Record audio using method: {audio_method}")
+
+                    if audio_method == "audio_stream":
+                        # 模式一：从音频流录制
+                        logger.debug("Recording from audio stream")
+                        result = server.record_audio(**arguments)
+                        if result.get("success"):
+                            result["method"] = "audio_stream"
+
+                    else:
+                        # 模式二：ADB 录制 (暂不支持)
+                        result = {
+                            "success": False,
+                            "error": "Audio recording not available",
+                            "hint": "Audio recording requires audio=true. Use --usb-full or --net-full to enable audio."
+                        }
+
+                # ==================== stop_audio_recording 处理 ====================
+                elif tool_name == "stop_audio_recording":
+                    audio_method = self._audio_method or "adb_record"
+                    if audio_method == "audio_stream":
+                        result = server.stop_audio_recording(**arguments)
+                    else:
+                        result = {
+                            "success": False,
+                            "error": "No audio recording in progress",
+                            "hint": "Audio was not enabled at connection time"
+                        }
+
                 else:
                     # 调用 MCP 服务器的方法
                     method = getattr(server, tool_name, None)
@@ -3084,6 +3308,20 @@ _network_device = None
 _network_push_device = None  # --network-push mode
 _enable_video = True
 
+# Video quality settings
+_video_bitrate = 8000000
+_video_fps = 60
+_video_codec = "auto"
+
+
+def _exit_on_failure(reason: str, exit_code: int = 1):
+    """Exit program on auto-connect failure."""
+    logger.error(f"[AUTO_CONNECT] {reason}")
+    print(f"\n[AUTO_CONNECT] FAILED: {reason}")
+    print("[AUTO_CONNECT] Exiting...")
+    import os
+    os._exit(exit_code)
+
 
 async def on_startup():
     """Auto-connect to device on server startup (if configured)."""
@@ -3103,11 +3341,8 @@ async def on_startup():
     try:
         if _network_push_device:
             # Network mode with USB push: Push server via USB first, then connect by IP
-            device_ip = _network_push_device
-            logger.info(f"[AUTO_CONNECT] Network+Push mode: will push via USB then connect to {device_ip}")
-            print(f"\n[AUTO_CONNECT] Network+Push mode: {device_ip}")
 
-            # Step 1: Detect USB device
+            # Step 1: Detect USB device and get IP
             logger.info("[AUTO_CONNECT] Step 1: Detecting USB device...")
             print("[AUTO_CONNECT] Step 1: Detecting USB device...")
             list_result = await _execute_tool("list_devices", {})
@@ -3126,15 +3361,24 @@ async def on_startup():
                     devices = list_result.get("devices", [])
 
                 if not devices:
-                    logger.error("[AUTO_CONNECT] No USB devices found! Connect device via USB first.")
-                    print("[AUTO_CONNECT] No USB devices found! Connect device via USB first.")
-                    return
+                    _exit_on_failure("No USB devices found! Connect device via USB first.")
 
             device = devices[0]
             device_id = device.get("id") or device.get("serial")
             device_name = device.get("name", device_id)
-            logger.info(f"[AUTO_CONNECT] Found USB device: {device_name} ({device_id})")
+
+            # Auto-detect IP if needed
+            if _network_push_device == "auto":
+                device_ip = device.get("ip")
+                if not device_ip:
+                    _exit_on_failure("Could not auto-detect device IP. Please specify IP manually.")
+                logger.info(f"[AUTO_CONNECT] Auto-detected device IP: {device_ip}")
+            else:
+                device_ip = _network_push_device
+
+            logger.info(f"[AUTO_CONNECT] Found USB device: {device_name} ({device_id}), IP: {device_ip}")
             print(f"[AUTO_CONNECT] Found USB device: {device_name}")
+            print(f"\n[AUTO_CONNECT] Network+Push mode: {device_ip}")
 
             # Step 2: Push server via USB (one-time mode)
             logger.info("[AUTO_CONNECT] Step 2: Pushing server via USB...")
@@ -3149,9 +3393,7 @@ async def on_startup():
             push_result = await _execute_tool("push_server_onetime", push_params)
 
             if not push_result.get("success"):
-                logger.error(f"[AUTO_CONNECT] Push failed: {push_result.get('error')}")
-                print(f"[AUTO_CONNECT] Push failed: {push_result.get('error')}")
-                return
+                _exit_on_failure(f"Push failed: {push_result.get('error')}")
 
             logger.info("[AUTO_CONNECT] Server pushed successfully!")
             print("[AUTO_CONNECT] Server pushed successfully!")
@@ -3175,6 +3417,8 @@ async def on_startup():
                 "audio": DEFAULT_AUDIO_ENABLED,
                 "audio_dup": DEFAULT_AUDIO_DUP,
                 "codec": actual_codec,  # Use the same codec as the server
+                "bitrate": _video_bitrate,
+                "max_fps": _video_fps,
             }
             result = await _execute_tool("connect", connect_params)
 
@@ -3194,21 +3438,43 @@ async def on_startup():
                     logger.warning(f"[AUTO_CONNECT] Preview failed: {preview_result.get('error')}")
                     print(f"[AUTO_CONNECT] Preview failed: {preview_result.get('error')}")
             else:
-                logger.error(f"[AUTO_CONNECT] Connection failed: {result.get('error')}")
-                print(f"[AUTO_CONNECT] Connection failed: {result.get('error')}")
+                _exit_on_failure(f"Connection failed: {result.get('error')}")
 
         elif _network_device:
             # Network mode: Connect to device by IP
-            logger.info(f"[AUTO_CONNECT] Network mode: connecting to {_network_device}")
-            print(f"\n[AUTO_CONNECT] Network mode: connecting to {_network_device}...")
+            device_ip = _network_device
+
+            # Auto-detect IP if needed
+            if _network_device == "auto":
+                logger.info("[AUTO_CONNECT] Auto-detecting device IP from USB...")
+                print("[AUTO_CONNECT] Detecting device IP via USB...")
+                list_result = await _execute_tool("list_devices", {})
+                devices = list_result.get("devices", [])
+
+                if not devices:
+                    _exit_on_failure("No USB devices found for IP auto-detection!")
+
+                device = devices[0]
+                device_ip = device.get("ip")
+                if not device_ip:
+                    _exit_on_failure("Could not auto-detect device IP. Please specify IP manually.")
+
+                logger.info(f"[AUTO_CONNECT] Auto-detected device IP: {device_ip}")
+                print(f"[AUTO_CONNECT] Auto-detected IP: {device_ip}")
+
+            logger.info(f"[AUTO_CONNECT] Network mode: connecting to {device_ip}")
+            print(f"\n[AUTO_CONNECT] Network mode: connecting to {device_ip}...")
 
             # Parse connection params
             params = {
                 "connection_mode": "network",
-                "device_id": _network_device,
+                "device_id": device_ip,
                 "video": _enable_video,
                 "audio": DEFAULT_AUDIO_ENABLED,
                 "audio_dup": DEFAULT_AUDIO_DUP,
+                "codec": _video_codec,
+                "bitrate": _video_bitrate,
+                "max_fps": _video_fps,
             }
 
             # Call connect tool
@@ -3216,7 +3482,7 @@ async def on_startup():
 
             if result.get("success"):
                 logger.info(f"[AUTO_CONNECT] Connected successfully!")
-                print(f"[AUTO_CONNECT] Connected to {_network_device}!")
+                print(f"[AUTO_CONNECT] Connected to {device_ip}!")
 
                 # Auto-start preview if requested
                 if _auto_preview or _network_device:  # --network implies preview
@@ -3231,8 +3497,7 @@ async def on_startup():
                         logger.warning(f"[AUTO_CONNECT] Preview failed: {preview_result.get('error')}")
                         print(f"[AUTO_CONNECT] Preview failed: {preview_result.get('error')}")
             else:
-                logger.error(f"[AUTO_CONNECT] Connection failed: {result.get('error')}")
-                print(f"[AUTO_CONNECT] Connection failed: {result.get('error')}")
+                _exit_on_failure(f"Connection failed: {result.get('error')}")
 
         elif _auto_connect:
             # USB mode: Auto-connect to first available device
@@ -3256,9 +3521,7 @@ async def on_startup():
                     devices = list_result.get("devices", [])
 
                 if not devices:
-                    logger.error("[AUTO_CONNECT] No devices found!")
-                    print("[AUTO_CONNECT] No devices found!")
-                    return
+                    _exit_on_failure("No devices found!")
 
             # Get first device
             device = devices[0]
@@ -3275,6 +3538,9 @@ async def on_startup():
                 "video": _enable_video,
                 "audio": DEFAULT_AUDIO_ENABLED,
                 "audio_dup": DEFAULT_AUDIO_DUP,
+                "codec": _video_codec,
+                "bitrate": _video_bitrate,
+                "max_fps": _video_fps,
             }
 
             result = await _execute_tool("connect", params)
@@ -3296,12 +3562,10 @@ async def on_startup():
                         logger.warning(f"[AUTO_CONNECT] Preview failed: {preview_result.get('error')}")
                         print(f"[AUTO_CONNECT] Preview failed: {preview_result.get('error')}")
             else:
-                logger.error(f"[AUTO_CONNECT] Connection failed: {result.get('error')}")
-                print(f"[AUTO_CONNECT] Connection failed: {result.get('error')}")
+                _exit_on_failure(f"Connection failed: {result.get('error')}")
 
     except Exception as e:
-        logger.exception(f"[AUTO_CONNECT] Error: {e}")
-        print(f"[AUTO_CONNECT] Error: {e}")
+        _exit_on_failure(f"Error: {e}")
 
     logger.info("=" * 50)
 
@@ -3426,7 +3690,54 @@ def main():
         sys.exit(1)
 
     import argparse
-    parser = argparse.ArgumentParser(description="Scrcpy HTTP MCP Server")
+    parser = argparse.ArgumentParser(
+        description="Scrcpy HTTP MCP Server",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Quick Start Examples:
+  # USB Mode (low power - control only)
+  python scrcpy_http_mcp_server.py --usb
+
+  # USB Mode with video preview
+  python scrcpy_http_mcp_server.py --usb-video
+
+  # USB Mode with video + audio
+  python scrcpy_http_mcp_server.py --usb-full
+
+  # Network mode (control only, server must be running on device)
+  python scrcpy_http_mcp_server.py --net 192.168.1.100
+
+  # Network mode with video preview
+  python scrcpy_http_mcp_server.py --net-video 192.168.1.100
+
+  # Network mode with video + audio
+  python scrcpy_http_mcp_server.py --net-full 192.168.1.100
+
+  # Push server via USB then connect via network (first-time setup)
+  python scrcpy_http_mcp_server.py --push 192.168.1.100        # control only
+  python scrcpy_http_mcp_server.py --push-video 192.168.1.100  # with preview
+  python scrcpy_http_mcp_server.py --push-full 192.168.1.100   # with audio
+"""
+    )
+
+    # ========== Quick Start Arguments (Recommended) ==========
+
+    # USB quick modes
+    parser.add_argument("--usb", action="store_true", help="USB mode: control only (low power, no video/audio)")
+    parser.add_argument("--usb-video", action="store_true", help="USB mode: control + video preview")
+    parser.add_argument("--usb-full", action="store_true", help="USB mode: control + video + audio")
+
+    # Network quick modes (server must be running on device, IP optional - auto-detect from USB)
+    parser.add_argument("--net", nargs='?', const="auto", metavar="IP", help="Network mode: control only (low power). Auto-detect IP from USB if not specified")
+    parser.add_argument("--net-video", nargs='?', const="auto", metavar="IP", help="Network mode: control + video preview. Auto-detect IP if not specified")
+    parser.add_argument("--net-full", nargs='?', const="auto", metavar="IP", help="Network mode: control + video + audio. Auto-detect IP if not specified")
+
+    # Push quick modes (push server via USB first, IP optional - auto-detect from USB)
+    parser.add_argument("--push", nargs='?', const="auto", metavar="IP", help="Push + Network: control only. Auto-detect IP from USB if not specified")
+    parser.add_argument("--push-video", nargs='?', const="auto", metavar="IP", help="Push + Network: control + video preview. Auto-detect IP if not specified")
+    parser.add_argument("--push-full", nargs='?', const="auto", metavar="IP", help="Push + Network: control + video + audio. Auto-detect IP if not specified")
+
+    # ========== Advanced Arguments ==========
     parser.add_argument(
         "--port", "-p",
         type=int,
@@ -3482,34 +3793,141 @@ def main():
         default=True,
         help="Enable video streaming (default: True)"
     )
+    parser.add_argument(
+        "--no-video",
+        action="store_true",
+        default=False,
+        help="Disable video streaming"
+    )
+    # Video quality parameters
+    parser.add_argument(
+        "--bitrate", "-b",
+        type=int,
+        default=8000000,
+        help="Video bitrate in bps (default: 8M = 8000000). Examples: 2M=2000000, 4M=4000000, 8M=8000000, 16M=16000000"
+    )
+    parser.add_argument(
+        "--fps",
+        type=int,
+        default=60,
+        help="Max frame rate (default: 60). Common values: 30, 60, 90, 120"
+    )
+    parser.add_argument(
+        "--codec",
+        type=str,
+        default="auto",
+        choices=["auto", "h264", "h265", "av1"],
+        help="Video codec (default: auto)"
+    )
     args = parser.parse_args()
 
     # 保存默认音频配置到全局变量
     global DEFAULT_AUDIO_ENABLED, DEFAULT_AUDIO_DUP
-    DEFAULT_AUDIO_ENABLED = args.audio
-    DEFAULT_AUDIO_DUP = args.audio_dup
-
-    # 设置自动连接参数
     global _auto_connect, _auto_preview, _network_device, _network_push_device, _enable_video
-    _enable_video = args.video
+    global _video_bitrate, _video_fps, _video_codec
 
-    if args.network_push:
-        # --network-push: 先通过 USB 推送服务器，然后通过网络连接
-        _network_push_device = args.network_push
-        _auto_connect = False  # 不使用普通 USB 连接
-        _auto_preview = True
-        logger.info(f"[AUTO_CONNECT] Network-push mode enabled: will push via USB, then connect to {args.network_push}")
-    elif args.network:
-        # --network 暗示 --connect 和 --preview
-        _network_device = args.network
-        _auto_connect = False  # 不需要 USB 模式
-        _auto_preview = True
-        logger.info(f"[AUTO_CONNECT] Network mode enabled: {args.network}")
-    elif args.connect:
+    # 保存视频质量参数
+    _video_bitrate = args.bitrate
+    _video_fps = args.fps
+    _video_codec = args.codec
+
+    # ========== Process Quick Start Arguments ==========
+
+    # USB quick modes
+    if args.usb:
         _auto_connect = True
-        _auto_preview = args.preview
-        if args.preview:
-            logger.info("[AUTO_CONNECT] Auto-connect with preview enabled")
+        _auto_preview = False
+        _enable_video = False
+        DEFAULT_AUDIO_ENABLED = False
+        logger.info("[QUICK] USB mode: control only (low power)")
+    elif args.usb_video:
+        _auto_connect = True
+        _auto_preview = True
+        _enable_video = True
+        DEFAULT_AUDIO_ENABLED = False
+        logger.info("[QUICK] USB mode: control + video preview")
+    elif args.usb_full:
+        _auto_connect = True
+        _auto_preview = True
+        _enable_video = True
+        DEFAULT_AUDIO_ENABLED = True
+        logger.info("[QUICK] USB mode: control + video + audio")
+
+    # Network quick modes
+    elif args.net:
+        _network_device = args.net if args.net != "auto" else "auto"
+        _auto_connect = False
+        _auto_preview = False
+        _enable_video = False
+        DEFAULT_AUDIO_ENABLED = False
+        ip_info = "auto-detect from USB" if args.net == "auto" else args.net
+        logger.info(f"[QUICK] Network mode: control only -> {ip_info}")
+    elif args.net_video:
+        _network_device = args.net_video if args.net_video != "auto" else "auto"
+        _auto_connect = False
+        _auto_preview = True
+        _enable_video = True
+        DEFAULT_AUDIO_ENABLED = False
+        ip_info = "auto-detect from USB" if args.net_video == "auto" else args.net_video
+        logger.info(f"[QUICK] Network mode: control + video -> {ip_info}")
+    elif args.net_full:
+        _network_device = args.net_full if args.net_full != "auto" else "auto"
+        _auto_connect = False
+        _auto_preview = True
+        _enable_video = True
+        DEFAULT_AUDIO_ENABLED = True
+        ip_info = "auto-detect from USB" if args.net_full == "auto" else args.net_full
+        logger.info(f"[QUICK] Network mode: control + video + audio -> {ip_info}")
+
+    # Push quick modes
+    elif args.push:
+        _network_push_device = args.push if args.push != "auto" else "auto"
+        _auto_connect = False
+        _auto_preview = False
+        _enable_video = False
+        DEFAULT_AUDIO_ENABLED = False
+        ip_info = "auto-detect from USB" if args.push == "auto" else args.push
+        logger.info(f"[QUICK] Push mode: control only -> {ip_info}")
+    elif args.push_video:
+        _network_push_device = args.push_video if args.push_video != "auto" else "auto"
+        _auto_connect = False
+        _auto_preview = True
+        _enable_video = True
+        DEFAULT_AUDIO_ENABLED = False
+        ip_info = "auto-detect from USB" if args.push_video == "auto" else args.push_video
+        logger.info(f"[QUICK] Push mode: control + video -> {ip_info}")
+    elif args.push_full:
+        _network_push_device = args.push_full if args.push_full != "auto" else "auto"
+        _auto_connect = False
+        _auto_preview = True
+        _enable_video = True
+        DEFAULT_AUDIO_ENABLED = True
+        ip_info = "auto-detect from USB" if args.push_full == "auto" else args.push_full
+        logger.info(f"[QUICK] Push mode: control + video + audio -> {ip_info}")
+
+    # ========== Process Advanced Arguments ==========
+    else:
+        DEFAULT_AUDIO_ENABLED = args.audio
+        DEFAULT_AUDIO_DUP = args.audio_dup
+        _enable_video = not args.no_video if args.no_video else args.video
+
+        if args.network_push:
+            # --network-push: 先通过 USB 推送服务器，然后通过网络连接
+            _network_push_device = args.network_push
+            _auto_connect = False  # 不使用普通 USB 连接
+            _auto_preview = True
+            logger.info(f"[AUTO_CONNECT] Network-push mode enabled: will push via USB, then connect to {args.network_push}")
+        elif args.network:
+            # --network 暗示 --connect 和 --preview
+            _network_device = args.network
+            _auto_connect = False  # 不需要 USB 模式
+            _auto_preview = True
+            logger.info(f"[AUTO_CONNECT] Network mode enabled: {args.network}")
+        elif args.connect:
+            _auto_connect = True
+            _auto_preview = args.preview
+            if args.preview:
+                logger.info("[AUTO_CONNECT] Auto-connect with preview enabled")
 
     port = args.port
     host = args.host

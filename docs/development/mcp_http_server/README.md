@@ -12,6 +12,7 @@
 | [GAP_ANALYSIS.md](GAP_ANALYSIS.md) | **差距分析** - 当前实现与理想设计的差距 | ⭐⭐ 必读 |
 | [MCP_HTTP_SERVER_SPEC.md](MCP_HTTP_SERVER_SPEC.md) | **开发规范** - 编码规范、工具定义、错误处理 | ⭐⭐ 必读 |
 | [GUI_WINDOW_ISSUES.md](GUI_WINDOW_ISSUES.md) | **预览窗口** - 分离进程 GUI 实现 | ⭐⭐ 必读 |
+| [STARTUP_FLOW_REFACTOR.md](STARTUP_FLOW_REFACTOR.md) | **启动流程重构** - 网络模式命令行设计、参数验证 | ⭐⭐ 必读 |
 | [SCREENSHOT_AUDIO_MODES.md](SCREENSHOT_AUDIO_MODES.md) | **截图录音** - 两种模式说明 | ⭐ 参考 |
 | [MCP_HTTP_SERVER_LOGIC.md](MCP_HTTP_SERVER_LOGIC.md) | **工作逻辑** - 请求处理、连接管理、状态控制 | ⭐ 参考 |
 | [MCP_HTTP_SERVER_UPGRADE.md](MCP_HTTP_SERVER_UPGRADE.md) | **升级计划** - 功能改进和优化计划 | 参考 |

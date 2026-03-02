@@ -62,10 +62,8 @@ class JSONResponse(StarletteJSONResponse):
 # 配置日志 - 使用统一的日志配置模块
 from scrcpy_py_ddlx.core.logging_config import setup_logging, get_cache_dir
 
-log_file = setup_logging(prefix="session")
+# logger 在模块加载时初始化，但日志配置在 main() 中进行
 logger = logging.getLogger(__name__)
-logger.info(f"日志文件: {log_file}")
-logger.info(f"日志目录: {get_cache_dir() / 'logs'}")
 
 
 def get_documents_dir() -> Path:
@@ -1912,11 +1910,16 @@ class ScrcpyMCPHandler:
         return any(pattern in error_str for pattern in adb_error_patterns)
 
     def _restart_adb_server(self) -> bool:
-        """Restart ADB server."""
+        """Restart ADB server using system commands."""
         try:
-            from scrcpy_py_ddlx.core.adb import ADBManager
-            adb = ADBManager()
-            return adb.restart_adb_server()
+            import subprocess
+            import time
+            # Kill existing ADB server
+            subprocess.run(["adb", "kill-server"], capture_output=True, timeout=5)
+            time.sleep(1)
+            # Start new ADB server
+            result = subprocess.run(["adb", "start-server"], capture_output=True, timeout=10)
+            return result.returncode == 0
         except Exception as e:
             logger.error(f"Failed to restart ADB server: {e}")
             return False
@@ -2136,6 +2139,37 @@ class ScrcpyMCPHandler:
                         success = adb.disconnect_tcpip(ip, port=port, timeout=10.0)
                         result = {"success": success, "ip": ip, "port": port, "message": f"Disconnected from {ip}:{port}"}
                         result_text = json.dumps(result, ensure_ascii=False, indent=2)
+                        return {"content": [{"type": "text", "text": result_text}]}
+                    except Exception as e:
+                        return {"content": [{"type": "text", "text": json.dumps({"success": False, "error": str(e)}, ensure_ascii=False)}]}
+
+                # restart_adb 操作特殊处理 - 不需要先连接
+                if tool_name == "restart_adb":
+                    try:
+                        from scrcpy_py_ddlx.core.adb import ADBManager
+                        adb = ADBManager()
+                        success = adb.restart_server()
+                        result = {"success": success, "message": "ADB server restarted" if success else "Failed to restart ADB server"}
+                        result_text = json.dumps(result, ensure_ascii=False, indent=2)
+                        return {"content": [{"type": "text", "text": result_text}]}
+                    except Exception as e:
+                        return {"content": [{"type": "text", "text": json.dumps({"success": False, "error": str(e)}, ensure_ascii=False)}]}
+
+                # force_stop_server 操作特殊处理 - 不需要先连接
+                if tool_name == "force_stop_server":
+                    try:
+                        import subprocess
+                        device_id = arguments.get("device_id")
+                        if not device_id:
+                            return {"content": [{"type": "text", "text": json.dumps({"success": False, "error": "device_id is required"}, ensure_ascii=False)}]}
+
+                        # 强制终止服务端
+                        cmd = ["adb", "-s", device_id, "shell", "pkill -f app_process"] if device_id else ["adb", "shell", "pkill -f app_process"]
+                        result = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
+                        # pkill 返回 0 表示找到并杀死进程，返回 1 表示没有找到进程
+                        success = result.returncode in [0, 1]
+                        message = "Server stopped" if result.returncode == 0 else "No server running"
+                        result_text = json.dumps({"success": success, "message": message}, ensure_ascii=False)
                         return {"content": [{"type": "text", "text": result_text}]}
                     except Exception as e:
                         return {"content": [{"type": "text", "text": json.dumps({"success": False, "error": str(e)}, ensure_ascii=False)}]}
@@ -2698,30 +2732,39 @@ class ScrcpyMCPHandler:
                 # restart_adb - 重启 ADB 服务器
                 if tool_name == "restart_adb":
                     try:
-                        from scrcpy_py_ddlx.core.adb import ADBManager
-                        adb = ADBManager()
+                        import subprocess
+                        import time
 
                         logger.info("Restarting ADB server via MCP tool...")
-                        success = adb.restart_adb_server()
+                        print("[restart_adb] Killing ADB server...")
+                        # Kill existing ADB server
+                        kill_result = subprocess.run(["adb", "kill-server"], capture_output=True, timeout=5)
+                        logger.info(f"ADB kill-server: returncode={kill_result.returncode}")
+                        time.sleep(1)
+                        # Start new ADB server
+                        print("[restart_adb] Starting ADB server...")
+                        start_result = subprocess.run(["adb", "start-server"], capture_output=True, timeout=10)
+                        logger.info(f"ADB start-server: returncode={start_result.returncode}, output={start_result.stdout.decode('utf-8', errors='ignore')[:200]}")
+                        success = start_result.returncode == 0
 
                         if success:
-                            # Also check connection
-                            connection_ok = adb.check_adb_connection(max_retries=1)
+                            print("[restart_adb] ADB server restarted successfully")
                             result_data = {
                                 "success": True,
-                                "message": "ADB server restarted successfully",
-                                "connection_ok": connection_ok
+                                "message": "ADB server restarted successfully"
                             }
                         else:
+                            print(f"[restart_adb] FAILED: returncode={start_result.returncode}")
                             result_data = {
                                 "success": False,
-                                "error": "Failed to restart ADB server"
+                                "error": f"Failed to restart ADB server (returncode={start_result.returncode})"
                             }
 
                         result_text = json.dumps(result_data, ensure_ascii=False, indent=2)
                         return {"content": [{"type": "text", "text": result_text}]}
                     except Exception as e:
                         logger.error(f"restart_adb error: {e}")
+                        print(f"[restart_adb] ERROR: {e}")
                         return {"content": [{"type": "text", "text": json.dumps({"success": False, "error": str(e)}, ensure_ascii=False)}]}
 
                 # discover_devices 操作特殊处理 - 不需要先连接
@@ -3247,6 +3290,10 @@ async def handle_mcp_request(request: Request) -> JSONResponse:
 
             logger.info(f"调用工具: {tool_name} 参数: {tool_args}")
             result = handler.call_tool(tool_name, tool_args)
+
+            # 打印简洁的 MCP 调用结果
+            _print_mcp_result(tool_name, tool_args, result)
+
             response = {
                 "jsonrpc": "2.0",
                 "id": request_id,
@@ -3329,26 +3376,144 @@ _network_device = None
 _network_push_device = None  # --network-push mode
 _enable_video = True
 _stay_alive = False  # Server persists after ADB disconnect
+_force_push = False  # Force push new server (stop old first)
+_stop_server_only = False  # Only stop server, don't connect
 
 # Video quality settings
 _video_bitrate = 8000000
 _video_fps = 60
 _video_codec = "auto"
 
+# Server ready print function (set by main())
+_print_server_ready_func = None
+
+# Device info (filled by on_startup, used by print_server_ready)
+_device_name = ""
+_device_resolution = ""
+_video_codec_used = ""
+_audio_info = ""
+
+# Server state tracking (for cleanup on failure)
+_server_started = False      # 服务端是否已启动
+_server_device_id = None     # 服务端运行的设备ID
+_server_stay_alive = False   # 服务端是否以stay_alive模式启动
+
+
+def _print_mcp_result(tool_name: str, args: dict, result: dict):
+    """打印 MCP 工具调用结果（简洁格式）"""
+    from datetime import datetime
+    time_str = datetime.now().strftime('%H:%M:%S')
+
+    # 解析结果
+    success = False
+    output_info = ""
+    error_msg = ""
+
+    if result and "content" in result:
+        for item in result["content"]:
+            if item.get("type") == "text":
+                try:
+                    data = json.loads(item.get("text", "{}"))
+                    success = data.get("success", False)
+                    if not success:
+                        error_msg = data.get("error", "Unknown error")
+
+                    # 获取输出信息（根据工具类型）
+                    if tool_name == "screenshot" and success:
+                        output_info = data.get("path", "")
+                    elif tool_name == "pull_file" and success:
+                        output_info = data.get("local_path", "")
+                    elif tool_name == "record_audio" and success:
+                        output_info = data.get("output_path", "")
+                    elif tool_name == "start_video_recording" and success:
+                        output_info = data.get("output_path", "")
+                    elif tool_name == "get_clipboard" and success:
+                        text = data.get("text", "")
+                        if text:
+                            output_info = f'"{text[:30]}{"..." if len(text) > 30 else ""}"'
+                    elif tool_name == "list_devices" and success:
+                        devices = data.get("devices", [])
+                        output_info = f"{len(devices)} device(s)"
+                    elif tool_name == "list_dir" and success:
+                        items = data.get("items", [])
+                        output_info = f"{len(items)} item(s)"
+
+                except json.JSONDecodeError:
+                    pass
+
+    # 构建参数摘要
+    args_summary = ""
+    if args:
+        if tool_name in ["tap"]:
+            args_summary = f"({args.get('x', 0)}, {args.get('y', 0)})"
+        elif tool_name in ["swipe"]:
+            args_summary = f"({args.get('start_x', 0)}, {args.get('start_y', 0)} → {args.get('end_x', 0)}, {args.get('end_y', 0)})"
+        elif tool_name == "input_text":
+            text = args.get("text", "")
+            args_summary = f'("{text[:20]}{"..." if len(text) > 20 else ""}")'
+        elif tool_name == "press_key":
+            args_summary = f"({args.get('keycode', 'unknown')})"
+        elif tool_name == "pull_file":
+            args_summary = f"({args.get('device_path', '')})"
+        elif tool_name == "push_file":
+            args_summary = f"({args.get('remote', '')})"
+        elif tool_name == "delete_file":
+            args_summary = f"({args.get('path', '')})"
+        elif tool_name == "list_dir":
+            args_summary = f"({args.get('path', '')})"
+
+    # 打印结果
+    if success:
+        msg = f"[{time_str}] [MCP] {tool_name}{args_summary}[OK]"
+        if output_info:
+            msg += f" → {output_info}"
+        print(msg)
+    else:
+        print(f"[{time_str}] [MCP] {tool_name}{args_summary}[X] → {error_msg}")
+
 
 def _exit_on_failure(reason: str, exit_code: int = 1):
-    """Exit program on auto-connect failure."""
+    """Exit program on auto-connect failure, with server cleanup."""
+    global _server_started, _server_device_id, _server_stay_alive
+
     logger.error(f"[AUTO_CONNECT] {reason}")
-    print(f"\n[AUTO_CONNECT] FAILED: {reason}")
-    print("[AUTO_CONNECT] Exiting...")
+    from datetime import datetime
+    import subprocess
     import os
+
+    time_str = datetime.now().strftime('%H:%M:%S')
+    print(f"\n[{time_str}][X] 启动失败: {reason}")
+
+    # 清理手机上残留的服务端（如果已启动）
+    if _server_started and _server_device_id:
+        print(f"[{time_str}] 正在清理手机上的服务端...")
+        try:
+            kill_cmd = ["adb", "-s", _server_device_id, "shell", "pkill -9 -f app_process"]
+            result = subprocess.run(kill_cmd, capture_output=True, text=True, timeout=5)
+            logger.info(f"Server cleanup: returncode={result.returncode}")
+            print(f"[{time_str}] 服务端已清理[OK]")
+        except Exception as e:
+            logger.warning(f"Failed to cleanup server: {e}")
+            print(f"[{time_str}] 清理服务端失败: {e}")
+    elif _server_stay_alive:
+        # --stay-alive 模式但没有启动服务端的记录，尝试通用清理
+        print(f"[{time_str}] 尝试清理可能残留的服务端...")
+        try:
+            subprocess.run(["adb", "shell", "pkill -9 -f app_process"],
+                          capture_output=True, text=True, timeout=5)
+        except Exception:
+            pass
+
+    print(f"[{time_str}] 退出...")
     os._exit(exit_code)
 
 
 async def on_startup():
     """Auto-connect to device on server startup (if configured)."""
     import asyncio
-    import time
+    from datetime import datetime
+
+    global _device_name, _device_resolution, _video_codec_used, _audio_info
 
     if not _auto_connect and not _network_device and not _network_push_device:
         return
@@ -3356,121 +3521,493 @@ async def on_startup():
     # Wait a bit for server to be fully ready
     await asyncio.sleep(0.5)
 
+    def ptime():
+        return datetime.now().strftime('%H:%M:%S')
+
+    def print_step(step_name):
+        """打印步骤开始"""
+        print(f"[{ptime()}] → {step_name}...")
+
+    def print_detail(detail):
+        """打印详细信息（缩进）"""
+        print(f"            {detail}")
+
+    def print_success():
+        """打印步骤成功"""
+        print("[OK]")
+
     logger.info("=" * 50)
     logger.info("[AUTO_CONNECT] Starting auto-connect sequence...")
     logger.info("=" * 50)
 
-    try:
-        if _network_push_device:
-            # Network mode with USB push: Push server via USB first, then connect by IP
+    # 显示启动参数和模式
+    print("")
+    print("┌─────────────────────────────────────────────────────────┐")
+    print("│ 启动参数                                                │")
+    print("├─────────────────────────────────────────────────────────┤")
+    print(f"│ 模式: {'Network (网络)' if _network_push_device else 'USB (ADB隧道)'}")
+    print(f"│ Video: {_enable_video}")
+    print(f"│ Audio: {DEFAULT_AUDIO_ENABLED}")
+    print(f"│ Stay-Alive: {_stay_alive}")
+    if _network_push_device:
+        ip_display = _network_push_device if _network_push_device != "auto" else "auto-detect"
+        print(f"│ 目标IP: {ip_display}")
+    print("└─────────────────────────────────────────────────────────┘")
+    print("")
 
-            # Step 1: Detect USB device and get IP
-            logger.info("[AUTO_CONNECT] Step 1: Detecting USB device...")
-            print("[AUTO_CONNECT] Step 1: Detecting USB device...")
+    # DEBUG: 打印关键变量值
+    logger.debug(f"[DEBUG] _network_push_device={_network_push_device}, _auto_connect={_auto_connect}, _stay_alive={_stay_alive}, _force_push={_force_push}")
+
+    try:
+        # ========== --stop-server 模式: 仅终止驻留服务端 ==========
+        if _stop_server_only:
+            logger.info("[MODE] Stop server only mode")
+            print_step("检测 USB 设备")
             list_result = await _execute_tool("list_devices", {})
             devices = list_result.get("devices", [])
 
             if not devices:
-                # Try to restart ADB and retry
-                logger.warning("[AUTO_CONNECT] No devices found, attempting ADB restart...")
-                print("[AUTO_CONNECT] No devices found, attempting ADB restart...")
-
-                restart_result = await _execute_tool("restart_adb", {})
-                if restart_result.get("success"):
-                    # Retry device detection after ADB restart
-                    await asyncio.sleep(1.0)
-                    list_result = await _execute_tool("list_devices", {})
-                    devices = list_result.get("devices", [])
-
-                if not devices:
-                    _exit_on_failure("No USB devices found! Connect device via USB first.")
+                _exit_on_failure("No USB device found. --stop-server requires USB connection.")
 
             device = devices[0]
             device_id = device.get("id") or device.get("serial")
             device_name = device.get("name", device_id)
+            print(f"{device_name} ({device_id})")
+            print_success()
 
-            # Auto-detect IP if needed
-            if _network_push_device == "auto":
+            print_step("终止驻留服务端")
+            stop_result = await _execute_tool("force_stop_server", {"device_id": device_id})
+            if stop_result.get("success"):
+                print_success()
+                print("驻留服务端已终止")
+            else:
+                print_detail("无驻留服务端运行")
+
+            logger.info("[STOP_SERVER] Done, exiting")
+            os._exit(0)
+            return
+
+        if _network_push_device:
+            logger.info("[DEBUG] 进入 _network_push_device 分支")
+            # ========== Network mode ==========
+            #
+            # 模式说明:
+            # --net                    一次性模式: USB推送 → 连接 → 断开服务端退出
+            # --net --stay-alive       驻留模式: 优先复用驻留服务端，无则推送
+            # --net --stay-alive --force  强制推送: 终止旧服务端 → 推送新驻留服务端
+            # --net 192.168.5.4        指定IP: 直接TCP连接
+
+            # 情况1: 指定了具体IP - 直接TCP连接
+            if _network_push_device and _network_push_device != "auto":
+                device_ip = _network_push_device
+                logger.info(f"[AUTO_CONNECT] Direct connection to specified IP: {device_ip}")
+                print_step(f"连接设备 ({device_ip})")
+                print_detail(f"直接TCP连接 {device_ip}...")
+
+                connect_params = {
+                    "connection_mode": "network",
+                    "device_id": device_ip,
+                    "video": _enable_video,
+                    "audio": DEFAULT_AUDIO_ENABLED,
+                    "audio_dup": DEFAULT_AUDIO_DUP,
+                    "wake_server": _stay_alive,  # stay-alive模式尝试唤醒
+                }
+                connect_result = await _execute_tool("connect", connect_params)
+
+                if connect_result.get("success"):
+                    logger.info(f"[AUTO_CONNECT] Connected to {device_ip}")
+                    print_success()
+                    print(f"            → 最终模式: Network (直接TCP连接)")
+                    print(f"            → 连接方式: TCP {device_ip}:27183-27187")
+
+                    # 标记服务端状态
+                    global _server_started, _server_device_id, _server_stay_alive
+                    _server_started = True
+                    _server_device_id = device_ip
+                    _server_stay_alive = _stay_alive
+
+                    if connect_result.get("device_name"):
+                        _device_name = connect_result.get("device_name")
+
+                    # 启动预览窗口
+                    if _auto_preview:
+                        await asyncio.sleep(0.5)
+                        print_step("启动预览窗口")
+                        preview_result = await _execute_tool("start_preview", {})
+                        if preview_result.get("success"):
+                            print_success()
+                        else:
+                            logger.warning(f"[AUTO_CONNECT] Preview failed: {preview_result.get('error')}")
+                            print(f"[X] ({preview_result.get('error')})")
+
+                    return
+                else:
+                    _exit_on_failure(f"Failed to connect to {device_ip}: {connect_result.get('error')}")
+
+            # 情况2: --net --stay-alive --force (强制推送驻留服务端)
+            if _stay_alive and _force_push:
+                logger.info("[AUTO_CONNECT] Force push mode: stop old server and push new one")
+                print_step("检测 USB 设备")
+                list_result = await _execute_tool("list_devices", {})
+                devices = list_result.get("devices", [])
+
+                if not devices:
+                    _exit_on_failure("--force requires USB connection. No device found.")
+
+                device = devices[0]
+                device_id = device.get("id") or device.get("serial")
+                device_name = device.get("name", device_id)
                 device_ip = device.get("ip")
                 if not device_ip:
                     _exit_on_failure("Could not auto-detect device IP. Please specify IP manually.")
-                logger.info(f"[AUTO_CONNECT] Auto-detected device IP: {device_ip}")
-            else:
-                device_ip = _network_push_device
 
-            logger.info(f"[AUTO_CONNECT] Found USB device: {device_name} ({device_id}), IP: {device_ip}")
-            print(f"[AUTO_CONNECT] Found USB device: {device_name}")
-            print(f"\n[AUTO_CONNECT] Network+Push mode: {device_ip}")
+                print(f"{device_name} | IP: {device_ip} | USB: {device_id}")
+                print_success()
 
-            # Step 2: Push server via USB (one-time mode)
-            logger.info("[AUTO_CONNECT] Step 2: Pushing server via USB...")
-            print("[AUTO_CONNECT] Step 2: Pushing server via USB...")
+                # 终止旧服务端
+                print_step("终止旧驻留服务端")
+                stop_result = await _execute_tool("force_stop_server", {"device_id": device_id})
+                if stop_result.get("success"):
+                    print_success()
+                else:
+                    print_detail("无旧服务端需要清理")
+
+                # 推送新驻留服务端
+                print_step("推送新驻留服务端")
+                push_params = {
+                    "device_id": device_id,
+                    "video": _enable_video,
+                    "audio": DEFAULT_AUDIO_ENABLED,
+                    "audio_dup": DEFAULT_AUDIO_DUP,
+                    "auto_connect": False,
+                    "stay_alive": True,
+                }
+                push_result = await _execute_tool("push_server_onetime", push_params)
+                if not push_result.get("success"):
+                    _exit_on_failure(f"Push failed: {push_result.get('error')}")
+                print_success()
+
+                # 获取编码器信息
+                start_info = push_result.get("start", {})
+                video_info = start_info.get("video", {})
+                actual_codec = video_info.get("codec", "h265")
+                _video_codec_used = actual_codec
+
+                # 等待服务端启动
+                await asyncio.sleep(1.0)
+
+                # 网络连接
+                print_step(f"建立网络连接 ({device_ip})")
+                connect_params = {
+                    "connection_mode": "network",
+                    "device_id": device_ip,
+                    "video": _enable_video,
+                    "audio": DEFAULT_AUDIO_ENABLED,
+                    "audio_dup": DEFAULT_AUDIO_DUP,
+                    "codec": actual_codec,
+                }
+                connect_result = await _execute_tool("connect", connect_params)
+                if not connect_result.get("success"):
+                    _exit_on_failure(f"Connection failed: {connect_result.get('error')}")
+
+                print_success()
+                print(f"            → 最终模式: Network (强制推送驻留)")
+                print(f"            → 设备IP: {device_ip}")
+                print("")
+
+                # 标记服务端状态
+                _server_started = True
+                _server_device_id = device_id
+                _server_stay_alive = True
+
+                # 启动预览窗口
+                if _auto_preview:
+                    await asyncio.sleep(0.5)
+                    print_step("启动预览窗口")
+                    preview_result = await _execute_tool("start_preview", {})
+                    if preview_result.get("success"):
+                        print_success()
+
+                if _print_server_ready_func:
+                    _print_server_ready_func(device_ip)
+                return
+
+            # 情况3: --net --stay-alive (优先复用驻留服务端)
+            if _stay_alive:
+                logger.info("[AUTO_CONNECT] Stay-alive mode: try reuse first, push if not found")
+
+                # Step 1: 先尝试 UDP discovery
+                print_step("UDP Discovery")
+                print_detail("检测驻留服务端...")
+                device_ip = None
+                try:
+                    from scrcpy_py_ddlx.client.udp_wake import discover_devices
+                    discovered = discover_devices(timeout=2.0)
+                    if discovered:
+                        device_ip = discovered[0]['ip']
+                        _device_name = discovered[0].get('name', 'unknown')
+                        logger.info(f"[AUTO_CONNECT] UDP discovery found: {_device_name} at {device_ip}")
+                        print_detail(f"发现驻留服务端: {_device_name} ({device_ip})")
+                except Exception as e:
+                    logger.warning(f"[AUTO_CONNECT] UDP discovery failed: {e}")
+
+                # Step 2: 如果发现驻留服务端，复用连接
+                if device_ip:
+                    print_detail(f"复用驻留服务端 ({device_ip})...")
+                    connect_params = {
+                        "connection_mode": "network",
+                        "device_id": device_ip,
+                        "video": _enable_video,
+                        "audio": DEFAULT_AUDIO_ENABLED,
+                        "audio_dup": DEFAULT_AUDIO_DUP,
+                        "wake_server": True,
+                    }
+                    connect_result = await _execute_tool("connect", connect_params)
+
+                    if connect_result.get("success"):
+                        print_success()
+                        print(f"            → 最终模式: Network (复用驻留服务端)")
+                        print(f"            → 连接方式: UDP discovery → TCP {device_ip}")
+
+                        _server_started = True
+                        _server_device_id = device_ip
+                        _server_stay_alive = True
+
+                        if connect_result.get("device_name"):
+                            _device_name = connect_result.get("device_name")
+
+                        # 启动预览窗口
+                        if _auto_preview:
+                            await asyncio.sleep(0.5)
+                            print_step("启动预览窗口")
+                            preview_result = await _execute_tool("start_preview", {})
+                            if preview_result.get("success"):
+                                print_success()
+
+                        return
+                    else:
+                        logger.warning(f"[AUTO_CONNECT] Failed to connect to {device_ip}: {connect_result.get('error')}")
+                        print_detail("连接失败，尝试 USB 推送...")
+
+                # Step 3: 未发现驻留服务端或连接失败，检测 USB 推送
+                print_step("检测 USB 设备")
+                list_result = await _execute_tool("list_devices", {})
+                devices = list_result.get("devices", [])
+
+                if not devices:
+                    logger.warning("[AUTO_CONNECT] No devices found, attempting ADB restart...")
+                    print_detail("ADB 重启中...")
+                    restart_result = await _execute_tool("restart_adb", {})
+                    if restart_result.get("success"):
+                        await asyncio.sleep(1.0)
+                        list_result = await _execute_tool("list_devices", {})
+                        devices = list_result.get("devices", [])
+
+                if not devices:
+                    _exit_on_failure("No USB device found and no persisted server available.")
+
+                # 有 USB 设备，推送驻留服务端
+                device = devices[0]
+                device_id = device.get("id") or device.get("serial")
+                device_name = device.get("name", device_id)
+                device_ip = device.get("ip")
+                if not device_ip:
+                    _exit_on_failure("Could not auto-detect device IP. Please specify IP manually.")
+
+                print(f"{device_name} | IP: {device_ip} | USB: {device_id}")
+                print_success()
+
+                # 推送驻留服务端
+                print_step("推送驻留服务端")
+                push_params = {
+                    "device_id": device_id,
+                    "video": _enable_video,
+                    "audio": DEFAULT_AUDIO_ENABLED,
+                    "audio_dup": DEFAULT_AUDIO_DUP,
+                    "auto_connect": False,
+                    "stay_alive": True,
+                }
+                push_result = await _execute_tool("push_server_onetime", push_params)
+                if not push_result.get("success"):
+                    _exit_on_failure(f"Push failed: {push_result.get('error')}")
+                print_success()
+
+                start_info = push_result.get("start", {})
+                video_info = start_info.get("video", {})
+                actual_codec = video_info.get("codec", "h265")
+                _video_codec_used = actual_codec
+
+                await asyncio.sleep(1.0)
+
+                # 网络连接
+                print_step(f"建立网络连接 ({device_ip})")
+                connect_params = {
+                    "connection_mode": "network",
+                    "device_id": device_ip,
+                    "video": _enable_video,
+                    "audio": DEFAULT_AUDIO_ENABLED,
+                    "audio_dup": DEFAULT_AUDIO_DUP,
+                    "codec": actual_codec,
+                }
+                connect_result = await _execute_tool("connect", connect_params)
+                if not connect_result.get("success"):
+                    _exit_on_failure(f"Connection failed: {connect_result.get('error')}")
+
+                print_success()
+                print(f"            → 最终模式: Network (推送驻留服务端)")
+                print(f"            → 设备IP: {device_ip}")
+                print("")
+
+                _server_started = True
+                _server_device_id = device_id
+                _server_stay_alive = True
+
+                if _auto_preview:
+                    await asyncio.sleep(0.5)
+                    print_step("启动预览窗口")
+                    preview_result = await _execute_tool("start_preview", {})
+                    if preview_result.get("success"):
+                        print_success()
+
+                if _print_server_ready_func:
+                    _print_server_ready_func(device_ip)
+                return
+
+            # 情况4: --net (一次性模式，USB 推送非驻留服务端)
+            # Step 1: 检测 USB 设备
+            print_step("检测设备")
+            list_result = await _execute_tool("list_devices", {})
+            devices = list_result.get("devices", [])
+
+            if not devices:
+                # 尝试重启 ADB
+                logger.warning("[AUTO_CONNECT] No devices found, attempting ADB restart...")
+                print("")
+                print_detail("ADB 重启中...")
+
+                restart_result = await _execute_tool("restart_adb", {})
+                if restart_result.get("success"):
+                    await asyncio.sleep(1.0)
+                    list_result = await _execute_tool("list_devices", {})
+                    devices = list_result.get("devices", [])
+
+            if not devices:
+                _exit_on_failure("No USB devices found! --net mode requires USB for push.")
+
+            # 有 USB 设备，推送一次性服务端
+            device = devices[0]
+            device_id = device.get("id") or device.get("serial")
+            device_name = device.get("name", device_id)
+            _device_name = device_name
+
+            # 获取设备 IP
+            device_ip = device.get("ip")
+            if not device_ip:
+                _exit_on_failure("Could not auto-detect device IP. Please specify IP manually.")
+            logger.info(f"[AUTO_CONNECT] Auto-detected device IP: {device_ip}")
+
+            print(f"{device_name} | IP: {device_ip} | USB: {device_id}")
+            print_success()
+
+            # 推送一次性服务端 (stay_alive=False)
+            print_step("推送服务端")
+            print_detail("推送一次性服务端...")
             push_params = {
                 "device_id": device_id,
                 "video": _enable_video,
                 "audio": DEFAULT_AUDIO_ENABLED,
                 "audio_dup": DEFAULT_AUDIO_DUP,
-                "auto_connect": False,  # We'll connect manually via network
-                "stay_alive": _stay_alive,  # Server persists after ADB disconnect
+                "auto_connect": False,
+                "stay_alive": False,  # 一次性模式
             }
             push_result = await _execute_tool("push_server_onetime", push_params)
-
             if not push_result.get("success"):
                 _exit_on_failure(f"Push failed: {push_result.get('error')}")
+            print_success()
 
-            logger.info("[AUTO_CONNECT] Server pushed successfully!")
-            print("[AUTO_CONNECT] Server pushed successfully!")
-
-            # Get the actual codec used by the server
+            # 获取编码器信息
             start_info = push_result.get("start", {})
             video_info = start_info.get("video", {})
-            actual_codec = video_info.get("codec", "h265")  # Default to h265 if not found
-            logger.info(f"[AUTO_CONNECT] Server started with codec: {actual_codec}")
+            actual_codec = video_info.get("codec", "h265")
+            bitrate = video_info.get("bitrate", 8000000)
+            max_fps = video_info.get("max_fps", 60)
+            bitrate_mode = video_info.get("bitrate_mode", "vbr").upper()
+            _video_codec_used = actual_codec
 
-            # Step 3: Wait a bit for server to start
+            if bitrate >= 1000000:
+                bitrate_str = f"{bitrate // 1000000}M"
+            else:
+                bitrate_str = f"{bitrate // 1000}K"
+
+            print_detail(f"服务端启动 ({actual_codec}, {bitrate_str}, {max_fps}fps, {bitrate_mode})")
+            print_success()
+
+            _server_started = True
+            _server_device_id = device_id
+            _server_stay_alive = False
+
+            # 等待服务端启动
             await asyncio.sleep(1.0)
 
-            # Step 4: Connect via network
-            logger.info(f"[AUTO_CONNECT] Step 3: Connecting via network to {device_ip}...")
-            print(f"[AUTO_CONNECT] Step 3: Connecting via network to {device_ip}...")
+            # 网络连接
+            print_step(f"建立网络连接 ({device_ip})")
             connect_params = {
                 "connection_mode": "network",
                 "device_id": device_ip,
                 "video": _enable_video,
                 "audio": DEFAULT_AUDIO_ENABLED,
                 "audio_dup": DEFAULT_AUDIO_DUP,
-                "codec": actual_codec,  # Use the same codec as the server
-                "bitrate": _video_bitrate,
-                "max_fps": _video_fps,
+                "codec": actual_codec,
             }
-            result = await _execute_tool("connect", connect_params)
+            connect_result = await _execute_tool("connect", connect_params)
 
-            if result.get("success"):
-                logger.info(f"[AUTO_CONNECT] Connected successfully!")
-                print(f"[AUTO_CONNECT] Connected to {device_ip} via network!")
+            if connect_result.get("success"):
+                video_size = connect_result.get("video_size", "")
+                if video_size:
+                    _device_resolution = video_size
 
-                # Auto-start preview
-                await asyncio.sleep(0.5)
-                logger.info("[AUTO_CONNECT] Starting preview window...")
-                print("[AUTO_CONNECT] Starting preview window...")
-                preview_result = await _execute_tool("start_preview", {})
-                if preview_result.get("success"):
-                    logger.info("[AUTO_CONNECT] Preview window started!")
-                    print("[AUTO_CONNECT] Preview window started!")
-                else:
-                    logger.warning(f"[AUTO_CONNECT] Preview failed: {preview_result.get('error')}")
-                    print(f"[AUTO_CONNECT] Preview failed: {preview_result.get('error')}")
+                print_detail("认证...")
+                print_success()
+                print_detail("控制: 27184 | 视频: 27185 | 音频: 27186")
+                print_success()
+
+                print("")
+                print(f"            → 最终模式: Network (一次性)")
+                print(f"            → 服务端驻留: 否")
+                print(f"            → 设备IP: {device_ip}")
+                print("")
+
+                # 初始化组件信息
+                print_step("初始化组件")
+                if _device_resolution:
+                    print_detail(f"视频解码器: {actual_codec} ({_device_resolution})")
+                print_detail(f"音频解码器: opus")
+                print_success()
+
+                # 启动预览窗口
+                if _auto_preview:
+                    await asyncio.sleep(0.5)
+                    print_step("启动预览窗口")
+                    preview_result = await _execute_tool("start_preview", {})
+                    if preview_result.get("success"):
+                        print_success()
+                    else:
+                        logger.warning(f"[AUTO_CONNECT] Preview failed: {preview_result.get('error')}")
+
+                if _print_server_ready_func:
+                    _print_server_ready_func(device_ip)
+                return
             else:
-                _exit_on_failure(f"Connection failed: {result.get('error')}")
+                _exit_on_failure(f"Connection failed: {connect_result.get('error')}")
 
         elif _network_device:
+            logger.info("[DEBUG] 进入 _network_device 分支")
             # Network mode: Connect to device by IP
             device_ip = _network_device
 
             # Auto-detect IP if needed
             if _network_device == "auto":
-                logger.info("[AUTO_CONNECT] Auto-detecting device IP from USB...")
-                print("[AUTO_CONNECT] Detecting device IP via USB...")
+                print_step("自动检测设备 IP")
                 list_result = await _execute_tool("list_devices", {})
                 devices = list_result.get("devices", [])
 
@@ -3479,14 +4016,15 @@ async def on_startup():
 
                 device = devices[0]
                 device_ip = device.get("ip")
+                device_name = device.get("name", "Unknown")
+                _device_name = device_name
                 if not device_ip:
                     _exit_on_failure("Could not auto-detect device IP. Please specify IP manually.")
 
-                logger.info(f"[AUTO_CONNECT] Auto-detected device IP: {device_ip}")
-                print(f"[AUTO_CONNECT] Auto-detected IP: {device_ip}")
+                print(f"{device_ip}")
+                print_success()
 
             logger.info(f"[AUTO_CONNECT] Network mode: connecting to {device_ip}")
-            print(f"\n[AUTO_CONNECT] Network mode: connecting to {device_ip}...")
 
             # Parse connection params
             params = {
@@ -3501,31 +4039,53 @@ async def on_startup():
             }
 
             # Call connect tool
+            print_step(f"建立网络连接 ({device_ip})")
             result = await _execute_tool("connect", params)
 
             if result.get("success"):
-                logger.info(f"[AUTO_CONNECT] Connected successfully!")
-                print(f"[AUTO_CONNECT] Connected to {device_ip}!")
+                # 获取连接信息
+                video_size = result.get("video_size", "")
+                if video_size:
+                    _device_resolution = video_size
+                audio_info = result.get("audio_info", "")
+                if audio_info:
+                    _audio_info = audio_info
+                device_name = result.get("device_name", device_ip)
+                _device_name = device_name
+
+                print_detail(f"认证...")
+                print_success()
+                print_detail(f"控制: 27184 | 视频: 27185 | 音频: 27186")
+                print_success()
+
+                # Initialize components info
+                print_step("初始化组件")
+                if _device_resolution:
+                    print_detail(f"视频解码器: {_video_codec} ({_device_resolution})")
+                print_detail(f"音频解码器: {'opus' if DEFAULT_AUDIO_ENABLED else 'N/A'}")
+                print_success()
 
                 # Auto-start preview if requested
                 if _auto_preview or _network_device:  # --network implies preview
-                    await asyncio.sleep(0.5)  # Wait for connection to stabilize
-                    logger.info("[AUTO_CONNECT] Starting preview window...")
-                    print("[AUTO_CONNECT] Starting preview window...")
+                    await asyncio.sleep(0.5)
+                    print_step("启动预览窗口")
                     preview_result = await _execute_tool("start_preview", {})
                     if preview_result.get("success"):
-                        logger.info("[AUTO_CONNECT] Preview window started!")
-                        print("[AUTO_CONNECT] Preview window started!")
+                        print_success()
                     else:
                         logger.warning(f"[AUTO_CONNECT] Preview failed: {preview_result.get('error')}")
-                        print(f"[AUTO_CONNECT] Preview failed: {preview_result.get('error')}")
+                        print(f"[X] ({preview_result.get('error')})")
+
+                # Print server ready message after successful connection
+                if _print_server_ready_func:
+                    _print_server_ready_func(device_ip)
             else:
                 _exit_on_failure(f"Connection failed: {result.get('error')}")
 
         elif _auto_connect:
+            logger.info("[DEBUG] 进入 _auto_connect 分支 (USB 模式)")
             # USB mode: Auto-connect to first available device
-            logger.info("[AUTO_CONNECT] USB mode: detecting devices...")
-            print("\n[AUTO_CONNECT] Detecting USB devices...")
+            print_step("检测 USB 设备")
 
             # First, list devices
             list_result = await _execute_tool("list_devices", {})
@@ -3534,11 +4094,11 @@ async def on_startup():
             if not devices:
                 # Try to restart ADB and retry
                 logger.warning("[AUTO_CONNECT] No devices found, attempting ADB restart...")
-                print("[AUTO_CONNECT] No devices found, attempting ADB restart...")
+                print("")
+                print_detail("ADB 重启中...")
 
                 restart_result = await _execute_tool("restart_adb", {})
                 if restart_result.get("success"):
-                    # Retry device detection after ADB restart
                     await asyncio.sleep(1.0)
                     list_result = await _execute_tool("list_devices", {})
                     devices = list_result.get("devices", [])
@@ -3550,11 +4110,13 @@ async def on_startup():
             device = devices[0]
             device_id = device.get("id") or device.get("serial")
             device_name = device.get("name", device_id)
+            _device_name = device_name
 
-            logger.info(f"[AUTO_CONNECT] Found device: {device_name} ({device_id})")
-            print(f"[AUTO_CONNECT] Found device: {device_name}")
+            print(f"{device_name} ({device_id})")
+            print_success()
 
             # Connect
+            print_step("建立 USB 连接")
             params = {
                 "connection_mode": "adb_tunnel",
                 "device_id": device_id,
@@ -3569,21 +4131,49 @@ async def on_startup():
             result = await _execute_tool("connect", params)
 
             if result.get("success"):
-                logger.info(f"[AUTO_CONNECT] Connected successfully!")
-                print(f"[AUTO_CONNECT] Connected to {device_name}!")
+                # 获取连接信息
+                video_size = result.get("video_size", "")
+                if video_size:
+                    _device_resolution = video_size
+                audio_info = result.get("audio_info", "")
+                if audio_info:
+                    _audio_info = audio_info
+
+                print_success()
+
+                # Initialize components info
+                print_step("初始化组件")
+                # 获取实际使用的编码器（从 connect 结果）
+                actual_codec = result.get("codec", {}).get("name", _video_codec)
+                _video_codec_used = actual_codec
+
+                # 格式化码率
+                bitrate_val = _video_bitrate
+                if bitrate_val >= 1000000:
+                    bitrate_str = f"{bitrate_val // 1000000}M"
+                else:
+                    bitrate_str = f"{bitrate_val // 1000}K"
+
+                if _device_resolution:
+                    print_detail(f"视频解码器: {actual_codec} ({_device_resolution})")
+                print_detail(f"请求参数: {bitrate_str}, {_video_fps}fps")
+                print_detail(f"音频解码器: {'opus' if DEFAULT_AUDIO_ENABLED else 'N/A'}")
+                print_success()
 
                 # Auto-start preview if requested
                 if _auto_preview:
-                    await asyncio.sleep(0.5)  # Wait for connection to stabilize
-                    logger.info("[AUTO_CONNECT] Starting preview window...")
-                    print("[AUTO_CONNECT] Starting preview window...")
+                    await asyncio.sleep(0.5)
+                    print_step("启动预览窗口")
                     preview_result = await _execute_tool("start_preview", {})
                     if preview_result.get("success"):
-                        logger.info("[AUTO_CONNECT] Preview window started!")
-                        print("[AUTO_CONNECT] Preview window started!")
+                        print_success()
                     else:
                         logger.warning(f"[AUTO_CONNECT] Preview failed: {preview_result.get('error')}")
-                        print(f"[AUTO_CONNECT] Preview failed: {preview_result.get('error')}")
+                        print(f" X ({preview_result.get('error')})")
+
+                # Print server ready message after successful connection
+                if _print_server_ready_func:
+                    _print_server_ready_func(f"USB ({device_name})")
             else:
                 _exit_on_failure(f"Connection failed: {result.get('error')}")
 
@@ -3755,7 +4345,11 @@ Quick Start Examples:
     parser.add_argument("--audio", action="store_true", default=False,
                         help="Enable audio (for recording)")
     parser.add_argument("--stay-alive", action="store_true", default=False,
-                        help="Network mode: server persists after disconnect (requires USB for initial push)")
+                        help="Network mode: server persists after disconnect. Auto-reuse if found, push if not.")
+    parser.add_argument("--force", action="store_true", default=False,
+                        help="Force push: stop old server and push new one (requires USB)")
+    parser.add_argument("--stop-server", action="store_true", default=False,
+                        help="Stop persisted server on device and exit (requires USB)")
 
     # ========== Server Settings ==========
 
@@ -3793,23 +4387,75 @@ Quick Start Examples:
     )
     args = parser.parse_args()
 
+    # 重新配置日志为静默模式（控制台只显示 ERROR+）
+    # 用户友好的信息用 print() 输出
+    log_file = setup_logging(prefix="session", quiet_console=True)
+    logger.info(f"日志文件: {log_file}")
+
     # 保存默认音频配置到全局变量
     global DEFAULT_AUDIO_ENABLED, DEFAULT_AUDIO_DUP
     global _auto_connect, _auto_preview, _network_device, _network_push_device, _enable_video, _stay_alive
-    global _video_bitrate, _video_fps, _video_codec
+    global _video_bitrate, _video_fps, _video_codec, _force_push, _stop_server_only
 
     # 保存视频质量参数
     _video_bitrate = args.bitrate
     _video_fps = args.fps
     _video_codec = args.codec
     _stay_alive = args.stay_alive
+    _force_push = args.force
+    _stop_server_only = args.stop_server
+
+    # ========== 参数组合验证 ==========
+    validation_errors = []
+
+    # --force 只能与 --net --stay-alive 组合使用
+    if args.force and not args.net:
+        validation_errors.append("--force 只能与 --net --stay-alive 组合使用")
+
+    # --force 需要同时指定 --stay-alive
+    if args.force and not args.stay_alive:
+        validation_errors.append("--force 需要同时指定 --stay-alive")
+
+    # --stop-server 不能与其他连接模式组合
+    if args.stop_server and (args.adb or args.net):
+        validation_errors.append("--stop-server 不能与 --adb 或 --net 同时使用")
+
+    # --stay-alive 在 ADB 模式下无意义（ADB 隧道断开后服务端自然会终止）
+    if args.stay_alive and args.adb:
+        validation_errors.append("--stay-alive 仅用于 --net 网络模式")
+
+    if validation_errors:
+        print("")
+        print("╔═══════════════════════════════════════════════════════════╗")
+        print("║                    [!] 参数错误                           ║")
+        print("╠═══════════════════════════════════════════════════════════╣")
+        for err in validation_errors:
+            print(f"║  X {err:<50} ║")
+        print("╠═══════════════════════════════════════════════════════════╣")
+        print("║  正确用法:                                                ║")
+        print("║  - --net                     一次性网络模式               ║")
+        print("║  - --net --stay-alive        驻留模式(复用/推送)          ║")
+        print("║  - --net --stay-alive --force 强制推送驻留服务端          ║")
+        print("║  - --net <IP>                直接TCP连接指定IP            ║")
+        print("║  - --adb                     USB ADB隧道模式              ║")
+        print("║  - --stop-server             仅终止驻留服务端             ║")
+        print("╚═══════════════════════════════════════════════════════════╝")
+        print("")
+        sys.exit(1)
 
     # ========== Process Quick Start Arguments ==========
 
     # ========== Process Mode Selection ==========
 
+    # Stop server only mode
+    if args.stop_server:
+        _stop_server_only = True
+        _enable_video = False
+        DEFAULT_AUDIO_ENABLED = False
+        logger.info("[MODE] Stop server only mode")
+
     # ADB mode
-    if args.adb:
+    elif args.adb:
         _auto_connect = True
         _auto_preview = args.video  # Auto preview if video enabled
         _enable_video = args.video
@@ -3825,10 +4471,16 @@ Quick Start Examples:
         DEFAULT_AUDIO_ENABLED = args.audio
         ip_info = "auto-detect from USB" if args.net == "auto" else args.net
         stay_info = " + stay-alive" if args.stay_alive else ""
-        logger.info(f"[MODE] Network mode: video={args.video}, audio={args.audio}{stay_info} -> {ip_info}")
+        force_info = " + force-push" if args.force else ""
+        logger.info(f"[MODE] Network mode: video={args.video}, audio={args.audio}{stay_info}{force_info} -> {ip_info}")
 
     port = args.port
     host = args.host
+
+    # 打印启动信息（简洁格式）
+    from datetime import datetime
+    time_str = datetime.now().strftime('%H:%M:%S')
+    print(f"[{time_str}] Scrcpy MCP Server 启动中...")
 
     # 检查并清理占用端口的残留进程
     import subprocess
@@ -3853,38 +4505,58 @@ Quick Start Examples:
     except Exception as e:
         logger.debug(f"端口检查失败（可忽略）: {e}")
 
-    logger.info("=" * 70)
-    logger.info(f"启动 Scrcpy HTTP MCP 服务器")
-    logger.info(f"端口: {port}")
-    logger.info(f"MCP 端点: http://{host}:{port}/mcp")
-    logger.info(f"健康检查: http://{host}:{port}/health")
-    logger.info(f"默认音频: {'启用' if DEFAULT_AUDIO_ENABLED else '禁用'}")
-    logger.info("=" * 70)
+    # 全局变量存储设备信息（由 on_startup 填充）
+    global _device_name, _device_resolution, _video_codec_used, _audio_info
+    _device_name = ""
+    _device_resolution = ""
+    _video_codec_used = ""
+    _audio_info = ""
 
-    print("")
-    print("=" * 70)
-    print("[Scrcpy HTTP MCP Server]")
-    print("[模式] 标准 HTTP POST (JSON-RPC)")
-    print(f"[端点] http://{host}:{port}/mcp")
-    print(f"[健康检查] http://{host}:{port}/health")
-    print(f"[默认音频] {'[ON] 启用' if DEFAULT_AUDIO_ENABLED else '[OFF] 禁用'}")
-    # 显示自动连接状态
-    if _network_device:
-        print(f"[自动连接] 网络 -> {_network_device} + 预览窗口")
-    elif _auto_connect:
-        mode = "USB + 预览" if _auto_preview else "USB"
-        print(f"[自动连接] {mode} (检测首个设备)")
-    print("")
-    print("[Claude Code 配置]")
-    print('{')
-    print('  "mcpServers": {')
-    print('    "scrcpy-http": {')
-    print(f'      "url": "http://{host}:{port}/mcp"')
-    print('    }')
-    print('  }')
-    print('}')
-    print("=" * 70)
-    print("")
+    def print_server_ready(connection_info=None):
+        """Print server ready message (简洁美观格式)."""
+        from datetime import datetime
+        time_str = datetime.now().strftime('%H:%M:%S')
+
+        print("")
+        print("═" * 66)
+        print("                     [OK] 服务已就绪")
+        print("─" * 66)
+        if connection_info:
+            print(f"  设备: {_device_name or 'Unknown'} @ {connection_info}")
+            if _device_resolution:
+                video_info = f"  视频: {_device_resolution}"
+                if _video_codec_used:
+                    video_info += f" ({_video_codec_used})"
+                print(video_info)
+            if DEFAULT_AUDIO_ENABLED:
+                audio_str = _audio_info if _audio_info else "ON"
+                print(f"  音频: {audio_str}")
+        else:
+            print(f"  状态: 等待连接 (端口 {port})")
+        print("")
+        print("  [阶跃AI 配置]")
+        print("  {")
+        print('    "mcpServers": {')
+        print('      "scrcpy-http": {')
+        print(f'        "url": "http://{host}:{port}/mcp"')
+        print('      }')
+        print('    }')
+        print('  }')
+        print("═" * 66)
+        print("")
+
+    # Store for on_startup to call after successful connection
+    global _print_server_ready_func
+    _print_server_ready_func = print_server_ready
+
+    # Only print ready message immediately if no auto-connect
+    # With auto-connect, print after connection succeeds
+    if not (_auto_connect or _network_device or _network_push_device):
+        def delayed_print():
+            import time
+            time.sleep(0.5)
+            print_server_ready()
+        threading.Thread(target=delayed_print, daemon=True).start()
 
     # 设置信号处理器 - Ctrl+C 退出
     import signal
@@ -3893,7 +4565,9 @@ Quick Start Examples:
 
     def signal_handler(signum, frame):
         """Handle Ctrl+C - graceful shutdown."""
-        print("\n收到退出信号，正在关闭...")
+        from datetime import datetime
+        time_str = datetime.now().strftime('%H:%M:%S')
+        print(f"\n[{time_str}] 收到退出信号，正在关闭...")
         try:
             on_shutdown()
         except Exception as e:
@@ -3910,7 +4584,6 @@ Quick Start Examples:
 
     # Start auto-connect in background thread (since lifespan is disabled)
     if _auto_connect or _network_device or _network_push_device:
-        import threading
         import asyncio
 
         def run_auto_connect():

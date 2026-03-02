@@ -147,7 +147,7 @@
 | `list_dir` | path | dict | 列出目录 |
 | `file_stat` | path | dict | 获取文件信息 |
 | `push_file` | local, remote | bool | 上传文件 |
-| `pull_file` | remote, local | bool | 下载文件 |
+| `pull_file` | remote, local? | bool | 下载文件 (v1.5: local 可选，自动保存到 files/) |
 | `make_dir` | path | bool | 创建目录 |
 | `delete_file` | path | bool | 删除文件 |
 

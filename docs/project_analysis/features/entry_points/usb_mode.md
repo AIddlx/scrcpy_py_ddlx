@@ -43,6 +43,12 @@ RECORDING_DURATION = 10         # 时长(秒)，None=无限
 - 拖放 APK 文件 → 自动安装
 - 拖放其他文件 → 推送到设备
 
+### 文件保存路径 (v1.5 规范)
+
+- 截图: `~/Documents/scrcpy-py-ddlx/screenshots/`
+- 录音/视频: `~/Documents/scrcpy-py-ddlx/recordings/`
+- 下载文件: `~/Documents/scrcpy-py-ddlx/files/<原路径>`
+
 ---
 
 ## 命令行参数

@@ -88,7 +88,8 @@
       "Bash(/c/Users/ming1/AppData/Local/Android/Sdk/platform-tools/adb.exe shell:*)",
       "mcp__zai-mcp-server__analyze_image",
       "Bash(sleep 8:*)",
-      "Bash(xxd:*)"
+      "Bash(xxd:*)",
+      "Bash(curl:*)"
     ]
   }
 }

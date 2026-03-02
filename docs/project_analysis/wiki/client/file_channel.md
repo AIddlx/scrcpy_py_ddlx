@@ -38,7 +38,7 @@ class FileChannel:
 
     # 文件操作
     def list_dir(self, path: str) -> List[FileInfo]
-    def pull_file(self, remote_path: str, local_path: str) -> bool
+    def pull_file(self, remote_path: str, local_path: str | None = None) -> bool  # v1.5: local_path 可选
     def push_file(self, local_path: str, remote_path: str) -> bool
     def delete_file(self, path: str) -> bool
     def stat(self, path: str) -> Optional[FileInfo]
@@ -102,6 +102,9 @@ for f in files:
 # 下载文件
 channel.pull_file("/sdcard/Download/test.txt", "local.txt")
 
+# v1.5: 自动路径 (local_path 省略 → files/Download/test.txt)
+channel.pull_file("/sdcard/Download/test.txt")
+
 # 上传文件
 channel.push_file("local.txt", "/sdcard/Download/remote.txt")
 
@@ -111,6 +114,18 @@ channel.delete_file("/sdcard/Download/remote.txt")
 # 关闭
 channel.close()
 ```
+
+---
+
+## 自动路径规则 (v1.5)
+
+当 `pull_file` 的 `local_path` 参数省略时，文件会自动保存到 `files/` 目录，并保持原有目录结构：
+
+| 设备路径 | 自动保存路径 |
+|---------|-------------|
+| `/sdcard/DCIM/Camera/IMG.jpg` | `files/DCIM/Camera/IMG.jpg` |
+| `/storage/emulated/0/Download/test.txt` | `files/Download/test.txt` |
+| `/data/app/file.txt` | `files/data/app/file.txt` |
 
 ---
 

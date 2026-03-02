@@ -168,7 +168,21 @@ python scrcpy_http_mcp_server.py --connect --audio --audio-dup --connection-mode
 
 ### pull_file - 下载文件
 
-**请求：**
+**参数：**
+- `device_path` (必填): 设备文件路径
+- `local_path` (可选): 本地保存路径，不填则自动保存到 `files/<原路径>`
+
+**请求（自动路径）：**
+```json
+{
+  "name": "pull_file",
+  "arguments": {
+    "device_path": "/sdcard/DCIM/Camera/IMG.jpg"
+  }
+}
+```
+
+**请求（自定义路径）：**
 ```json
 {
   "name": "pull_file",
@@ -183,12 +197,19 @@ python scrcpy_http_mcp_server.py --connect --audio --audio-dup --connection-mode
 ```json
 {
   "success": true,
-  "device_path": "/sdcard/remote_file.txt",
-  "local_path": "./local_file.txt",
-  "size": 1234,
+  "device_path": "/sdcard/DCIM/Camera/IMG.jpg",
+  "local_path": "C:/Users/.../files/DCIM/Camera/IMG.jpg",
+  "size": 123456,
   "mode": "network"
 }
 ```
+
+**自动路径规则：**
+| 设备路径 | 本地保存路径 |
+|----------|--------------|
+| `/sdcard/DCIM/Camera/IMG.jpg` | `files/DCIM/Camera/IMG.jpg` |
+| `/storage/emulated/0/Download/test.txt` | `files/Download/test.txt` |
+| `/data/app/file.txt` | `files/data/app/file.txt` |
 
 ### make_dir - 创建目录
 
@@ -394,3 +415,4 @@ scrcpy/server/src/main/java/com/genymobile/scrcpy/
 |------|------|------|
 | 1.0 | 2026-02-26 | 初始实现，支持 ADB 和网络模式 |
 | 1.1 | 2026-02-26 | 修复网络模式画面卡死问题（后台线程 accept） |
+| 1.2 | 2026-03-01 | pull_file 支持自动路径，保留原目录结构 |

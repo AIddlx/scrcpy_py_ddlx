@@ -30,7 +30,7 @@
 |------|------|------|
 | `list_dir` | 列出目录 | `path` |
 | `push_file` | 上传文件 | `local`, `remote` |
-| `pull_file` | 下载文件 | `remote`, `local` |
+| `pull_file` | 下载文件 | `device_path`, `local_path` (可选) |
 | `delete_file` | 删除文件 | `path` |
 
 ---
@@ -101,12 +101,21 @@
   }
 }
 
-// 2. 下载文件
+// 2. 下载文件 (自动路径)
 {
   "tool": "pull_file",
   "arguments": {
-    "remote": "/sdcard/Download/test.txt",
-    "local": "C:\\Downloads\\test.txt"
+    "device_path": "/sdcard/Download/test.txt"
+  }
+}
+// 保存到: files/Download/test.txt
+
+// 3. 下载文件 (指定路径)
+{
+  "tool": "pull_file",
+  "arguments": {
+    "device_path": "/sdcard/Download/test.txt",
+    "local_path": "C:\\Downloads\\test.txt"
   }
 }
 ```

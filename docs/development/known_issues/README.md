@@ -20,6 +20,7 @@
 | [SurfaceControl 截图限制](surfacecontrol_screenshot_limitation.md) | --push 模式 (video=false) 截图失败 | ✅ 已修复 |
 | [Windows UTF-8 编码](windows_utf8_encoding.md) | CMD/PowerShell 中文文件名乱码 | ✅ 已修复 |
 | [Stay-Alive USB 断开](stay_alive_usb_disconnect.md) | setsid 进程持久化 + `--no-auth` 完整控制 + hot-connect 自动发现 | ✅ 已修复 |
+| [网络模式 USB 拔插](network_usb_disconnect.md) | 网络模式始终使用 setsid，避免 ADB 断开时服务终止 | ✅ 已修复 |
 | [零拷贝 GPU 模式](zero_copy_gpu_status.md) | 零拷贝 GPU 模式需要环境变量启用 | 📖 信息 |
 | [音频录制指南](../AUDIO_RECORDING_GUIDE.md) | 音频录制功能实现与常见问题 | 📖 指南 |
 | [调试方法论](../DEBUG_METHODOLOGY.md) | 高效调试问题的通用方法 | 📖 指南 |

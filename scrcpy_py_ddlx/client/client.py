@@ -709,10 +709,17 @@ class ScrcpyClient:
 
             except Exception as e:
                 if not stop_event.is_set():
-                    logger.error(f"Controller loop error: {e}")
-                    import traceback
-
-                    traceback.print_exc()
+                    # Connection errors are normal when USB is unplugged or server stops
+                    error_msg = str(e)
+                    if "10053" in error_msg or "10054" in error_msg or "10038" in error_msg:
+                        # Windows socket errors: connection aborted/reset/closed
+                        logger.info(f"Control connection closed: {e}")
+                    elif "timed out" in error_msg.lower():
+                        logger.debug(f"Control send timeout: {e}")
+                    else:
+                        logger.error(f"Controller loop error: {e}")
+                        import traceback
+                        traceback.print_exc()
                 break
 
         logger.info("Controller loop ended")

@@ -59,6 +59,12 @@ python mcp_stdio.py
 - 支持 Claude Desktop 直接调用
 - 自动连接管理
 
+### 文件保存路径 (v1.5 规范)
+
+- 截图: `~/Documents/scrcpy-py-ddlx/screenshots/`
+- 录音/视频: `~/Documents/scrcpy-py-ddlx/recordings/`
+- 下载文件: `~/Documents/scrcpy-py-ddlx/files/<原路径>`
+
 ---
 
 ## 核心实现

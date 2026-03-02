@@ -60,8 +60,23 @@
 
 | 参数 | 类型 | 默认值 | 说明 |
 |------|------|--------|------|
-| `stay_alive` | boolean | false | Stay-Alive 模式 |
-| `max_connections` | int | -1 | 最大连接数 |
+| `stay_alive` | boolean | false | 客户端断开后服务端继续运行 |
+| `max_connections` | int | -1 | 最大连接数 (-1=无限) |
+
+> **注意**: `stay_alive` 控制服务端是否支持多客户端连接，与 `setsid` 无关。
+> `setsid` 是客户端启动命令中的 shell 命令，用于让进程脱离 ADB 会话。
+
+### 进程控制对比
+
+| 功能 | setsid | stay_alive |
+|------|--------|------------|
+| **类型** | Shell 命令 | 服务端参数 |
+| **设置位置** | 客户端启动脚本 | 服务端命令行 |
+| **作用域** | 进程会话 (操作系统) | 连接生命周期 (应用层) |
+| **网络模式** | **始终使用** | 可选 |
+| **目的** | USB 拔插时进程存活 | 支持多客户端热连接 |
+
+---
 
 ### 低延迟优化
 
@@ -100,6 +115,8 @@ public static Options parse(Arguments args) {
 
 ## 命令行示例
 
+### 服务端参数 (Java)
+
 ```bash
 app_process / com.genymobile.scrcpy.Server 3.3.4 \
     control_port=27184 \
@@ -114,6 +131,21 @@ app_process / com.genymobile.scrcpy.Server 3.3.4 \
     auth_key_file=/data/local/tmp/scrcpy-auth.key \
     stay_alive=true
 ```
+
+### 客户端启动命令 (Shell)
+
+```bash
+# 网络模式: 使用 setsid 让进程脱离 ADB 会话
+adb shell CLASSPATH=/data/local/tmp/scrcpy-server.jar \
+    setsid app_process / com.genymobile.scrcpy.Server 3.3.4 \
+        control_port=27184 video_port=27185 audio_port=27186
+
+# ADB 模式: 不使用 setsid (默认行为)
+adb shell CLASSPATH=/data/local/tmp/scrcpy-server.jar \
+    app_process / com.genymobile.scrcpy.Server 3.3.4
+```
+
+> **说明**: `setsid` 是 shell 命令前缀，不是 Java 参数。它由客户端在启动服务端时添加。
 
 ---
 

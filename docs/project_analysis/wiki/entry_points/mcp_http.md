@@ -46,13 +46,26 @@
 
 ---
 
-## 文件保存位置
+## 文件保存位置 (v1.5 规范)
 
-| 类型 | 路径 |
-|------|------|
-| 截图 | `~/Documents/scrcpy/screenshots/` |
-| 录制 | `~/Documents/scrcpy/recordings/` |
-| 下载 | `~/Documents/scrcpy/downloads/` |
+| 类型 | 路径 | 示例 |
+|------|------|------|
+| 截图 | `screenshots/` | `screenshot_20260301_232016.jpg` |
+| 录音/视频 | `recordings/` | `recording_20260301_231830.opus` |
+| 下载文件 | `files/<原路径>` | `files/DCIM/Camera/IMG.jpg` |
+
+**说明**：所有路径相对于当前工作目录，v1.5 版本已规范化路径结构。
+
+### pull_file 自动路径 (v1.5)
+
+```json
+// 不指定 local_path → 自动按原路径保存到 files/ 目录
+{"tool": "pull_file", "arguments": {"device_path": "/sdcard/DCIM/Camera/IMG.jpg"}}
+// → files/DCIM/Camera/IMG.jpg
+
+// 指定 local_path → 保存到指定位置
+{"tool": "pull_file", "arguments": {"device_path": "/sdcard/DCIM/Camera/IMG.jpg", "local_path": "D:/photos/IMG.jpg"}}
+```
 
 ---
 

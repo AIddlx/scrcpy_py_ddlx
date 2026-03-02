@@ -140,7 +140,7 @@ python -X utf8 tests_gui/test_network_direct.py \
 5. 检查/启动服务端
    - 推送认证密钥 (如启用)
    - 推送服务器 APK
-   - 启动服务器 (nohup)
+   - 启动服务器 (nohup setsid) - 独立于 ADB 会话
 6. 创建 ClientConfig
 7. 连接设备
 8. 运行 Qt 事件循环
@@ -156,6 +156,13 @@ python -X utf8 tests_gui/test_network_direct.py \
 - ADB 仅用于启动服务器
 - 服务器启动后可拔掉 USB
 - TCP 控制 + UDP 媒体分离
+- **始终使用 `setsid`**，USB 拔插不会导致服务终止
+
+### 文件保存路径 (v1.5 规范)
+
+- 截图: `~/Documents/scrcpy-py-ddlx/screenshots/`
+- 录音/视频: `~/Documents/scrcpy-py-ddlx/recordings/`
+- 下载文件: `~/Documents/scrcpy-py-ddlx/files/<原路径>`
 
 ### 认证流程
 

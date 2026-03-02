@@ -254,7 +254,11 @@ class StreamingAudioDemuxer(StreamingDemuxerBase):
 
         except Exception as e:
             self._parse_errors += 1
-            logger.error(f"Error receiving audio packet: {e}")
+            # Socket timeout is normal when no audio is playing
+            if "timed out" in str(e) or isinstance(e, socket.timeout):
+                logger.debug(f"Audio packet receive timeout (no audio playing)")
+            else:
+                logger.error(f"Error receiving audio packet: {e}")
             raise
 
     def _get_thread_name(self) -> str:

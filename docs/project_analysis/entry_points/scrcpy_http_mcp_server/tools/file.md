@@ -66,21 +66,48 @@
 
 从设备拉取文件。
 
+**v1.5 新增**: `local_path` 参数现在是可选的。不指定时自动保存到 `files/<原路径>`，保留目录结构。
+
 ### 参数
 
 ```json
 {
-  "remote_path": "/sdcard/DCIM/photo.jpg",
-  "local_path": "/local/path/photo.jpg"
+  "device_path": "/sdcard/DCIM/photo.jpg",
+  "local_path": "/local/path/photo.jpg"  // 可选，默认: files/DCIM/photo.jpg
 }
 ```
+
+| 参数 | 类型 | 必需 | 说明 |
+|------|------|------|------|
+| `device_path` | string | 是 | 设备上的文件路径 |
+| `local_path` | string | 否 | 本地保存路径，不指定则自动保存到 `files/<原路径>` |
+
+### 自动路径规则
+
+当 `local_path` 未指定时，路径按以下规则处理：
+
+1. 去除 Android 路径前缀:
+   - `/sdcard/`
+   - `/storage/emulated/0/`
+   - `/mnt/sdcard/`
+
+2. 保存到 `files/<相对路径>`
+
+**示例**:
+| 设备路径 | 本地路径 (自动) |
+|----------|----------------|
+| `/sdcard/DCIM/photo.jpg` | `files/DCIM/photo.jpg` |
+| `/storage/emulated/0/Download/doc.pdf` | `files/Download/doc.pdf` |
 
 ### 返回
 
 ```json
 {
   "success": true,
-  "bytes_transferred": 2456789
+  "device_path": "/sdcard/DCIM/photo.jpg",
+  "local_path": "files/DCIM/photo.jpg",
+  "size": 2456789,
+  "mode": "network"
 }
 ```
 
@@ -191,9 +218,15 @@ install_apk({
 // 1. 列出照片
 list_files({ "path": "/sdcard/DCIM/Camera" })
 
-// 2. 拉取照片
+// 2. 拉取照片 (自动路径)
 pull_file({
-  "remote_path": "/sdcard/DCIM/Camera/IMG_001.jpg",
+  "device_path": "/sdcard/DCIM/Camera/IMG_001.jpg"
+})
+// 保存到: files/DCIM/Camera/IMG_001.jpg
+
+// 3. 拉取照片 (指定路径)
+pull_file({
+  "device_path": "/sdcard/DCIM/Camera/IMG_001.jpg",
   "local_path": "./backup/IMG_001.jpg"
 })
 ```

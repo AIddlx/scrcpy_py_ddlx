@@ -342,7 +342,7 @@ TOOLS = [
     # 网络模式专用推送工具
     {
         "name": "push_server_onetime",
-        "description": "Push and start scrcpy server for ONE-TIME network connection. REQUIRES USB. Server exits after disconnect. Set auto_connect=true to connect immediately after push. DEFAULT: control-only (no video/audio). Set video=true for preview/screenshot, audio=true for recording. SECURITY: auth=true (default) enables HMAC-SHA256 authentication.",
+        "description": "Push and start scrcpy server for ONE-TIME network connection. REQUIRES USB. Server exits after disconnect (unless stay_alive=true). Set auto_connect=true to connect immediately after push. DEFAULT: control-only (no video/audio). Set video=true for preview/screenshot, audio=true for recording. SECURITY: auth=true (default) enables HMAC-SHA256 authentication.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -354,6 +354,7 @@ TOOLS = [
                 "video_bitrate": {"type": "integer", "default": 8000000},
                 "max_fps": {"type": "integer", "default": 60},
                 "auto_connect": {"type": "boolean", "default": False, "description": "Auto connect via network after push (one-step flow)"},
+                "stay_alive": {"type": "boolean", "default": False, "description": "Server persists after ADB disconnect (use setsid)"},
                 "auth": {"type": "boolean", "default": True, "description": "Enable HMAC-SHA256 authentication (recommended for network mode)"}
             }
         }
@@ -743,14 +744,14 @@ TOOLS = [
     },
     {
         "name": "pull_file",
-        "description": "Download a file from the device to PC. Works in both ADB mode (via adb pull) and network mode (via file channel).",
+        "description": "Download a file from the device to PC. Works in both ADB mode (via adb pull) and network mode (via file channel). Auto-saves to files/ preserving directory structure if local_path not specified (e.g., /sdcard/DCIM/IMG.jpg → files/DCIM/IMG.jpg).",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "device_path": {"type": "string", "description": "File path on device (e.g., /sdcard/Download/file.txt)"},
-                "local_path": {"type": "string", "description": "Local path to save the file"}
+                "device_path": {"type": "string", "description": "File path on device (e.g., /sdcard/DCIM/Camera/IMG.jpg)"},
+                "local_path": {"type": "string", "description": "Local path to save (optional, default: files/<relative_path>)"}
             },
-            "required": ["device_path", "local_path"]
+            "required": ["device_path"]
         }
     },
     {
@@ -2298,9 +2299,9 @@ class ScrcpyMCPHandler:
                 # push_server_onetime / push_server_persistent - 必须在 push_server 之前处理
                 auto_connect_after_push = False
                 if tool_name == "push_server_onetime":
-                    # 一次性模式：stay_alive=false，断开后服务端退出
+                    # 一次性模式：stay_alive 默认 false，但可以通过参数覆盖
                     # video/audio 由用户控制，默认都关闭（仅控制消息）
-                    arguments["stay_alive"] = False
+                    arguments["stay_alive"] = arguments.get("stay_alive", False)
                     arguments["video"] = arguments.get("video", False)
                     arguments["audio"] = arguments.get("audio", False)
                     auto_connect_after_push = arguments.pop("auto_connect", False)  # 保存并移除
@@ -2579,7 +2580,9 @@ class ScrcpyMCPHandler:
                                 f"video={'true' if video_enabled else 'false'} {audio_params} control=true send_device_meta=true send_dummy_byte=true cleanup=false"
                             )
 
-                            shell_cmd = f"nohup sh -c '{server_cmd}' > /data/local/tmp/scrcpy_server.log 2>&1 &"
+                            # Always use setsid for network mode to survive ADB disconnect
+                            # Without setsid, the server process will be killed when ADB session ends
+                            shell_cmd = f"nohup setsid sh -c '{server_cmd}' > /data/local/tmp/scrcpy_server.log 2>&1 &"
 
                             logger.info(f"Start command: adb shell {shell_cmd}")
                             subprocess.run(
@@ -2928,18 +2931,35 @@ class ScrcpyMCPHandler:
                         }, ensure_ascii=False)}]}
 
                 if tool_name == "pull_file":
+                    from pathlib import Path
+
                     device_path = arguments.get("device_path")
                     local_path = arguments.get("local_path")
-                    if not device_path or not local_path:
+                    if not device_path:
                         return {"content": [{"type": "text", "text": json.dumps({
                             "success": False,
-                            "error": "Both device_path and local_path are required"
+                            "error": "device_path is required"
                         }, ensure_ascii=False)}]}
+
+                    # Auto-generate local_path if not specified (preserve directory structure)
+                    if not local_path:
+                        files_dir = get_save_dir("files")
+
+                        # Remove common Android path prefixes to get relative path
+                        rel_path = device_path.lstrip('/')
+                        for prefix in ["sdcard/", "storage/emulated/0/", "mnt/sdcard/"]:
+                            if rel_path.startswith(prefix):
+                                rel_path = rel_path[len(prefix):]
+                                break
+
+                        local_path = str(files_dir / rel_path)
+
+                        # Create parent directories
+                        Path(local_path).parent.mkdir(parents=True, exist_ok=True)
 
                     try:
                         self._client.pull_file(device_path, local_path)
 
-                        from pathlib import Path
                         local_file = Path(local_path)
                         size = local_file.stat().st_size if local_file.exists() else 0
 
@@ -3308,6 +3328,7 @@ _auto_preview = False
 _network_device = None
 _network_push_device = None  # --network-push mode
 _enable_video = True
+_stay_alive = False  # Server persists after ADB disconnect
 
 # Video quality settings
 _video_bitrate = 8000000
@@ -3390,6 +3411,7 @@ async def on_startup():
                 "audio": DEFAULT_AUDIO_ENABLED,
                 "audio_dup": DEFAULT_AUDIO_DUP,
                 "auto_connect": False,  # We'll connect manually via network
+                "stay_alive": _stay_alive,  # Server persists after ADB disconnect
             }
             push_result = await _execute_tool("push_server_onetime", push_params)
 
@@ -3702,49 +3724,41 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Quick Start Examples:
-  # USB Mode (low power - control only)
-  python scrcpy_http_mcp_server.py --usb
+  # ADB mode (USB or WiFi ADB)
+  python scrcpy_http_mcp_server.py --adb                    # control only
+  python scrcpy_http_mcp_server.py --adb --video            # with video preview
+  python scrcpy_http_mcp_server.py --adb --video --audio    # with video + audio
 
-  # USB Mode with video preview
-  python scrcpy_http_mcp_server.py --usb-video
-
-  # USB Mode with video + audio
-  python scrcpy_http_mcp_server.py --usb-full
-
-  # Network mode (control only, server must be running on device)
-  python scrcpy_http_mcp_server.py --net 192.168.1.100
-
-  # Network mode with video preview
-  python scrcpy_http_mcp_server.py --net-video 192.168.1.100
-
-  # Network mode with video + audio
-  python scrcpy_http_mcp_server.py --net-full 192.168.1.100
-
-  # Push server via USB then connect via network (first-time setup)
-  python scrcpy_http_mcp_server.py --push 192.168.1.100        # control only
-  python scrcpy_http_mcp_server.py --push-video 192.168.1.100  # with preview
-  python scrcpy_http_mcp_server.py --push-full 192.168.1.100   # with audio
+  # Network mode (TCP/UDP direct, IP optional - auto-discover)
+  python scrcpy_http_mcp_server.py --net                 # control only (auto-discover IP)
+  python scrcpy_http_mcp_server.py --net --video         # with video preview
+  python scrcpy_http_mcp_server.py --net --video --audio # with video + audio
+  python scrcpy_http_mcp_server.py --net 192.168.1.100    # specify IP
+  python scrcpy_http_mcp_server.py --net --stay-alive     # server persists after disconnect
 """
     )
 
-    # ========== Quick Start Arguments (Recommended) ==========
+    # ========== Mode Selection (Required) ==========
 
-    # USB quick modes
-    parser.add_argument("--usb", action="store_true", help="USB mode: control only (low power, no video/audio)")
-    parser.add_argument("--usb-video", action="store_true", help="USB mode: control + video preview")
-    parser.add_argument("--usb-full", action="store_true", help="USB mode: control + video + audio")
+    # ADB mode (ADB tunnel - USB or WiFi ADB)
+    parser.add_argument("--adb", action="store_true",
+                        help="ADB mode: connect via ADB tunnel (USB or WiFi ADB)")
 
-    # Network quick modes (server must be running on device, IP optional - auto-detect from USB)
-    parser.add_argument("--net", nargs='?', const="auto", metavar="IP", help="Network mode: control only (low power). Auto-detect IP from USB if not specified")
-    parser.add_argument("--net-video", nargs='?', const="auto", metavar="IP", help="Network mode: control + video preview. Auto-detect IP if not specified")
-    parser.add_argument("--net-full", nargs='?', const="auto", metavar="IP", help="Network mode: control + video + audio. Auto-detect IP if not specified")
+    # Network mode (TCP/UDP direct, IP optional - auto-discover from USB)
+    parser.add_argument("--net", nargs='?', const="auto", metavar="IP",
+                        help="Network mode: TCP/UDP direct connection. Auto-discover IP from USB if not specified")
 
-    # Push quick modes (push server via USB first, IP optional - auto-detect from USB)
-    parser.add_argument("--push", nargs='?', const="auto", metavar="IP", help="Push + Network: control only. Auto-detect IP from USB if not specified")
-    parser.add_argument("--push-video", nargs='?', const="auto", metavar="IP", help="Push + Network: control + video preview. Auto-detect IP if not specified")
-    parser.add_argument("--push-full", nargs='?', const="auto", metavar="IP", help="Push + Network: control + video + audio. Auto-detect IP if not specified")
+    # ========== Function Switches ==========
 
-    # ========== Advanced Arguments ==========
+    parser.add_argument("--video", action="store_true", default=False,
+                        help="Enable video (for preview/screenshot)")
+    parser.add_argument("--audio", action="store_true", default=False,
+                        help="Enable audio (for recording)")
+    parser.add_argument("--stay-alive", action="store_true", default=False,
+                        help="Network mode: server persists after disconnect (requires USB for initial push)")
+
+    # ========== Server Settings ==========
+
     parser.add_argument(
         "--port", "-p",
         type=int,
@@ -3752,59 +3766,10 @@ Quick Start Examples:
         help="Server port (default: 3359)"
     )
     parser.add_argument(
-        "--audio",
-        action="store_true",
-        default=False,
-        help="Enable audio streaming by default (for recording)"
-    )
-    parser.add_argument(
-        "--audio-dup",
-        action="store_true",
-        default=False,
-        help="Duplicate audio: play on both device and computer (Android 11+)"
-    )
-    parser.add_argument(
         "--host",
         type=str,
         default="127.0.0.1",
         help="Server host (default: 127.0.0.1)"
-    )
-    parser.add_argument(
-        "--connect", "-c",
-        action="store_true",
-        default=False,
-        help="Auto-connect to first available device on startup"
-    )
-    parser.add_argument(
-        "--preview",
-        action="store_true",
-        default=False,
-        help="Auto-start preview window after connection (requires --connect)"
-    )
-    parser.add_argument(
-        "--network",
-        type=str,
-        default=None,
-        help="Network mode: connect to device by IP (e.g., --network 192.168.1.100). Requires server already running on device. Implies --preview"
-    )
-    parser.add_argument(
-        "--network-push",
-        type=str,
-        default=None,
-        dest="network_push",
-        help="Network mode with USB push: push server via USB first, then connect by IP. Use this for first-time setup. Implies --preview"
-    )
-    parser.add_argument(
-        "--video",
-        action="store_true",
-        default=True,
-        help="Enable video streaming (default: True)"
-    )
-    parser.add_argument(
-        "--no-video",
-        action="store_true",
-        default=False,
-        help="Disable video streaming"
     )
     # Video quality parameters
     parser.add_argument(
@@ -3830,111 +3795,37 @@ Quick Start Examples:
 
     # 保存默认音频配置到全局变量
     global DEFAULT_AUDIO_ENABLED, DEFAULT_AUDIO_DUP
-    global _auto_connect, _auto_preview, _network_device, _network_push_device, _enable_video
+    global _auto_connect, _auto_preview, _network_device, _network_push_device, _enable_video, _stay_alive
     global _video_bitrate, _video_fps, _video_codec
 
     # 保存视频质量参数
     _video_bitrate = args.bitrate
     _video_fps = args.fps
     _video_codec = args.codec
+    _stay_alive = args.stay_alive
 
     # ========== Process Quick Start Arguments ==========
 
-    # USB quick modes
-    if args.usb:
-        _auto_connect = True
-        _auto_preview = False
-        _enable_video = False
-        DEFAULT_AUDIO_ENABLED = False
-        logger.info("[QUICK] USB mode: control only (low power)")
-    elif args.usb_video:
-        _auto_connect = True
-        _auto_preview = True
-        _enable_video = True
-        DEFAULT_AUDIO_ENABLED = False
-        logger.info("[QUICK] USB mode: control + video preview")
-    elif args.usb_full:
-        _auto_connect = True
-        _auto_preview = True
-        _enable_video = True
-        DEFAULT_AUDIO_ENABLED = True
-        logger.info("[QUICK] USB mode: control + video + audio")
+    # ========== Process Mode Selection ==========
 
-    # Network quick modes
-    elif args.net:
-        _network_device = args.net if args.net != "auto" else "auto"
-        _auto_connect = False
-        _auto_preview = False
-        _enable_video = False
-        DEFAULT_AUDIO_ENABLED = False
-        ip_info = "auto-detect from USB" if args.net == "auto" else args.net
-        logger.info(f"[QUICK] Network mode: control only -> {ip_info}")
-    elif args.net_video:
-        _network_device = args.net_video if args.net_video != "auto" else "auto"
-        _auto_connect = False
-        _auto_preview = True
-        _enable_video = True
-        DEFAULT_AUDIO_ENABLED = False
-        ip_info = "auto-detect from USB" if args.net_video == "auto" else args.net_video
-        logger.info(f"[QUICK] Network mode: control + video -> {ip_info}")
-    elif args.net_full:
-        _network_device = args.net_full if args.net_full != "auto" else "auto"
-        _auto_connect = False
-        _auto_preview = True
-        _enable_video = True
-        DEFAULT_AUDIO_ENABLED = True
-        ip_info = "auto-detect from USB" if args.net_full == "auto" else args.net_full
-        logger.info(f"[QUICK] Network mode: control + video + audio -> {ip_info}")
-
-    # Push quick modes
-    elif args.push:
-        _network_push_device = args.push if args.push != "auto" else "auto"
-        _auto_connect = False
-        _auto_preview = False
-        _enable_video = False
-        DEFAULT_AUDIO_ENABLED = False
-        ip_info = "auto-detect from USB" if args.push == "auto" else args.push
-        logger.info(f"[QUICK] Push mode: control only -> {ip_info}")
-    elif args.push_video:
-        _network_push_device = args.push_video if args.push_video != "auto" else "auto"
-        _auto_connect = False
-        _auto_preview = True
-        _enable_video = True
-        DEFAULT_AUDIO_ENABLED = False
-        ip_info = "auto-detect from USB" if args.push_video == "auto" else args.push_video
-        logger.info(f"[QUICK] Push mode: control + video -> {ip_info}")
-    elif args.push_full:
-        _network_push_device = args.push_full if args.push_full != "auto" else "auto"
-        _auto_connect = False
-        _auto_preview = True
-        _enable_video = True
-        DEFAULT_AUDIO_ENABLED = True
-        ip_info = "auto-detect from USB" if args.push_full == "auto" else args.push_full
-        logger.info(f"[QUICK] Push mode: control + video + audio -> {ip_info}")
-
-    # ========== Process Advanced Arguments ==========
-    else:
+    # ADB mode
+    if args.adb:
+        _auto_connect = True
+        _auto_preview = args.video  # Auto preview if video enabled
+        _enable_video = args.video
         DEFAULT_AUDIO_ENABLED = args.audio
-        DEFAULT_AUDIO_DUP = args.audio_dup
-        _enable_video = not args.no_video if args.no_video else args.video
+        logger.info(f"[MODE] ADB mode: video={args.video}, audio={args.audio}")
 
-        if args.network_push:
-            # --network-push: 先通过 USB 推送服务器，然后通过网络连接
-            _network_push_device = args.network_push
-            _auto_connect = False  # 不使用普通 USB 连接
-            _auto_preview = True
-            logger.info(f"[AUTO_CONNECT] Network-push mode enabled: will push via USB, then connect to {args.network_push}")
-        elif args.network:
-            # --network 暗示 --connect 和 --preview
-            _network_device = args.network
-            _auto_connect = False  # 不需要 USB 模式
-            _auto_preview = True
-            logger.info(f"[AUTO_CONNECT] Network mode enabled: {args.network}")
-        elif args.connect:
-            _auto_connect = True
-            _auto_preview = args.preview
-            if args.preview:
-                logger.info("[AUTO_CONNECT] Auto-connect with preview enabled")
+    # Network mode (auto-detect IP from USB if not specified)
+    elif args.net:
+        _network_push_device = args.net if args.net != "auto" else "auto"
+        _auto_connect = False
+        _auto_preview = args.video  # Auto preview if video enabled
+        _enable_video = args.video
+        DEFAULT_AUDIO_ENABLED = args.audio
+        ip_info = "auto-detect from USB" if args.net == "auto" else args.net
+        stay_info = " + stay-alive" if args.stay_alive else ""
+        logger.info(f"[MODE] Network mode: video={args.video}, audio={args.audio}{stay_info} -> {ip_info}")
 
     port = args.port
     host = args.host

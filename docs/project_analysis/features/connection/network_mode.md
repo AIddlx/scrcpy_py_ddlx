@@ -80,16 +80,16 @@ python tests_gui/test_network_direct.py --ip 192.168.1.100
 # Hot-connect 自动发现（无需指定 IP）
 python tests_gui/test_network_direct.py --hot-connect
 
-# Stay-alive 模式（USB 断开后服务端仍驻留）
+# Stay-alive 模式（支持多客户端连接）
 python tests_gui/test_network_direct.py --stay-alive --ip 192.168.1.100
 
 # 禁用认证
 python tests_gui/test_network_direct.py --no-auth --ip 192.168.1.100
 ```
 
-### Stay-Alive 模式
+### 进程会话管理 (setsid)
 
-使用 `setsid` 创建新会话，使服务端进程与 ADB shell 进程组分离：
+**网络模式始终使用 `setsid`** 创建新会话，使服务端进程与 ADB shell 进程组分离：
 
 ```
 ADB shell ──► nohup setsid sh -c 'server_cmd' &
@@ -98,6 +98,10 @@ ADB shell ──► nohup setsid sh -c 'server_cmd' &
                       │
                       └── USB 断开后仍运行
 ```
+
+这意味着：
+- **USB 拔插不会导致服务端终止** - 服务端在独立会话中运行，不受 ADB 连接状态影响
+- `stay_alive` 参数控制服务端是否支持多客户端连接，而非控制进程会话行为
 
 ### Hot-Connect 自动发现
 

@@ -1,6 +1,8 @@
 # 文件传输
 
 > PC 与设备之间的文件传输功能
+>
+> **更新**: 2026-03-01 - 添加 pull_file 自动路径功能
 
 ---
 
@@ -42,8 +44,11 @@ files = client.list_dir("/sdcard/Download")
 # 上传文件
 client.push_file("local.txt", "/sdcard/Download/remote.txt")
 
-# 下载文件
+# 下载文件 (指定路径)
 client.pull_file("/sdcard/Download/remote.txt", "local.txt")
+
+# 下载文件 (自动路径 → files/Download/remote.txt)
+client.pull_file("/sdcard/DCIM/Camera/IMG.jpg")
 
 # 删除文件
 client.delete_file("/sdcard/Download/remote.txt")
@@ -58,12 +63,35 @@ client.delete_file("/sdcard/Download/remote.txt")
 // 上传文件
 {"tool": "push_file", "arguments": {"local": "local.txt", "remote": "/sdcard/Download/remote.txt"}}
 
-// 下载文件
-{"tool": "pull_file", "arguments": {"remote": "/sdcard/Download/remote.txt", "local": "local.txt"}}
+// 下载文件 (指定路径)
+{"tool": "pull_file", "arguments": {"device_path": "/sdcard/Download/remote.txt", "local_path": "local.txt"}}
+
+// 下载文件 (自动路径)
+{"tool": "pull_file", "arguments": {"device_path": "/sdcard/DCIM/Camera/IMG.jpg"}}
+// → 保存到 files/DCIM/Camera/IMG.jpg
 
 // 删除文件
 {"tool": "delete_file", "arguments": {"path": "/sdcard/Download/remote.txt"}}
 ```
+
+---
+
+## 文件保存路径规范
+
+| 功能 | 保存目录 | 示例 |
+|------|----------|------|
+| 截图 | `screenshots/` | `screenshot_20260301_232016.jpg` |
+| 录音 | `recordings/` | `recording_20260301_231830.opus` |
+| 视频 | `recordings/` | `video_20260301_231830.mp4` |
+| 下载文件 | `files/<原路径>` | `files/DCIM/Camera/IMG.jpg` |
+
+### pull_file 自动路径规则
+
+| 设备路径 | 本地保存路径 |
+|----------|--------------|
+| `/sdcard/DCIM/Camera/IMG.jpg` | `files/DCIM/Camera/IMG.jpg` |
+| `/storage/emulated/0/Download/test.txt` | `files/Download/test.txt` |
+| `/data/app/file.txt` | `files/data/app/file.txt` |
 
 ---
 

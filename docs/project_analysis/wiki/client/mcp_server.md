@@ -35,7 +35,7 @@
 |------|------|
 | `list_dir` | 列出目录 |
 | `push_file` | 上传文件 |
-| `pull_file` | 下载文件 |
+| `pull_file` | 下载文件 (v1.5: `local_path` 可选，自动保存到 `files/<原路径>`) |
 | `delete_file` | 删除文件 |
 
 ### 控制操作

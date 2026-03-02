@@ -56,9 +56,9 @@ python scrcpy_http_mcp_server.py
 
 ### 文件保存
 
-- 截图: `~/Documents/scrcpy/screenshots/`
-- 录制: `~/Documents/scrcpy/recordings/`
-- 下载: `~/Documents/scrcpy/downloads/`
+- 截图: `~/Documents/scrcpy-py-ddlx/screenshots/`
+- 录音/视频: `~/Documents/scrcpy-py-ddlx/recordings/`
+- 下载文件: `~/Documents/scrcpy-py-ddlx/files/<原路径>` (如 `files/DCIM/Camera/IMG.jpg`)
 
 ### UTF-8 支持
 

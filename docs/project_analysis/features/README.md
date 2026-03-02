@@ -69,7 +69,7 @@ features/
 
 | 模块 | 文件 | 改写内容 |
 |------|------|---------|
-| **Server 主类** | `Server.java` | stay-alive 模式、UDP 发现集成 |
+| **Server 主类** | `Server.java` | setsid 进程控制、stay-alive 多客户端、UDP 发现集成 |
 | **Options** | `Options.java` | 大量新参数 (FEC/认证/网络端口等) |
 | **SurfaceEncoder** | `video/SurfaceEncoder.java` | UDP 发送集成 |
 
@@ -95,6 +95,7 @@ features/
 
 | 版本 | 日期 | 主要变更 |
 |-----|------|---------|
+| v1.5 | 2026-03-02 | 进程控制模式明确 (setsid vs stay_alive) |
 | v1.4 | 2026-02-28 | HMAC-SHA256 认证 + 横屏截图修复 |
 | v1.3 | 2026-02-20 | TCP 心跳机制 (PING/PONG) |
 | v1.2 | 2026-02-20 | UDP header 24 字节，E2E 延迟追踪 |

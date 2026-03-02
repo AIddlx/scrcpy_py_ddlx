@@ -52,9 +52,11 @@
 |------|--------|------|
 | `--reuse` | False | 复用服务器 |
 | `--push/--no-push` | push | 推送 APK |
-| `--stay-alive` | False | Stay-Alive 模式（使用 setsid 持久化） |
+| `--stay-alive` | False | Stay-Alive 模式（客户端断开后服务端保持运行） |
 | `--hot-connect` | False | 自动发现并连接设备（无需指定 IP） |
 | `--discover-timeout` | 5 | 发现超时（秒） |
+
+> **注意**: 所有网络模式启动均使用 `setsid` 创建独立会话，服务端进程独立于 ADB 会话，USB 拔插不影响运行。 |
 
 ### 认证
 
@@ -82,7 +84,7 @@ def start_server(args, device_serial):
     1. 检查服务器是否运行
     2. (可选) 推送 APK
     3. (可选) 推送认证密钥
-    4. 启动服务器 (nohup)
+    4. 启动服务器 (nohup setsid - 独立于 ADB 会话)
     """
 ```
 

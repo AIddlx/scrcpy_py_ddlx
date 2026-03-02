@@ -48,6 +48,12 @@ python -m scrcpy_py_ddlx.gui
 - 多设备支持
 - 实时画面显示
 
+### 文件保存路径 (v1.5 规范)
+
+- 截图: `~/Documents/scrcpy-py-ddlx/screenshots/`
+- 录音/视频: `~/Documents/scrcpy-py-ddlx/recordings/`
+- 下载文件: `~/Documents/scrcpy-py-ddlx/files/<原路径>`
+
 ---
 
 ## 界面布局

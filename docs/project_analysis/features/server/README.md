@@ -130,6 +130,38 @@ private static void scrcpy(Options options)
 private static void runStayAliveMode(Options options)
 ```
 
+### 进程控制 (setsid vs stay_alive)
+
+**v1.5 关键变更**：明确区分两个独立的概念
+
+| 特性 | setsid | stay_alive |
+|------|--------|------------|
+| **作用** | 进程会话控制 | 多客户端连接控制 |
+| **启用时机** | 网络模式**始终启用** | 需要时启用 (`stay_alive=true`) |
+| **目的** | 让服务端独立于 ADB 会话 | 支持多客户端先后连接 |
+| **效果** | USB 拔插不会终止服务 | 客户端断开后服务继续运行 |
+| **依赖关系** | 与 stay_alive 无关 | 与 setsid 无关 |
+
+```
+网络模式默认行为:
+┌─────────────────────────────────────┐
+│  Server (setsid=true)               │ ← 独立于 ADB 会话
+│  ┌───────────────────────────────┐  │
+│  │ stay_alive=false              │  │ ← 单客户端 (默认)
+│  │ 客户端断开 → 服务退出         │  │
+│  └───────────────────────────────┘  │
+└─────────────────────────────────────┘
+
+多客户端服务模式:
+┌─────────────────────────────────────┐
+│  Server (setsid=true)               │ ← 独立于 ADB 会话
+│  ┌───────────────────────────────┐  │
+│  │ stay_alive=true               │  │ ← 多客户端模式
+│  │ 客户端断开 → 等待下一个连接   │  │
+│  └───────────────────────────────┘  │
+└─────────────────────────────────────┘
+```
+
 ### UDP 发现集成
 
 ```java
@@ -159,9 +191,26 @@ if (discovery.isTerminateRequested()) {
 | `fec_parity_count` | int | FEC 校验数 M |
 | `fec_mode` | String | FEC 模式 |
 | `auth_key_file` | String | 认证密钥文件 |
-| `stay_alive` | boolean | Stay-Alive 模式 |
+| `stay_alive` | boolean | 多客户端模式 |
 | `max_connections` | int | 最大连接数 |
 | `discovery_port` | int | UDP 发现端口 |
+
+### setsid 说明
+
+网络模式下，客户端通过 shell 命令中的 `setsid` 创建独立会话：
+
+**代码实现** (`scrcpy_http_mcp_server.py` 第 2583-2585 行)：
+
+```python
+# Always use setsid for network mode to survive ADB disconnect
+# Without setsid, the server process will be killed when ADB session ends
+shell_cmd = f"nohup setsid sh -c '{server_cmd}' > /data/local/tmp/scrcpy_server.log 2>&1 &"
+```
+
+**效果**：
+- 进程获得新的会话 ID (SID)
+- 不再依赖 ADB 连接
+- USB 拔插不影响服务运行
 
 ---
 

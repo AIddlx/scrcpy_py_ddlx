@@ -359,7 +359,11 @@ class StreamingVideoDemuxer(StreamingDemuxerBase):
 
         except Exception as e:
             self._parse_errors += 1
-            logger.error(f"Error receiving video packet: {e}")
+            # Socket timeout is normal when screen is static (no video packets)
+            if "timed out" in str(e):
+                logger.debug(f"Video packet receive timeout (screen may be static)")
+            else:
+                logger.error(f"Error receiving video packet: {e}")
             raise
 
     def _merge_config(self, packet: VideoPacket) -> Optional[VideoPacket]:

@@ -62,6 +62,54 @@ private static DesktopConnection createConnection(Options options) {
 
 ---
 
+## 进程控制模式 (v1.5)
+
+### setsid - 进程会话控制
+
+```
+网络模式始终使用 setsid
+```
+
+**作用**：让服务端进程独立于 ADB 会话
+
+| 特性 | 说明 |
+|------|------|
+| **启用时机** | 网络模式**始终启用**，USB 模式不启用 |
+| **目的** | 进程脱离 ADB 会话，独立运行 |
+| **效果** | USB 拔插不会导致服务终止 |
+| **实现** | 客户端 shell 命令：`nohup setsid sh -c '{server_cmd}'` |
+
+**代码实现** (`scrcpy_http_mcp_server.py` 第 2583-2585 行)：
+
+```python
+# Always use setsid for network mode to survive ADB disconnect
+# Without setsid, the server process will be killed when ADB session ends
+shell_cmd = f"nohup setsid sh -c '{server_cmd}' > /data/local/tmp/scrcpy_server.log 2>&1 &"
+```
+
+**为什么需要 setsid**：
+
+```
+原始 scrcpy (USB 模式):
+┌─────────────┐
+│   ADB Shell │ ← 进程依赖 ADB 连接
+│  └─ Server  │   USB 断开 → 进程终止
+└─────────────┘
+
+scrcpy-py-ddlx (网络模式):
+┌─────────────┐
+│  Server     │ ← 独立会话 (setsid)
+│  (PID: XXX) │   USB 断开 → 进程继续
+└─────────────┘
+```
+
+**与 stay_alive 的关系**：
+- `setsid` 和 `stay_alive` 是**独立的**两个概念
+- 网络模式下 `setsid` **始终启用**
+- `stay_alive` 控制是否支持多客户端连接
+
+---
+
 ## Stay-Alive 模式
 
 ```java
@@ -77,10 +125,34 @@ private static void runStayAliveMode(Options options) {
 }
 ```
 
-特性：
-- 服务器持续运行
-- 支持多次连接
-- 无需重启服务器
+**作用**：控制服务端是否支持多客户端连接
+
+| 特性 | 说明 |
+|------|------|
+| **启用方式** | `stay_alive=true` 参数 |
+| **目的** | 支持多个客户端先后连接 (hot-connect) |
+| **效果** | 客户端断开后服务端继续运行 |
+| **默认行为** | 单客户端模式 (断开后退出) |
+
+**两种模式对比**：
+
+| 模式 | stay_alive=false | stay_alive=true |
+|------|------------------|-----------------|
+| 客户端断开 | 服务退出 | 服务继续运行 |
+| 多连接 | 不支持 | 支持 |
+| 用途 | 单次使用场景 | 长期服务场景 |
+
+**典型流程**：
+
+```
+stay_alive=false (默认):
+客户端连接 → 传输数据 → 客户端断开 → 服务退出
+
+stay_alive=true:
+客户端1连接 → 传输数据 → 客户端1断开 → 等待...
+客户端2连接 → 传输数据 → 客户端2断开 → 等待...
+(直到收到终止命令)
+```
 
 ---
 

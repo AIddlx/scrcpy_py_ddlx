@@ -39,11 +39,13 @@
 ### 1. 服务端启动
 
 ```python
-# 通过 ADB 启动服务端
-adb shell nohup sh -c 'CLASSPATH=/data/local/tmp/scrcpy-server.apk
+# 通过 ADB 启动服务端（使用 setsid 创建独立会话）
+adb shell nohup setsid sh -c 'CLASSPATH=/data/local/tmp/scrcpy-server.apk
     app_process / com.genymobile.scrcpy.Server 3.3.4
     control_port=27184 video_port=27185 audio_port=27186 ...'
 ```
+
+> **v1.5**: 所有网络模式启动均使用 `setsid`，服务端进程独立于 ADB 会话，USB 拔插不影响运行。
 
 ### 2. 客户端连接
 
@@ -135,16 +137,21 @@ python test_network_direct.py --stay-alive --ip 192.168.1.100
 python test_network_direct.py --reuse --no-push --ip 192.168.1.100
 ```
 
-### 进程持久化 (setsid)
+### 进程持久化
 
-**重要**：服务端使用 `setsid` 启动，确保 USB 断开后服务端继续运行。
+> **v1.5 重要变更**: **所有网络模式启动均使用 `setsid`**，不再仅限于 `--stay-alive` 参数。
+
+服务端使用 `setsid` 启动，创建独立会话，确保服务端进程独立于 ADB 会话：
 
 ```bash
-# 启动命令（内部实现）
+# 启动命令（内部实现，所有网络模式通用）
 nohup setsid sh -c 'app_process ...' > /data/local/tmp/scrcpy_server.log 2>&1 &
 ```
 
-`setsid` 创建新会话，让服务端脱离 ADB shell 进程组，避免 USB 断开时被一起杀死。
+**效果**:
+- USB 拔插不影响服务端运行
+- ADB 会话结束不影响服务端
+- 服务端成为独立进程组，拥有独立生命周期
 
 ### UDP Wake
 

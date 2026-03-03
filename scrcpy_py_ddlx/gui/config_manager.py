@@ -12,8 +12,8 @@ from dataclasses import dataclass, asdict, field
 
 logger = logging.getLogger(__name__)
 
-# Default configuration directory
-CONFIG_DIR = Path.home() / ".scrcpy-py-ddlx" / "configs"
+# Default configuration directory (XDG-compliant)
+CONFIG_DIR = Path.home() / ".config" / "scrcpy-py-ddlx" / "configs"
 
 
 @dataclass

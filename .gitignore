@@ -109,3 +109,6 @@ CLAUDE.md
 
 # Windows reserved names
 nul
+
+# Auth keys (local only)
+.auth/

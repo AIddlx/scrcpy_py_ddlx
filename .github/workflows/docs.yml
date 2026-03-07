@@ -62,7 +62,7 @@ jobs:
           git push
 
       - name: Upload formatting changes
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         if: always()
         with:
           name: formatting-changes
